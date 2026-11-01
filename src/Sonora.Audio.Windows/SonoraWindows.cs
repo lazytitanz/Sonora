@@ -18,14 +18,15 @@ public static class SonoraWindows
     public static AudioEngine CreateEngine(AudioEngineOptions? options = null)
     {
         options ??= new AudioEngineOptions();
-        if (options.EffectFactory is null)
+        if (options.EffectFactory is null || options.FormatConverter is null)
         {
             options = new AudioEngineOptions
             {
                 BufferDuration = options.BufferDuration,
                 PrimeDuration = options.PrimeDuration,
                 Processors = options.Processors,
-                EffectFactory = new WindowsAudioEffectFactory(),
+                EffectFactory = options.EffectFactory ?? new WindowsAudioEffectFactory(),
+                FormatConverter = options.FormatConverter ?? new WindowsAudioFormatConverter(),
             };
         }
 

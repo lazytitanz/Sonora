@@ -29,4 +29,11 @@ public sealed class AudioEngineOptions
     /// Set automatically by <c>SonoraWindows.CreateEngine()</c>.
     /// </summary>
     public IAudioEffectFactory? EffectFactory { get; init; }
+
+    /// <summary>
+    /// Converts preloaded/loaded decoders to the session output format for gapless joins.
+    /// Defaults to <see cref="PassthroughFormatConverter"/> (channel mix only).
+    /// <c>SonoraWindows.CreateEngine()</c> supplies a WDL-backed converter.
+    /// </summary>
+    public IAudioFormatConverter? FormatConverter { get; init; }
 }

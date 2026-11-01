@@ -17,12 +17,18 @@ public sealed class AudioPlayer : IDisposable
     private readonly IAudioDecoderFactory _decoderFactory;
     private readonly IAudioOutputFactory _outputFactory;
     private readonly AudioEngineOptions _options;
+    private readonly IAudioFormatConverter _formatConverter;
     private readonly AudioEffectRack _effects;
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly object _pipelineSync = new();
+    private readonly NextTrackSlot _next = new();
 
     private PlaybackState _state = PlaybackState.Stopped;
     private float _volume = 1f;
     private int _generation;
+    private int _activeTrackGeneration;
+    private int _transitionId;
+    private int _suppressTransitionIdsAtOrBelow;
     private bool _disposed;
     private bool _hasSource;
     private bool _completionRaised;
@@ -35,12 +41,12 @@ public sealed class AudioPlayer : IDisposable
     /// </summary>
     private int _acceptEndOfStreamCompletion;
 
-    private IAudioDecoder? _decoder;
+    private TrackDecodePipeline? _active;
     private IAudioOutput? _output;
-    private PcmRingBuffer? _ring;
-    private DecodePump? _pump;
-    private BufferedSampleSource? _sampleSource;
+    private TransitionSampleSource? _sampleSource;
     private CancellationTokenSource? _sessionCts;
+    private AudioFormat _sessionFormat;
+    private string? _sourcePath;
 
     private long _timelineOriginSamples;
     private long _samplesDecoded;
@@ -59,21 +65,32 @@ public sealed class AudioPlayer : IDisposable
         _decoderFactory = decoderFactory ?? throw new ArgumentNullException(nameof(decoderFactory));
         _outputFactory = outputFactory ?? throw new ArgumentNullException(nameof(outputFactory));
         _options = options ?? new AudioEngineOptions();
+        _formatConverter = _options.FormatConverter ?? new PassthroughFormatConverter();
         _effects = new AudioEffectRack(_options.EffectFactory);
     }
 
     /// <summary>
     /// Per-player DSP effect rack (equalizer, preamp, limiter). Processing runs after the PCM ring
-    /// on the output path so live parameter changes apply without waiting for buffered audio to drain.
-    /// Effect settings are preserved across track changes; filter state is reset on seek/stop/load.
+    /// on the output path so live parameter changes apply without waiting for the buffer to drain.
+    /// Effect settings are preserved across gapless transitions and track loads; filter state is reset on seek/stop/load.
     /// </summary>
     public IAudioEffectRack Effects => _effects;
 
     /// <summary>Raised when <see cref="State"/> changes.</summary>
     public event EventHandler? StateChanged;
 
-    /// <summary>Raised exactly once when playback reaches the natural end of the current source.</summary>
+    /// <summary>
+    /// Raised exactly once when playback reaches the natural end of the session with no ready next track.
+    /// Not raised between gaplessly joined tracks.
+    /// </summary>
     public event EventHandler? PlaybackCompleted;
+
+    /// <summary>
+    /// Raised after a gapless consumption-boundary handoff to the preloaded next track.
+    /// Never invoked on the real-time audio callback; delivery may lag after the first samples of the
+    /// next track have already entered the output pipeline. Not sample-synchronized with audible output.
+    /// </summary>
+    public event EventHandler<TrackTransitionedEventArgs>? TrackTransitioned;
 
     /// <summary>Raised when a recoverable or fatal playback error occurs.</summary>
     public event EventHandler<Exception>? ErrorOccurred;
@@ -87,29 +104,34 @@ public sealed class AudioPlayer : IDisposable
     /// <summary>Whether a source is loaded.</summary>
     public bool HasSource => Volatile.Read(ref _hasSource);
 
-    /// <summary>Source duration when known.</summary>
+    /// <summary>Path of the logically active track (updates at the output-consumption handoff).</summary>
+    public string? SourcePath => Volatile.Read(ref _sourcePath);
+
+    /// <summary>Path of the pending next track when loading or ready; otherwise <see langword="null"/>.</summary>
+    public string? NextTrackPath => _next.Path;
+
+    /// <summary>State of the single pending next-track preload slot.</summary>
+    public NextTrackState NextTrackState => _next.State;
+
+    /// <summary>Active track duration when known (updates at the consumption handoff).</summary>
     public TimeSpan Duration => _duration;
 
     /// <summary>
-    /// Estimated audible playback position. Accounts for buffered samples handed to the device and output latency when available.
-    /// This is an estimate and is not sample-accurate under shared-mode resampling or underruns.
+    /// Estimated audible playback position within the active track. Accounts for device rendered clock
+    /// and output latency when available. This is an estimate and is not sample-accurate under shared-mode
+    /// resampling, device buffering, underruns, or gapless handoffs.
     /// </summary>
     public TimeSpan Position
     {
         get
         {
-            if (!_hasSource || _decoder is null)
+            if (!_hasSource || _active is null)
             {
                 return TimeSpan.Zero;
             }
 
             var state = _state;
-            if (state is PlaybackState.Stopped)
-            {
-                return _heldPosition;
-            }
-
-            if (state is PlaybackState.Paused)
+            if (state is PlaybackState.Stopped or PlaybackState.Paused)
             {
                 return _heldPosition;
             }
@@ -119,19 +141,19 @@ public sealed class AudioPlayer : IDisposable
     }
 
     /// <summary>
-    /// Timeline position of the latest sample written into the PCM ring buffer (decode frontier).
+    /// Timeline position of the latest sample written into the active track's PCM ring (decode frontier).
     /// </summary>
     public TimeSpan BufferedPosition
     {
         get
         {
-            if (!_hasSource || _decoder is null)
+            if (!_hasSource || _active is null)
             {
                 return TimeSpan.Zero;
             }
 
             var samples = _timelineOriginSamples + Interlocked.Read(ref _samplesDecoded);
-            return ClampToDuration(_decoder.Format.SamplesToTime(samples));
+            return ClampToDuration(_active.Format.SamplesToTime(samples));
         }
     }
 
@@ -156,13 +178,14 @@ public sealed class AudioPlayer : IDisposable
         return new PlaybackDiagnostics
         {
             UnderrunCount = Interlocked.Read(ref _underrunCount),
-            BufferCapacitySamples = _ring?.Capacity ?? 0,
-            BufferedSamples = _ring?.Count ?? 0,
+            BufferCapacitySamples = _active?.Ring.Capacity ?? 0,
+            BufferedSamples = _active?.Ring.Count ?? 0,
         };
     }
 
     /// <summary>
-    /// Loads an audio file, releasing any previously loaded source.
+    /// Loads an audio file, releasing any previously loaded source and clearing any preloaded next track.
+    /// Locks the session output format to this track for subsequent gapless joins.
     /// </summary>
     public async Task LoadAsync(string filePath, CancellationToken cancellationToken = default)
     {
@@ -175,14 +198,12 @@ public sealed class AudioPlayer : IDisposable
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             generation = ++_generation;
+            _next.Clear();
             SetState_NoLock(PlaybackState.Buffering);
 
             await TearDownSession_NoLockAsync().ConfigureAwait(false);
 
             _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            var sessionToken = _sessionCts.Token;
-
-            // Release the gate while opening the decoder so Play/Dispose can still serialize afterwards via generation checks.
         }
         finally
         {
@@ -224,7 +245,8 @@ public sealed class AudioPlayer : IDisposable
 
             try
             {
-                StartSession_NoLock(decoder);
+                // Session format is the loaded track's native float format (no conversion on first load).
+                StartSession_NoLock(filePath, decoder);
                 SetState_NoLock(PlaybackState.Stopped);
             }
             catch
@@ -240,6 +262,110 @@ public sealed class AudioPlayer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Preloads exactly one upcoming track without interrupting current playback.
+    /// Replaces any previous preload. Failures set <see cref="NextTrackState.Failed"/> and do not stop the current track.
+    /// Decoded PCM is converted to the session format and buffered with a bounded ring.
+    /// </summary>
+    public async Task PreloadNextAsync(string filePath, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        int preloadGeneration;
+        AudioFormat sessionFormat;
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!_hasSource)
+            {
+                throw new InvalidOperationException("Load a source before preloading the next track.");
+            }
+
+            sessionFormat = _sessionFormat;
+            preloadGeneration = _next.BeginLoad(filePath);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+
+        IAudioDecoder? opened = null;
+        TrackDecodePipeline? pipeline = null;
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            opened = await _decoderFactory.CreateAsync(filePath, cancellationToken).ConfigureAwait(false);
+            if (!_next.IsCurrentGeneration(preloadGeneration))
+            {
+                opened.Dispose();
+                return;
+            }
+
+            var converted = _formatConverter.Convert(opened, sessionFormat);
+            opened = null; // ownership transferred to converted (or same instance)
+            pipeline = TrackDecodePipeline.Create(filePath, converted, _options);
+            pipeline.StartPump(
+                _options.Processors,
+                () => Volatile.Read(ref _volume),
+                onSamplesWritten: _ => { },
+                onError: ex =>
+                {
+                    if (_next.TryCompleteFailed(preloadGeneration, ex))
+                    {
+                        RaiseError(ex);
+                    }
+                });
+            pipeline.Prime(_options.PrimeDuration);
+
+            if (!_next.TryCompleteReady(preloadGeneration, pipeline))
+            {
+                return;
+            }
+
+            pipeline = null;
+        }
+        catch (OperationCanceledException)
+        {
+            pipeline?.Dispose();
+            opened?.Dispose();
+            if (_next.IsCurrentGeneration(preloadGeneration))
+            {
+                _next.Clear();
+            }
+
+            throw;
+        }
+        catch (Exception ex)
+        {
+            pipeline?.Dispose();
+            opened?.Dispose();
+            if (_next.TryCompleteFailed(preloadGeneration, ex))
+            {
+                RaiseError(ex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Cancels and disposes any pending or ready next track.
+    /// </summary>
+    public void ClearNext()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _gate.Wait();
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _next.Clear();
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     /// <summary>Starts or resumes playback.</summary>
     public void Play()
     {
@@ -248,7 +374,7 @@ public sealed class AudioPlayer : IDisposable
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (!_hasSource || _output is null || _ring is null || _decoder is null)
+            if (!_hasSource || _output is null || _active is null)
             {
                 throw new InvalidOperationException("No audio source is loaded.");
             }
@@ -258,11 +384,10 @@ public sealed class AudioPlayer : IDisposable
                 return;
             }
 
-            EnsurePumpRunning_NoLock();
-            PrimeBuffer_NoLock();
+            EnsureActivePumpRunning_NoLock();
+            _active.Prime(_options.PrimeDuration);
             _completionRaised = false;
             Volatile.Write(ref _acceptEndOfStreamCompletion, 1);
-            // Publish Playing before starting the device so callback underrun detection sees the active state.
             SetState_NoLock(PlaybackState.Playing);
             _output.Play();
         }
@@ -295,7 +420,10 @@ public sealed class AudioPlayer : IDisposable
         }
     }
 
-    /// <summary>Stops playback and resets position to the beginning without raising <see cref="PlaybackCompleted"/>.</summary>
+    /// <summary>
+    /// Stops playback, resets position to the beginning, and clears any preloaded next track
+    /// without raising <see cref="PlaybackCompleted"/>.
+    /// </summary>
     public void Stop()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -303,6 +431,7 @@ public sealed class AudioPlayer : IDisposable
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            _next.Clear();
             if (!_hasSource)
             {
                 SetState_NoLock(PlaybackState.Stopped);
@@ -317,7 +446,9 @@ public sealed class AudioPlayer : IDisposable
         }
     }
 
-    /// <summary>Seeks to <paramref name="position"/> when the source supports seeking.</summary>
+    /// <summary>
+    /// Seeks within the active track. Preserves a safe preloaded next track; does not trigger a transition.
+    /// </summary>
     public void Seek(TimeSpan position)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -327,12 +458,12 @@ public sealed class AudioPlayer : IDisposable
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_decoder is null || _ring is null)
+            if (_active is null)
             {
                 throw new InvalidOperationException("No audio source is loaded.");
             }
 
-            if (!_decoder.CanSeek)
+            if (!_active.Decoder.CanSeek)
             {
                 throw new NotSupportedException("The current audio source does not support seeking.");
             }
@@ -342,28 +473,35 @@ public sealed class AudioPlayer : IDisposable
                 position = _duration;
             }
 
+            // Invalidate in-flight transition notifications from a pre-seek drain.
+            _activeTrackGeneration++;
+            _suppressTransitionIdsAtOrBelow = Volatile.Read(ref _transitionId);
+
             var wasPlaying = _state == PlaybackState.Playing;
             _output?.Pause();
 
-            StopPump_NoLock();
-            _ring.Clear();
-            _sampleSource?.ResetEndOfStream();
-            _decoder.Seek(position);
-            // Output is paused: safe to reset IIR/dynamics state and dispose removed effects.
+            lock (_pipelineSync)
+            {
+                _active.StopPump();
+                _active.Ring.Clear();
+                _sampleSource?.ResetEndOfStream();
+                _active.Decoder.Seek(position);
+            }
+
             _effects.ResetProcessingState();
             _effects.DisposeRetired();
 
-            _timelineOriginSamples = _decoder.Format.TimeToSamples(position);
+            _timelineOriginSamples = _active.Format.TimeToSamples(position);
             Interlocked.Exchange(ref _samplesDecoded, 0);
             Interlocked.Exchange(ref _samplesConsumed, 0);
             _completionRaised = false;
             Interlocked.Exchange(ref _underrunLatched, 0);
             RebasePositionClock_NoLock(position);
 
-            EnsurePumpRunning_NoLock();
+            EnsureActivePumpRunning_NoLock();
             if (wasPlaying)
             {
-                PrimeBuffer_NoLock();
+                _active.Prime(_options.PrimeDuration);
                 _output?.Play();
                 SetState_NoLock(PlaybackState.Playing);
             }
@@ -392,6 +530,7 @@ public sealed class AudioPlayer : IDisposable
 
             _disposed = true;
             _generation++;
+            _next.Clear();
             TearDownSession_NoLockAsync().GetAwaiter().GetResult();
             _effects.Dispose();
             SetState_NoLock(PlaybackState.Stopped);
@@ -403,9 +542,10 @@ public sealed class AudioPlayer : IDisposable
         }
     }
 
-    private void StartSession_NoLock(IAudioDecoder decoder)
+    private void StartSession_NoLock(string path, IAudioDecoder decoder)
     {
-        _decoder = decoder;
+        _sessionFormat = decoder.Format;
+        Volatile.Write(ref _sourcePath, path);
         _duration = decoder.Duration;
         _timelineOriginSamples = 0;
         Interlocked.Exchange(ref _samplesDecoded, 0);
@@ -416,19 +556,16 @@ public sealed class AudioPlayer : IDisposable
         _logicalPositionAtAnchor = TimeSpan.Zero;
         _deviceClockAnchor = TimeSpan.Zero;
         _heldPosition = TimeSpan.Zero;
+        _activeTrackGeneration++;
+        _suppressTransitionIdsAtOrBelow = _transitionId;
 
-        var capacity = Math.Max(
-            decoder.Format.ChannelCount * 256,
-            (int)Math.Ceiling(_options.BufferDuration.TotalSeconds * decoder.Format.SamplesPerSecond));
+        _active = TrackDecodePipeline.Create(path, decoder, _options);
 
-        _ring = new PcmRingBuffer(capacity);
-        // Preserve effect instances/settings across tracks; reconfigure + reset processing state only.
         _effects.Configure(decoder.Format);
         _effects.ResetProcessingState();
         _effects.DisposeRetired();
 
-        _sampleSource = new BufferedSampleSource(
-            _ring,
+        _sampleSource = new TransitionSampleSource(
             decoder.Format,
             _effects,
             onSamplesConsumed: n =>
@@ -437,66 +574,137 @@ public sealed class AudioPlayer : IDisposable
                 Interlocked.Exchange(ref _underrunLatched, 0);
             },
             onUnderrun: HandleUnderrunFromCallback,
-            isPlaying: () => _state == PlaybackState.Playing);
+            isPlaying: () => _state == PlaybackState.Playing,
+            getActive: () =>
+            {
+                lock (_pipelineSync)
+                {
+                    return _active;
+                }
+            },
+            tryPromoteNext: TryPromoteNextFromCallback,
+            hasPendingNext: () =>
+            {
+                var s = _next.State;
+                return s is NextTrackState.Ready or NextTrackState.Loading;
+            },
+            scheduleTransitioned: ScheduleTrackTransitioned);
 
         _output = _outputFactory.CreateDefaultOutput();
         _output.Stopped += OnOutputStopped;
         _output.Initialize(_sampleSource);
 
         _hasSource = true;
-        EnsurePumpRunning_NoLock();
-        PrimeBuffer_NoLock();
+        EnsureActivePumpRunning_NoLock();
+        _active.Prime(_options.PrimeDuration);
     }
 
-    private void EnsurePumpRunning_NoLock()
+    private TransitionSampleSource.PromoteResult? TryPromoteNextFromCallback()
     {
-        if (_decoder is null || _ring is null)
+        // Called from the audio pull path — TryEnter only; never block waiting on Seek/Load.
+        if (!Monitor.TryEnter(_pipelineSync))
+        {
+            return null;
+        }
+
+        TrackDecodePipeline? previous = null;
+        string? previousPath = null;
+        var previousDuration = TimeSpan.Zero;
+        string? nextPath = null;
+        TrackDecodePipeline? nextPipeline = null;
+        var transitionId = 0;
+        try
+        {
+            if (!_next.TryTakeReady(out nextPipeline, out nextPath))
+            {
+                return null;
+            }
+
+            previous = _active;
+            previousPath = previous?.Path;
+            previousDuration = previous?.Duration ?? TimeSpan.Zero;
+            _active = nextPipeline;
+            Volatile.Write(ref _sourcePath, nextPath);
+            _duration = nextPipeline.Duration;
+            _timelineOriginSamples = 0;
+            Interlocked.Exchange(ref _samplesDecoded, 0);
+            Interlocked.Exchange(ref _samplesConsumed, 0);
+            Interlocked.Exchange(ref _underrunLatched, 0);
+
+            // Rebase logical timeline to the start of B using the continuous device clock.
+            _logicalPositionAtAnchor = TimeSpan.Zero;
+            _deviceClockAnchor = _output?.TryGetRenderedPosition() ?? TimeSpan.Zero;
+            _heldPosition = TimeSpan.Zero;
+
+            transitionId = Interlocked.Increment(ref _transitionId);
+        }
+        finally
+        {
+            Monitor.Exit(_pipelineSync);
+        }
+
+        var args = new TrackTransitionedEventArgs(previousPath, nextPath, previousDuration, transitionId);
+        var toDispose = previous;
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                toDispose?.Dispose();
+            }
+            catch
+            {
+                // ignored
+            }
+        });
+
+        return new TransitionSampleSource.PromoteResult(args);
+    }
+
+    private void ScheduleTrackTransitioned(TrackTransitionedEventArgs args)
+    {
+        // Never invoke user handlers on the audio callback thread.
+        var capturedSession = Volatile.Read(ref _generation);
+        _ = Task.Run(() =>
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (capturedSession != Volatile.Read(ref _generation))
+            {
+                return;
+            }
+
+            if (args.TransitionId <= Volatile.Read(ref _suppressTransitionIdsAtOrBelow))
+            {
+                return;
+            }
+
+            try
+            {
+                TrackTransitioned?.Invoke(this, args);
+            }
+            catch
+            {
+                // ignored
+            }
+        });
+    }
+
+    private void EnsureActivePumpRunning_NoLock()
+    {
+        var active = _active;
+        if (active is null)
         {
             return;
         }
 
-        if (_pump?.IsRunning == true)
-        {
-            return;
-        }
-
-        _pump?.Dispose();
-        _pump = new DecodePump(
-            _decoder,
-            _ring,
+        active.StartPump(
             _options.Processors,
             () => Volatile.Read(ref _volume),
             onSamplesWritten: n => Interlocked.Add(ref _samplesDecoded, n),
             onError: ex => RaiseError(ex));
-        _pump.Start();
-    }
-
-    private void PrimeBuffer_NoLock()
-    {
-        if (_ring is null || _decoder is null)
-        {
-            return;
-        }
-
-        var target = (int)Math.Ceiling(_options.PrimeDuration.TotalSeconds * _decoder.Format.SamplesPerSecond);
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (_ring.Count < target && !_ring.IsCompleted && sw.Elapsed < TimeSpan.FromSeconds(2))
-        {
-            Thread.Sleep(5);
-        }
-    }
-
-    private void StopPump_NoLock()
-    {
-        var pump = _pump;
-        _pump = null;
-        if (pump is null)
-        {
-            return;
-        }
-
-        pump.StopAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
-        pump.Dispose();
     }
 
     private async Task TearDownSession_NoLockAsync()
@@ -525,59 +733,56 @@ public sealed class AudioPlayer : IDisposable
             }
         }
 
-        StopPump_NoLock();
+        _active?.StopPump();
 
         _output?.Dispose();
         _output = null;
 
-        _ring?.Dispose();
-        _ring = null;
         _sampleSource = null;
 
-        _decoder?.Dispose();
-        _decoder = null;
+        _active?.Dispose();
+        _active = null;
 
         _sessionCts?.Dispose();
         _sessionCts = null;
 
-        // Callback path is torn down: dispose effects removed while the previous session was active.
         _effects.DisposeRetired();
 
         _hasSource = false;
+        Volatile.Write(ref _sourcePath, null);
         _duration = TimeSpan.Zero;
         _heldPosition = TimeSpan.Zero;
+        await Task.CompletedTask.ConfigureAwait(false);
     }
 
     private void StopTransport_NoLock(bool resetToStart, bool raiseCompletion)
     {
-        // Suppress EOS completion before stopping the device — WASAPI/NAudio may raise
-        // PlaybackStopped asynchronously (or synchronously) as a result of Stop().
         Volatile.Write(ref _acceptEndOfStreamCompletion, 0);
 
         _output?.Stop();
-        StopPump_NoLock();
+        _active?.StopPump();
 
-        if (_ring is not null)
+        if (_active is not null)
         {
-            _ring.Clear();
+            _active.Ring.Clear();
         }
 
         _sampleSource?.ResetEndOfStream();
         _effects.ResetProcessingState();
         _effects.DisposeRetired();
 
-        if (resetToStart && _decoder is not null)
+        if (resetToStart && _active is not null)
         {
-            if (_decoder.CanSeek)
+            if (_active.Decoder.CanSeek)
             {
-                _decoder.Seek(TimeSpan.Zero);
+                _active.Decoder.Seek(TimeSpan.Zero);
             }
 
             _timelineOriginSamples = 0;
             Interlocked.Exchange(ref _samplesDecoded, 0);
             Interlocked.Exchange(ref _samplesConsumed, 0);
             RebasePositionClock_NoLock(TimeSpan.Zero);
-            EnsurePumpRunning_NoLock();
+            EnsureActivePumpRunning_NoLock();
         }
         else
         {
@@ -599,7 +804,6 @@ public sealed class AudioPlayer : IDisposable
             RaiseError(e.Exception);
         }
 
-        // Avoid taking the command gate on the output thread for long; try enter with timeout.
         if (!_gate.Wait(0))
         {
             _ = Task.Run(() => HandleOutputStopped(e));
@@ -638,8 +842,13 @@ public sealed class AudioPlayer : IDisposable
 
         if (e.ReachedEndOfStream)
         {
-            // Ignore EOS after explicit Stop/teardown, or from a stale callback.
             if (Volatile.Read(ref _acceptEndOfStreamCompletion) == 0)
+            {
+                return;
+            }
+
+            // If a next track became ready after EOS signaling started, do not complete the session.
+            if (_next.State == NextTrackState.Ready)
             {
                 return;
             }
@@ -677,7 +886,7 @@ public sealed class AudioPlayer : IDisposable
 
     private TimeSpan EstimateAudiblePosition()
     {
-        if (_decoder is null)
+        if (_active is null)
         {
             return TimeSpan.Zero;
         }
@@ -685,7 +894,6 @@ public sealed class AudioPlayer : IDisposable
         var rendered = _output?.TryGetRenderedPosition();
         if (rendered is not null)
         {
-            // Rebase device clock against the last seek/load/stop so logical timeline stays correct.
             var delta = rendered.Value - _deviceClockAnchor;
             if (delta < TimeSpan.Zero)
             {
@@ -696,15 +904,15 @@ public sealed class AudioPlayer : IDisposable
         }
 
         var consumed = _timelineOriginSamples + Interlocked.Read(ref _samplesConsumed);
-        var buffered = _ring?.Count ?? 0;
+        var buffered = _active.Ring.Count;
         var latencySamples = 0L;
         if (_output is not null)
         {
-            latencySamples = _decoder.Format.TimeToSamples(_output.CurrentLatency);
+            latencySamples = _active.Format.TimeToSamples(_output.CurrentLatency);
         }
 
         var audibleSamples = Math.Max(0, consumed - buffered - latencySamples);
-        return ClampToDuration(_decoder.Format.SamplesToTime(audibleSamples));
+        return ClampToDuration(_active.Format.SamplesToTime(audibleSamples));
     }
 
     private void RebasePositionClock_NoLock(TimeSpan logicalPosition)
@@ -738,8 +946,6 @@ public sealed class AudioPlayer : IDisposable
 
         _state = state;
         var handler = StateChanged;
-        // Raise after state publish; still under gate — consumers must not re-enter player commands.
-        // Documented: re-entrancy into Play/Pause/Stop/Seek/Load/Dispose from event handlers is unsupported.
         try
         {
             handler?.Invoke(this, EventArgs.Empty);

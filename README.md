@@ -1,3 +1,7 @@
+<div align="center">
+
+<img src="img/Sonora.png" alt="Sonora" width="160" />
+
 # Sonora
 
 ### A reliable .NET audio engine with a clean public API.
@@ -6,10 +10,12 @@
 
 [![.NET 10](https://img.shields.io/badge/.NET-10-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/download)
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 [Why Sonora?](#why-sonora) · [Quick start](#quick-start) · [Formats](#supported-audio-formats) · [DSP](#dsp-effects) · [Architecture](#how-it-works) · [Build](#build-and-test)
+
+</div>
 
 ---
 
@@ -26,11 +32,13 @@ It is built for apps like [EMP](https://github.com/lazytitanz/EMP) but stays com
 | **Predictable playback** | Deterministic state, resource disposal, and completion semantics |
 | **Real-time safe** | Decoding and file I/O stay off the WASAPI callback |
 | **Extensible DSP** | Equalizer, preamp, and limiter on a per-player effect rack |
+| **Gapless joins** | Preload one next track; continuous WASAPI without device restart |
 
 ### At a glance
 
 - **.NET 10** — `Sonora.Audio` (`net10.0`) and `Sonora.Audio.Windows` (`net10.0-windows10.0.19041.0`)
 - **Wide format coverage** — WAV, AIFF, MP3, AAC, M4A, FLAC, WMA, ALAC, Ogg Vorbis, Ogg Opus, WebM audio
+- **Gapless playback** — `PreloadNextAsync` + seamless hard-cut transition on one WASAPI session
 - **Dual position tracking** — `Position` (audible estimate) and `BufferedPosition` (decode frontier)
 - **Live DSP** — EQ/preamp changes apply on the output path without waiting for the PCM buffer to drain
 - **MIT licensed** — packages prepared for NuGet (`Sonora.Audio`, `Sonora.Audio.Windows`)
@@ -71,14 +79,46 @@ Console.WriteLine(player.Duration);
 | `Seek` | Seeks when the decoder supports it |
 | `Volume` | Linear gain in `[0, 1]` |
 
-**Events:** `StateChanged`, `PlaybackCompleted`, `ErrorOccurred`, `Underrun`. Raised on worker threads (not marshaled to a UI sync context).
+**Events:** `StateChanged`, `PlaybackCompleted`, `TrackTransitioned`, `ErrorOccurred`, `Underrun`. Raised on worker threads (not marshaled to a UI sync context). `TrackTransitioned` is never raised on the WASAPI callback and may fire after the next track’s samples have already entered the output pipeline.
+
+### Gapless playback
+
+Application-controlled next-track selection (no playlist manager):
+
+```csharp
+using var engine = SonoraWindows.CreateEngine();
+using var player = engine.CreatePlayer();
+
+await player.LoadAsync(@"C:\Music\Track01.flac");
+await player.PreloadNextAsync(@"C:\Music\Track02.flac");
+player.Play();
+
+player.TrackTransitioned += (_, e) =>
+{
+    // Previous track finished at the output-consumption boundary; next is now active.
+    // Delivery is deferred off the audio thread and is not ear-sample-accurate.
+};
+```
+
+| Behavior | Detail |
+| --- | --- |
+| Preload | Opens the next decoder, converts to the session format, fills a **bounded** ring (`BufferDuration`) |
+| Ready / Failed | Inspect `NextTrackState` and `NextTrackPath` |
+| Replace | Another `PreloadNextAsync` cancels/disposes the previous pending track |
+| Clear | `ClearNext()`, `Stop()`, `LoadAsync()`, and `Dispose()` clear the slot; **Seek preserves** a safe next track |
+| Transition | When the current track drains and next is `Ready`, Sonora hard-cuts into B without stopping WASAPI |
+| Not ready | Natural `PlaybackCompleted` as before (exactly once) |
+| DSP | Same effect rack and settings continue across the join (filter state is not reset at the boundary) |
+
+Mismatched sample rates/channels are converted on the decode pump (NAudio WDL on Windows). Continuous output without a device restart is guaranteed for prepared joins; **encoder-delay/padding-corrected** gapless for MP3/AAC/Opus is **not** claimed unless metadata is verified.
 
 ### Position accuracy
 
-- **`BufferedPosition`** — timeline of the latest sample written into the PCM ring buffer.
-- **`Position`** — estimated audible position (device clock when available, rebased across seeks).
+- **`BufferedPosition`** — timeline of the latest sample written into the **active** track’s PCM ring.
+- **`Position`** — estimated audible position within the active track (device clock when available, rebased across seeks and gapless handoffs; accounts for reported output latency when available).
+- **Track identity** (`SourcePath` / `Duration`) — updates at the **output-consumption** handoff, which can precede what the listener hears by device buffering/latency.
 
-Shared-mode resampling, device padding, and underruns introduce error. Positions are suitable for UI scrubbers, but are **not** sample-accurate broadcast / lip-sync grade in 0.3.0.
+Shared-mode resampling, device padding, and underruns introduce error. Positions and transition timing are suitable for UI scrubbers, but are **not** sample-accurate broadcast / lip-sync grade.
 
 ### Console sample
 
@@ -201,7 +241,9 @@ dotnet add package Sonora.Audio.Windows
 ## Current limitations
 
 - Windows only for output (WASAPI shared mode; default device only)
-- No exclusive-mode WASAPI, gapless playback, playlists, metadata, or network streaming
+- No exclusive-mode WASAPI, playlists, metadata, or network streaming
+- Gapless joins are continuous PCM hard-cuts; encoder delay/padding trimming for lossy codecs is not applied
+- Audible track-change timing is not sample-accurate under shared-mode WASAPI
 - FLAC / Media Foundation seeking is reliable for playback but not guaranteed sample-accurate
 - Bare Ogg Opus uses managed Concentus (not MF); WebM Opus depends on host Media Foundation codecs
 - WASAPI playback integration tests are tagged `Hardware` (skipped in default CI)
@@ -212,7 +254,8 @@ dotnet add package Sonora.Audio.Windows
 - Stronger WebM portability across Windows SKUs
 - Output device enumeration and selection
 - Additional DSP effects (compressor, reverb, …) on the existing rack
-- Gapless / crossfade
+- Crossfade on the existing transition stage
+- Encoder-delay/padding aware gapless where metadata is available
 - Additional platform backends
 
 ## License

@@ -27,25 +27,41 @@ player.ErrorOccurred += (_, ex) => Console.WriteLine(ex.Message);
 player.Play();
 ```
 
+## Gapless next track
+
+```csharp
+await player.LoadAsync(@"C:\music\Track01.flac");
+await player.PreloadNextAsync(@"C:\music\Track02.flac");
+
+player.TrackTransitioned += (_, e) =>
+    Console.WriteLine($"Now playing {e.NextPath}");
+
+player.Play();
+// Inspect player.NextTrackState / NextTrackPath; call ClearNext() to drop the lookahead.
+```
+
+When the current track drains and the next track is `Ready`, Sonora transitions without stopping WASAPI and without raising `PlaybackCompleted` between tracks. If nothing is ready, `PlaybackCompleted` fires as usual.
+
 ## Control playback
 
 ```csharp
 player.Pause();
 player.Play();                         // resume
-player.Seek(TimeSpan.FromMinutes(1));
-player.Stop();                         // resets to 00:00; does not raise PlaybackCompleted
+player.Seek(TimeSpan.FromMinutes(1));  // preserves a safe preloaded next track
+player.Stop();                         // resets to 00:00; clears next; does not raise PlaybackCompleted
 ```
 
 ## Read timing information
 
 ```csharp
 Console.WriteLine(player.State);
+Console.WriteLine(player.SourcePath);
 Console.WriteLine(player.Duration);
-Console.WriteLine(player.Position);           // estimated audible
+Console.WriteLine(player.Position);           // estimated audible (active track)
 Console.WriteLine(player.BufferedPosition);   // buffered decode frontier
 ```
 
-`Position` is an estimate. See the README for accuracy caveats.
+`Position` is an estimate. Gapless handoffs update identity at the output-consumption boundary and are not ear-sample-accurate. See the README for accuracy caveats.
 
 ## Console sample
 

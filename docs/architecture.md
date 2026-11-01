@@ -59,7 +59,25 @@ LoadAsync → WindowsAudioDecoderFactory → DecoderSelector (sniff)
   → Wave / AIFF / MF / Vorbis / Opus → IAudioDecoder → decode pump
 ```
 
-## DSP (0.3.0)
+## Gapless (0.4.0)
+
+```text
+Active Decoder (+ convert) → Pump → Ring A ─┐
+                                           ├→ TransitionSampleSource → EffectRack → WASAPI
+Next Decoder (+ convert) → Pump → Ring B ───┘
+```
+
+| Concern | Behavior |
+|---|---|
+| API | `PreloadNextAsync` / `ClearNext` / `NextTrackState` / `TrackTransitioned` |
+| Output | One WASAPI session for the continuous play-through; format locked at `LoadAsync` |
+| Conversion | Decode-pump only; Windows uses NAudio WDL (`WindowsAudioFormatConverter`) |
+| Transition | Hard cut; single output `Read` may span A\|B; no silence/dup/drop at the join |
+| Events | `TrackTransitioned` deferred off the audio callback; `PlaybackCompleted` only when no ready next |
+| Seek | Preserves a safe next track; does not promote or notify |
+| DSP | Same rack across joins; no `ResetProcessingState` on gapless handoff |
+
+## DSP (0.3.0+)
 
 ```text
 Decoder → [optional IAudioProcessor] → Volume → PcmRingBuffer (dry)
@@ -73,7 +91,7 @@ Decoder → [optional IAudioProcessor] → Volume → PcmRingBuffer (dry)
 | Windows | `WindowsAudioEffectFactory` wraps NAudio `Equalizer`, `GainEffect`, `LimiterEffect` |
 | Chain edits | Immutable snapshots; removed effects disposed only when the callback cannot reference them |
 | Parameter updates | Queued on the control thread; applied on the audio thread via `ApplyPendingUpdates` (includes `Equalizer.Update()`) |
-| Track changes | Effect instances/settings preserved; `Configure` + `Reset` on load/seek/stop |
+| Track changes | Effect instances/settings preserved; `Configure` + `Reset` on load/seek/stop (not on gapless handoff) |
 | PCM format | Interleaved float32 only (`WaveFormat.CreateIeeeFloatWaveFormat`) |
 | Legacy | `AudioEngineOptions.Processors` still runs on the decode pump |
 

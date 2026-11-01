@@ -46,7 +46,8 @@ Thumbs.db
 /tools/
 
 ## Local assets (not part of the library)
-/img/
+/img/*
+!/img/Sonora.png
 
 ## Secrets
 *.pfx

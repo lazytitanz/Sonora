@@ -2,6 +2,24 @@
 
 All notable changes to Sonora will be documented in this file.
 
+## 0.4.0 — 2026-11-01
+
+### Added
+
+- Gapless next-track preloading via `AudioPlayer.PreloadNextAsync` / `ClearNext`
+- `NextTrackState`, `NextTrackPath`, and `SourcePath` for preload and active-track identity
+- `TrackTransitioned` event for consumption-boundary handoffs (deferred off the audio callback)
+- Dual decode pipelines with a spanning hard-cut `TransitionSampleSource` on one continuous WASAPI session
+- Session-locked output format with Windows NAudio WDL resampling (`WindowsAudioFormatConverter`) and core channel mixing
+- Core gapless / preload / spanning-buffer / lifecycle tests (hardware-free)
+
+### Notes
+
+- Applications select the next track; Sonora does not manage playlists.
+- Seek preserves a safe preloaded next track; `Stop` / `LoadAsync` / `Dispose` clear it.
+- DSP effect settings persist across gapless joins; processing state is not reset at the boundary.
+- Continuous output without device restart is supported for prepared joins. Encoder-delay/padding-corrected gapless for lossy codecs is not claimed. `Position` and transition delivery remain estimates under shared-mode WASAPI.
+
 ## 0.3.0 — 2026-11-01
 
 ### Added

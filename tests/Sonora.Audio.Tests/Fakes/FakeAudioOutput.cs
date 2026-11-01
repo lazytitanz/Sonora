@@ -29,12 +29,16 @@ internal sealed class FakeAudioOutput : IAudioOutput
     public event EventHandler<AudioOutputStoppedEventArgs>? Stopped;
     public int PlayCount { get; private set; }
     public int StopCount { get; private set; }
+    public int InitializeCount { get; private set; }
+    public int PullThreadId { get; private set; }
+    public List<float> CapturedSamples { get; } = new();
 
     public void Initialize(IPcmSampleSource source)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         _source = source ?? throw new ArgumentNullException(nameof(source));
         Format = source.Format;
+        InitializeCount++;
     }
 
     public void Play()
@@ -125,11 +129,25 @@ internal sealed class FakeAudioOutput : IAudioOutput
     {
         var source = _source!;
         var buffer = new float[_blockSamples];
+        PullThreadId = Environment.CurrentManagedThreadId;
         try
         {
             while (!token.IsCancellationRequested && Volatile.Read(ref _playing) == 1)
             {
                 var read = source.Read(buffer);
+                if (read > 0)
+                {
+                    lock (CapturedSamples)
+                    {
+                        for (var i = 0; i < read; i++)
+                        {
+                            CapturedSamples.Add(buffer[i]);
+                        }
+                    }
+
+                    Interlocked.Add(ref _renderedSamples, read);
+                }
+
                 if (read <= 0 || source.IsEndOfStream)
                 {
                     Interlocked.Exchange(ref _playing, 0);
@@ -137,7 +155,6 @@ internal sealed class FakeAudioOutput : IAudioOutput
                     return;
                 }
 
-                Interlocked.Add(ref _renderedSamples, read);
                 Thread.Sleep(1);
             }
         }
