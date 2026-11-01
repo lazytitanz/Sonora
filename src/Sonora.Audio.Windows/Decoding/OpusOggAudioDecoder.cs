@@ -2,15 +2,22 @@ using Concentus;
 using Concentus.Oggfile;
 using Sonora.Audio.Abstractions;
 using Sonora.Audio.Formats;
+using Sonora.Audio.Seeking;
 
 namespace Sonora.Audio.Windows.Decoding;
 
 /// <summary>
 /// Ogg Opus decoder backed by Concentus + Concentus.Oggfile (managed, MIT).
+/// Seeking is page-granular; container timestamps do not establish Exact accuracy.
 /// </summary>
 internal sealed class OpusOggAudioDecoder : IAudioDecoder
 {
     private const int OpusSampleRate = 48_000;
+
+    /// <summary>Typical Opus preroll used when discarding toward a requested frame after a coarse page seek.</summary>
+    private static readonly TimeSpan PrerollHint = TimeSpan.FromMilliseconds(80);
+
+    private static readonly TimeSpan MaxDiscardWindow = TimeSpan.FromSeconds(2);
 
     private readonly string _sourcePath;
     private readonly int _channels;
@@ -49,13 +56,7 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
         {
             var opusDecoder = OpusCodecFactory.CreateDecoder(OpusSampleRate, channels);
             var ogg = new OpusOggReadStream(opusDecoder, file);
-            var decoder = new OpusOggAudioDecoder(filePath, channels, file, opusDecoder, ogg);
-            if (ogg.TotalTime <= TimeSpan.Zero)
-            {
-                // Duration may become available after the first pages; keep zero if unknown.
-            }
-
-            return decoder;
+            return new OpusOggAudioDecoder(filePath, channels, file, opusDecoder, ogg);
         }
         catch
         {
@@ -101,7 +102,7 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
         }
     }
 
-    public void Seek(TimeSpan position)
+    public AudioSeekResult Seek(TimeSpan position)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (!CanSeek)
@@ -109,22 +110,19 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
             throw new NotSupportedException("The current decoder does not support seeking.");
         }
 
-        if (position < TimeSpan.Zero)
-        {
-            position = TimeSpan.Zero;
-        }
-
-        if (Duration > TimeSpan.Zero && position > Duration)
-        {
-            position = Duration;
-        }
+        var requestedFrames = ClampRequestedFrames(position);
+        var requested = Format.FramesToTime(requestedFrames);
 
         try
         {
-            if (!TrySeekInPlace(position))
+            // Seek slightly early when possible so preroll/discard can approach the request.
+            var coarseFrames = Math.Max(0, requestedFrames - Format.TimeToFrames(PrerollHint));
+            var coarse = Format.FramesToTime(coarseFrames);
+
+            if (!TrySeekInPlace(coarse))
             {
                 Recreate();
-                if (!TrySeekInPlace(position))
+                if (!TrySeekInPlace(coarse))
                 {
                     throw new DecoderException($"Failed to seek in Opus file '{_sourcePath}' after recreate.");
                 }
@@ -133,6 +131,18 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
             _packetOffset = 0;
             _packetCount = 0;
             _reachedEnd = false;
+
+            // Best-effort discard toward the request. Page seeks do not prove frame identity,
+            // so ActualPosition stays unset (Unknown).
+            if (requestedFrames > coarseFrames)
+            {
+                var toDiscard = Math.Min(
+                    requestedFrames - coarseFrames,
+                    Format.TimeToFrames(MaxDiscardWindow));
+                DiscardFrames(toDiscard);
+            }
+
+            return AudioSeekResult.Unknown(requested);
         }
         catch (Exception ex) when (ex is DecoderException)
         {
@@ -154,6 +164,55 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
         _disposed = true;
         _ogg.Close();
         _file.Dispose();
+    }
+
+    private long ClampRequestedFrames(TimeSpan position)
+    {
+        if (position < TimeSpan.Zero)
+        {
+            position = TimeSpan.Zero;
+        }
+
+        var frames = Format.TimeToFrames(position);
+        if (Duration > TimeSpan.Zero)
+        {
+            frames = AudioFormat.ClampFrameIndex(frames, Format.TimeToFrames(Duration));
+        }
+
+        return frames;
+    }
+
+    private void DiscardFrames(long framesToDiscard)
+    {
+        if (framesToDiscard <= 0)
+        {
+            return;
+        }
+
+        var remaining = checked(framesToDiscard * _channels);
+        var scratch = new float[Math.Min(_packetScratch.Length, 4096)];
+        while (remaining > 0)
+        {
+            var chunk = (int)Math.Min(remaining, scratch.Length);
+            chunk -= chunk % _channels;
+            if (chunk <= 0)
+            {
+                break;
+            }
+
+            var read = Read(scratch.AsSpan(0, chunk));
+            if (read <= 0)
+            {
+                break;
+            }
+
+            var aligned = read - (read % _channels);
+            remaining -= aligned;
+            if (aligned <= 0)
+            {
+                break;
+            }
+        }
     }
 
     private bool TryFillPacket()
@@ -185,7 +244,6 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
         try
         {
             _ogg.SeekTo(position);
-            // Concentus may leave the stream unreadable after EOF; treat as failure.
             if (_reachedEnd && !_ogg.HasNextPacket && position < Duration)
             {
                 return false;
@@ -242,7 +300,6 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
             }
         }
 
-        // Default stereo when header is missing/odd; decoder open will fail if wrong.
         return 2;
     }
 }

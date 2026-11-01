@@ -1,4 +1,5 @@
 using Sonora.Audio.Formats;
+using Sonora.Audio.Seeking;
 using Sonora.Audio.Windows.Decoding;
 
 namespace Sonora.Audio.Windows.Tests;
@@ -81,8 +82,13 @@ public sealed class FormatConversionTests
             return n;
         }
 
-        public void Seek(TimeSpan position) =>
-            _position = (int)Math.Min(Format.TimeToSamples(position), _samples.Length);
+        public AudioSeekResult Seek(TimeSpan position)
+        {
+            var frames = Format.TimeToFrames(position);
+            _position = (int)Math.Min(frames * Format.ChannelCount, _samples.Length);
+            var requested = Format.FramesToTime(frames);
+            return AudioSeekResult.Exact(requested, requested);
+        }
 
         public void Dispose()
         {

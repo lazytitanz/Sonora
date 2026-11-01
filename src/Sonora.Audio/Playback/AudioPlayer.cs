@@ -5,6 +5,7 @@ using Sonora.Audio.DSP;
 using Sonora.Audio.Formats;
 using Sonora.Audio.Output;
 using Sonora.Audio.Playback;
+using Sonora.Audio.Seeking;
 
 namespace Sonora.Audio;
 
@@ -69,6 +70,8 @@ public sealed class AudioPlayer : IDisposable
     private TimeSpan _duration;
     private TimeSpan _deviceClockAnchor;
     private TimeSpan _logicalPositionAtAnchor;
+    /// <summary>Bumped on every position rebase (including seek-to-zero) so output rebinds observe seek intent.</summary>
+    private int _positionIntentGeneration;
 
     /// <summary>Creates a player. Prefer <see cref="AudioEngine.CreatePlayer"/>.</summary>
     public AudioPlayer(
@@ -179,8 +182,10 @@ public sealed class AudioPlayer : IDisposable
 
     /// <summary>
     /// Estimated audible playback position within the active track. Accounts for device rendered clock
-    /// and output latency when available. This is an estimate and is not sample-accurate under shared-mode
+    /// and output latency when available. This is an estimate of what is being heard — not the last
+    /// seek request, not the verified decoded landing, and not sample-accurate under shared-mode
     /// resampling, device buffering, underruns, gapless handoffs, or output device switches.
+    /// Use <see cref="SeekWithResult"/> for requested vs actual decoded seek positions.
     /// </summary>
     public TimeSpan Position
     {
@@ -330,6 +335,8 @@ public sealed class AudioPlayer : IDisposable
             heldPosition = _state is PlaybackState.Playing
                 ? EstimateAudiblePosition()
                 : _heldPosition;
+            // Snapshot so FinishOutputRebind can prefer _heldPosition (including seek-to-zero).
+            _heldPosition = heldPosition;
 
             oldOutput = DetachOutput_NoLock();
             _outputDeviceStatus = OutputDeviceStatus.Switching;
@@ -449,6 +456,7 @@ public sealed class AudioPlayer : IDisposable
             heldPosition = _state is PlaybackState.Playing
                 ? EstimateAudiblePosition()
                 : _heldPosition;
+            _heldPosition = heldPosition;
 
             oldOutput = DetachOutput_NoLock();
             _effectiveOutputMode = null;
@@ -921,7 +929,14 @@ public sealed class AudioPlayer : IDisposable
     /// <summary>
     /// Seeks within the active track. Preserves a safe preloaded next track; does not trigger a transition.
     /// </summary>
-    public void Seek(TimeSpan position)
+    public void Seek(TimeSpan position) => _ = SeekWithResult(position);
+
+    /// <summary>
+    /// Seeks within the active track and returns requested vs actual decoded landing information.
+    /// Preserves a safe preloaded next track; does not trigger a transition.
+    /// Timestamps in the result are source-timeline positions (frame-rounded).
+    /// </summary>
+    public AudioSeekResult SeekWithResult(TimeSpan position)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentOutOfRangeException.ThrowIfLessThan(position, TimeSpan.Zero);
@@ -929,59 +944,154 @@ public sealed class AudioPlayer : IDisposable
         _gate.Wait();
         try
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_active is null)
-            {
-                throw new InvalidOperationException("No audio source is loaded.");
-            }
-
-            if (!_active.Decoder.CanSeek)
-            {
-                throw new NotSupportedException("The current audio source does not support seeking.");
-            }
-
-            if (position > _duration && _duration > TimeSpan.Zero)
-            {
-                position = _duration;
-            }
-
-            // Invalidate in-flight transition notifications from a pre-seek drain.
-            _activeTrackGeneration++;
-            _suppressTransitionIdsAtOrBelow = Volatile.Read(ref _transitionId);
-
-            var wasPlaying = _state == PlaybackState.Playing;
-            _output?.Pause();
-
-            lock (_pipelineSync)
-            {
-                _active.StopPump();
-                _active.Ring.Clear();
-                _sampleSource?.ResetEndOfStream();
-                _active.Decoder.Seek(position);
-            }
-
-            _effects.ResetProcessingState();
-            _effects.DisposeRetired();
-
-            _timelineOriginSamples = _active.Format.TimeToSamples(position);
-            Interlocked.Exchange(ref _samplesDecoded, 0);
-            Interlocked.Exchange(ref _samplesConsumed, 0);
-            _completionRaised = false;
-            Interlocked.Exchange(ref _underrunLatched, 0);
-            RebasePositionClock_NoLock(position);
-
-            EnsureActivePumpRunning_NoLock();
-            if (wasPlaying && _output is not null)
-            {
-                _active.Prime(_options.PrimeDuration);
-                _output.Play();
-                SetState_NoLock(PlaybackState.Playing);
-            }
+            return SeekWithResult_NoGate(position);
         }
         finally
         {
             _gate.Release();
         }
+    }
+
+    private AudioSeekResult SeekWithResult_NoGate(TimeSpan position)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        TrackDecodePipeline active;
+        lock (_pipelineSync)
+        {
+            if (_active is null)
+            {
+                throw new InvalidOperationException("No audio source is loaded.");
+            }
+
+            active = _active;
+        }
+
+        if (!active.Decoder.CanSeek)
+        {
+            throw new NotSupportedException("The current audio source does not support seeking.");
+        }
+
+        if (position > _duration && _duration > TimeSpan.Zero)
+        {
+            position = _duration;
+        }
+
+        // Invalidate in-flight transition notifications from a pre-seek drain.
+        _activeTrackGeneration++;
+        _suppressTransitionIdsAtOrBelow = Volatile.Read(ref _transitionId);
+
+        var wasPlaying = _state == PlaybackState.Playing;
+        var wasPaused = _state == PlaybackState.Paused;
+        var previousHeld = _heldPosition;
+
+        try
+        {
+            _output?.Pause();
+        }
+        catch (Exception ex) when (ex is not ObjectDisposedException)
+        {
+            // Continue — barrier still protects DSP reset.
+        }
+
+        // Ensure no output callback can observe effect state while it is reset (no WASAPI Shutdown).
+        _sampleSource?.EnterEffectsBarrier(TimeSpan.FromSeconds(2));
+
+        AudioSeekResult result;
+        try
+        {
+            lock (_pipelineSync)
+            {
+                // Re-validate: gapless promotion may have swapped the active track.
+                if (_active is null)
+                {
+                    throw new InvalidOperationException("No audio source is loaded.");
+                }
+
+                active = _active;
+                if (!active.Decoder.CanSeek)
+                {
+                    throw new NotSupportedException("The current audio source does not support seeking.");
+                }
+
+                var duration = active.Duration > TimeSpan.Zero ? active.Duration : _duration;
+                if (position > duration && duration > TimeSpan.Zero)
+                {
+                    position = duration;
+                }
+
+                active.StopPump();
+                active.Ring.Clear();
+                _sampleSource?.ResetEndOfStream();
+                result = active.Decoder.Seek(position);
+            }
+
+            _effects.ResetProcessingState();
+            _effects.DisposeRetired();
+
+            // Authoritative timeline from evidence-backed actual when present; otherwise requested intent.
+            var timelinePosition = result.ActualPosition ?? result.RequestedPosition;
+            _timelineOriginSamples = active.Format.TimeToSamples(timelinePosition);
+            Interlocked.Exchange(ref _samplesDecoded, 0);
+            Interlocked.Exchange(ref _samplesConsumed, 0);
+            _completionRaised = false;
+            Interlocked.Exchange(ref _underrunLatched, 0);
+            // Allow natural completion again after seeking away from a prior EOS.
+            Volatile.Write(ref _acceptEndOfStreamCompletion, 1);
+            RebasePositionClock_NoLock(timelinePosition);
+        }
+        catch
+        {
+            // Leave a documented consistent state after a failed seek.
+            try
+            {
+                if (_active is not null)
+                {
+                    _active.Ring.Clear();
+                    _sampleSource?.ResetEndOfStream();
+                    EnsureActivePumpRunning_NoLock();
+                }
+
+                RebasePositionClock_NoLock(previousHeld);
+                if (wasPlaying && _output is not null)
+                {
+                    _output.Play();
+                    SetState_NoLock(PlaybackState.Playing);
+                }
+                else if (wasPaused)
+                {
+                    SetState_NoLock(PlaybackState.Paused);
+                }
+                else
+                {
+                    SetState_NoLock(PlaybackState.Stopped);
+                }
+            }
+            catch
+            {
+                // Preserve the original seek failure.
+            }
+
+            throw;
+        }
+        finally
+        {
+            _sampleSource?.ExitEffectsBarrier();
+        }
+
+        EnsureActivePumpRunning_NoLock();
+        if (wasPlaying && _output is not null)
+        {
+            active.Prime(_options.PrimeDuration);
+            _output.Play();
+            SetState_NoLock(PlaybackState.Playing);
+        }
+        else if (wasPaused)
+        {
+            SetState_NoLock(PlaybackState.Paused);
+        }
+
+        return result.EnsureInvariants();
     }
 
     /// <inheritdoc />
@@ -1436,10 +1546,15 @@ public sealed class AudioPlayer : IDisposable
         {
             if (_active.Decoder.CanSeek)
             {
-                _active.Decoder.Seek(TimeSpan.Zero);
+                var seekResult = _active.Decoder.Seek(TimeSpan.Zero);
+                var origin = seekResult.ActualPosition ?? TimeSpan.Zero;
+                _timelineOriginSamples = _active.Format.TimeToSamples(origin);
+            }
+            else
+            {
+                _timelineOriginSamples = 0;
             }
 
-            _timelineOriginSamples = 0;
             Interlocked.Exchange(ref _samplesDecoded, 0);
             Interlocked.Exchange(ref _samplesConsumed, 0);
             RebasePositionClock_NoLock(TimeSpan.Zero);
@@ -1919,6 +2034,7 @@ public sealed class AudioPlayer : IDisposable
         _logicalPositionAtAnchor = logicalPosition;
         _deviceClockAnchor = _output?.TryGetRenderedPosition() ?? TimeSpan.Zero;
         _heldPosition = logicalPosition;
+        Interlocked.Increment(ref _positionIntentGeneration);
     }
 
     private TimeSpan ClampToDuration(TimeSpan value)
@@ -2216,7 +2332,8 @@ public sealed class AudioPlayer : IDisposable
                 throw CreateSupersededException();
             }
 
-            attachPosition = _heldPosition != TimeSpan.Zero ? _heldPosition : heldPosition;
+            // Prefer the latest rebased intent (including seek-to-zero during the switch window).
+            attachPosition = _heldPosition;
 
             try
             {
@@ -2524,9 +2641,11 @@ public sealed class AudioPlayer : IDisposable
             var converted = _formatConverter.Convert(opened, requiredFormat);
             opened = null;
             pipeline = TrackDecodePipeline.Create(activePath!, converted, _options);
+            var rebuildOrigin = heldPosition;
             if (heldPosition > TimeSpan.Zero && pipeline.Decoder.CanSeek)
             {
-                pipeline.Decoder.Seek(heldPosition);
+                var seekResult = pipeline.Decoder.Seek(heldPosition);
+                rebuildOrigin = seekResult.ActualPosition ?? heldPosition;
             }
 
             await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
@@ -2536,7 +2655,7 @@ public sealed class AudioPlayer : IDisposable
                 _sessionFormat = requiredFormat;
                 Volatile.Write(ref _sourcePath, activePath);
                 _duration = pipeline.Duration;
-                _timelineOriginSamples = requiredFormat.TimeToSamples(heldPosition);
+                _timelineOriginSamples = requiredFormat.TimeToSamples(rebuildOrigin);
                 Interlocked.Exchange(ref _samplesDecoded, 0);
                 Interlocked.Exchange(ref _samplesConsumed, 0);
                 _completionRaised = false;

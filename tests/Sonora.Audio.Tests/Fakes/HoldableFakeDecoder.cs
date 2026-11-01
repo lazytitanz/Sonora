@@ -1,5 +1,6 @@
 using Sonora.Audio.Abstractions;
 using Sonora.Audio.Formats;
+using Sonora.Audio.Seeking;
 
 namespace Sonora.Audio.Tests.Fakes;
 
@@ -37,7 +38,7 @@ internal sealed class HoldableFakeDecoder : IAudioDecoder
         return _inner.Read(destination);
     }
 
-    public void Seek(TimeSpan position) => _inner.Seek(position);
+    public AudioSeekResult Seek(TimeSpan position) => _inner.Seek(position);
 
     public void Dispose()
     {

@@ -1,28 +1,38 @@
 using NAudio.Wave;
 using Sonora.Audio.Abstractions;
 using Sonora.Audio.Formats;
+using Sonora.Audio.Seeking;
 
 namespace Sonora.Audio.Windows.Decoding;
 
 /// <summary>
 /// Adapts an NAudio <see cref="WaveStream"/> to interleaved float32 <see cref="IAudioDecoder"/>.
 /// Media Foundation readers may be recreated after EOF/invalid-state seeks.
+/// MF container timestamps are hints only and never establish Exact accuracy.
 /// </summary>
 internal sealed class WaveStreamAudioDecoder : IAudioDecoder
 {
+    /// <summary>Maximum forward-discard window after a coarse seek (source time).</summary>
+    private static readonly TimeSpan MaxDiscardWindow = TimeSpan.FromSeconds(2);
+
+    /// <summary>Earlier-anchor skew used once when a coarse seek lands late of the request.</summary>
+    private static readonly TimeSpan LateLandAnchorSkew = TimeSpan.FromMilliseconds(100);
+
     private readonly string? _sourcePath;
     private readonly bool _isMediaFoundation;
+    private readonly bool _supportsExactByteSeek;
     private WaveStream _stream;
     private ISampleProvider _samples;
     private readonly float[] _conversionScratch;
     private bool _disposed;
     private bool _reachedEnd;
 
-    private WaveStreamAudioDecoder(WaveStream stream, string? sourcePath, bool isMediaFoundation)
+    private WaveStreamAudioDecoder(WaveStream stream, string? sourcePath, bool isMediaFoundation, bool supportsExactByteSeek)
     {
         _stream = stream;
         _sourcePath = sourcePath;
         _isMediaFoundation = isMediaFoundation;
+        _supportsExactByteSeek = supportsExactByteSeek;
         _samples = stream.ToSampleProvider();
         var wf = _samples.WaveFormat;
         Format = AudioFormat.CreateFloat32(wf.SampleRate, wf.Channels);
@@ -36,16 +46,16 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
     public bool CanSeek { get; }
 
     public static WaveStreamAudioDecoder OpenWave(string filePath)
-        => new(new WaveFileReader(filePath), sourcePath: null, isMediaFoundation: false);
+        => new(new WaveFileReader(filePath), sourcePath: null, isMediaFoundation: false, supportsExactByteSeek: true);
 
     public static WaveStreamAudioDecoder OpenAiff(string filePath)
-        => new(new AiffFileReader(filePath), sourcePath: null, isMediaFoundation: false);
+        => new(new AiffFileReader(filePath), sourcePath: null, isMediaFoundation: false, supportsExactByteSeek: true);
 
     public static WaveStreamAudioDecoder OpenMediaFoundation(string filePath)
-        => new(CreateMediaFoundationReader(filePath), filePath, isMediaFoundation: true);
+        => new(CreateMediaFoundationReader(filePath), filePath, isMediaFoundation: true, supportsExactByteSeek: false);
 
-    public static WaveStreamAudioDecoder FromWaveStream(WaveStream stream, string? sourcePath, bool isMediaFoundation)
-        => new(stream, sourcePath, isMediaFoundation);
+    public static WaveStreamAudioDecoder FromWaveStream(WaveStream stream, string? sourcePath, bool isMediaFoundation, bool supportsExactByteSeek = false)
+        => new(stream, sourcePath, isMediaFoundation, supportsExactByteSeek);
 
     public int Read(Span<float> destination)
     {
@@ -74,7 +84,7 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
         }
     }
 
-    public void Seek(TimeSpan position)
+    public AudioSeekResult Seek(TimeSpan position)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (!CanSeek)
@@ -82,29 +92,17 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
             throw new NotSupportedException("The current decoder does not support seeking.");
         }
 
-        if (position < TimeSpan.Zero)
-        {
-            position = TimeSpan.Zero;
-        }
-
-        if (Duration > TimeSpan.Zero && position > Duration)
-        {
-            position = Duration;
-        }
+        var requestedFrames = ClampRequestedFrames(position);
+        var requested = Format.FramesToTime(requestedFrames);
 
         try
         {
-            if (!TrySeekInPlace(position))
+            if (_supportsExactByteSeek)
             {
-                RecreateMediaFoundationReader();
-                if (!TrySeekInPlace(position))
-                {
-                    throw new DecoderException(
-                        $"Failed to seek in '{Describe()}' even after recreating the Media Foundation reader.");
-                }
+                return SeekExactPcm(requestedFrames, requested);
             }
 
-            _reachedEnd = false;
+            return SeekApproximateOrUnknown(requestedFrames, requested);
         }
         catch (Exception ex) when (ex is DecoderException)
         {
@@ -127,6 +125,115 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
         _stream.Dispose();
     }
 
+    private AudioSeekResult SeekExactPcm(long requestedFrames, TimeSpan requested)
+    {
+        CoarseSeekOrRecreate(requested);
+        AlignExactBytePosition(requestedFrames);
+
+        var landingFrames = ReadVerifiedFramePosition();
+        if (landingFrames is null)
+        {
+            return AudioSeekResult.Unknown(requested);
+        }
+
+        if (landingFrames.Value < requestedFrames)
+        {
+            DiscardFrames(requestedFrames - landingFrames.Value);
+            landingFrames = ReadVerifiedFramePosition() ?? requestedFrames;
+        }
+
+        var actual = Format.FramesToTime(landingFrames.Value);
+        if (landingFrames.Value == requestedFrames)
+        {
+            return AudioSeekResult.Exact(requested, actual);
+        }
+
+        // Byte math available but landed off the request after bounded discard.
+        return AudioSeekResult.Approximate(requested, actual);
+    }
+
+    private AudioSeekResult SeekApproximateOrUnknown(long requestedFrames, TimeSpan requested)
+    {
+        // Media Foundation / compressed paths: CurrentTime is a hint only.
+        // Forward discard may improve proximity but never establishes Exact accuracy,
+        // and CurrentTime alone is not meaningful evidence for ActualPosition.
+        if (!CoarseSeekOrRecreate(requested))
+        {
+            return AudioSeekResult.Unknown(requested);
+        }
+
+        var hintFrames = ReadHintFramePosition();
+        if (hintFrames is long early && early < requestedFrames)
+        {
+            var toDiscard = requestedFrames - early;
+            var maxDiscard = Format.TimeToFrames(MaxDiscardWindow);
+            DiscardFrames(Math.Min(toDiscard, maxDiscard));
+        }
+        else if (hintFrames is long late && late > requestedFrames && requestedFrames > 0)
+        {
+            var anchorFrames = Math.Max(0, requestedFrames - Format.TimeToFrames(LateLandAnchorSkew));
+            var anchor = Format.FramesToTime(anchorFrames);
+            if (CoarseSeekOrRecreate(anchor))
+            {
+                var retryHint = ReadHintFramePosition();
+                if (retryHint is long h && h < requestedFrames)
+                {
+                    var toDiscard = requestedFrames - h;
+                    var maxDiscard = Format.TimeToFrames(MaxDiscardWindow);
+                    DiscardFrames(Math.Min(toDiscard, maxDiscard));
+                }
+            }
+        }
+
+        // Conservative: MF/container timestamps do not prove the first retained frame.
+        return AudioSeekResult.Unknown(requested);
+    }
+
+    private long ClampRequestedFrames(TimeSpan position)
+    {
+        if (position < TimeSpan.Zero)
+        {
+            position = TimeSpan.Zero;
+        }
+
+        var frames = Format.TimeToFrames(position);
+        if (Duration > TimeSpan.Zero)
+        {
+            var maxFrames = Format.TimeToFrames(Duration);
+            frames = AudioFormat.ClampFrameIndex(frames, maxFrames);
+        }
+        else if (frames < 0)
+        {
+            frames = 0;
+        }
+
+        return frames;
+    }
+
+    private bool CoarseSeekOrRecreate(TimeSpan position)
+    {
+        if (TrySeekInPlace(position))
+        {
+            _reachedEnd = false;
+            return true;
+        }
+
+        if (!_isMediaFoundation)
+        {
+            throw new DecoderException($"Failed to seek in '{Describe()}'.");
+        }
+
+        RecreateMediaFoundationReader();
+        if (!TrySeekInPlace(position))
+        {
+            throw new DecoderException(
+                $"Failed to seek in '{Describe()}' even after recreating the Media Foundation reader.");
+        }
+
+        _reachedEnd = false;
+        return true;
+    }
+
     private bool TrySeekInPlace(TimeSpan position)
     {
         try
@@ -138,6 +245,99 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
         catch (Exception ex) when (_isMediaFoundation && (_reachedEnd || IsInvalidState(ex)))
         {
             return false;
+        }
+    }
+
+    private void AlignExactBytePosition(long requestedFrames)
+    {
+        var bytesPerFrame = _stream.WaveFormat.BlockAlign;
+        if (bytesPerFrame <= 0)
+        {
+            return;
+        }
+
+        var target = checked(requestedFrames * bytesPerFrame);
+        if (target > _stream.Length)
+        {
+            target = _stream.Length - (_stream.Length % bytesPerFrame);
+        }
+
+        if (target < 0)
+        {
+            target = 0;
+        }
+
+        _stream.Position = target;
+        _samples = _stream.ToSampleProvider();
+    }
+
+    private long? ReadVerifiedFramePosition()
+    {
+        if (!_supportsExactByteSeek)
+        {
+            return null;
+        }
+
+        var bytesPerFrame = _stream.WaveFormat.BlockAlign;
+        if (bytesPerFrame <= 0)
+        {
+            return null;
+        }
+
+        return _stream.Position / bytesPerFrame;
+    }
+
+    /// <summary>Hint only — never treat as verified source-frame proof.</summary>
+    private long? ReadHintFramePosition()
+    {
+        try
+        {
+            if (_stream.CurrentTime < TimeSpan.Zero)
+            {
+                return null;
+            }
+
+            return Format.TimeToFrames(_stream.CurrentTime);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void DiscardFrames(long framesToDiscard)
+    {
+        if (framesToDiscard <= 0)
+        {
+            return;
+        }
+
+        var channels = Format.ChannelCount;
+        var remaining = checked(framesToDiscard * channels);
+        while (remaining > 0)
+        {
+            var chunk = (int)Math.Min(remaining, _conversionScratch.Length);
+            // Trim to whole frames.
+            chunk -= chunk % channels;
+            if (chunk <= 0)
+            {
+                break;
+            }
+
+            var read = _samples.Read(_conversionScratch.AsSpan(0, chunk));
+            if (read <= 0)
+            {
+                _reachedEnd = true;
+                break;
+            }
+
+            // Keep frame alignment if the provider returns a partial block.
+            var frameAligned = read - (read % channels);
+            remaining -= frameAligned;
+            if (frameAligned <= 0)
+            {
+                break;
+            }
         }
     }
 
@@ -181,5 +381,5 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
         return false;
     }
 
-    private string Describe() => _stream.GetType().Name;
+    private string Describe() => _sourcePath ?? _stream.GetType().Name;
 }

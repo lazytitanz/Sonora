@@ -37,6 +37,10 @@ Ordered teardown: stop output → stop pump → dispose decoder/output.
 
 - `BufferedPosition` — decode frontier (samples written to the ring).
 - `Position` — estimated audible time. On Windows, `WasapiPlayer.GetPosition()` is rebased at load/seek/stop so the logical timeline remains consistent.
+- `SeekWithResult` — requested vs actual source-frame landing (`AudioSeekResult`); `Unknown` ⇒ null `ActualPosition`.
+- Frame indices are authoritative inside converters (`TimeToFrames` / `FramesToTime`); `TimeSpan` is used at API boundaries.
+
+Seek path: pause output → enter effects barrier (silence pull; wait for in-flight Read) → stop pump / clear ring → `IAudioDecoder.Seek` → reset DSP → rebase timeline → exit barrier → resume if playing. Does not `Shutdown` WASAPI per seek.
 
 Accuracy limits are documented in the README.
 
@@ -52,7 +56,9 @@ Accuracy limits are documented in the README.
 | MP3 / ADTS AAC / M4A / ALAC / WMA / FLAC / WebM | `MediaFoundationReader` with `RepositionInRead=false`, `RequestFloatOutput=true` |
 | Ogg Vorbis | `VorbisWaveReader` (NAudio.Vorbis / NVorbis) |
 | Ogg Opus | Concentus + Concentus.Oggfile (`OpusOggAudioDecoder`) |
-| MF seek | Immediate `CurrentTime` seek; recreate reader only as fallback after EOF/invalid state |
+| MF seek | Coarse `CurrentTime` seek + bounded forward discard; recreate after EOF/invalid state; never Exact from MF timestamps alone |
+| WAV/AIFF seek | Frame-aligned byte `Position`; may report `Exact` |
+| Opus seek | Page-granular `SeekTo` + preroll discard; `Unknown` accuracy |
 
 ```text
 LoadAsync → WindowsAudioDecoderFactory → DecoderSelector (sniff)

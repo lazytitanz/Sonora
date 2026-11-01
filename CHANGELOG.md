@@ -2,6 +2,39 @@
 
 All notable changes to Sonora will be documented in this file.
 
+## 0.7.0 — 2026-11-01
+
+### Added
+
+- `AudioSeekResult` / `AudioSeekAccuracy` (`Exact`, `Approximate`, `Unknown`) with nullable `ActualPosition`
+- `AudioPlayer.SeekWithResult(TimeSpan)` returning requested vs actual decoded landing
+- Frame-authoritative `AudioFormat.TimeToFrames` / `FramesToTime` (tick arithmetic; round-trip safe)
+- Bounded forward-discard after coarse seeks (WAV/AIFF/MF/Opus) without fabricating accuracy claims
+- Deterministic seek accuracy tests (index-coded PCM, seek-to-zero during output switch, MF non-Exact policy)
+
+### Changed
+
+- **Breaking:** `IAudioDecoder.Seek` now returns `AudioSeekResult` (was `void`)
+- `AudioPlayer.Seek` preserved as a void wrapper over `SeekWithResult`
+- Timeline rebase after seek uses evidence-backed `ActualPosition` when present; otherwise requested-frame intent
+- `WdlFormatConvertingDecoder` rebuilds the provider graph on seek (exception-safe; demotes Exact→Approximate when resampling)
+- Seek quiesces the output pull path via an effects barrier so DSP `Reset` cannot race active callbacks (no WASAPI Shutdown per seek)
+
+### Fixed
+
+- Seek vs gapless promotion re-validates the active pipeline under `_pipelineSync`
+- Seek-to-zero during an output-switch window is no longer overridden by a stale nonzero snapshot
+- Failed seeks leave a consistent playback state instead of a half-cleared Playing session
+- Seeking after EOS re-arms natural completion acceptance without raising a false `PlaybackCompleted`
+
+### Notes
+
+- `Position` remains an **audible estimate**; use `SeekWithResult` for requested/actual seek semantics.
+- WAV/AIFF may report `Exact` when byte-position math proves the first retained frame.
+- Media Foundation formats (FLAC, MP3, AAC/M4A, ALAC, WMA, WebM) and Ogg Opus do **not** claim `Exact` from container/`CurrentTime` timestamps; forward discard may improve proximity but returns `Unknown` (null `ActualPosition`) unless stronger evidence exists.
+- `Unknown` never fabricates an actual position.
+- Gapless next-track preservation and v0.5.0 output-quiescence guarantees are unchanged.
+
 ## 0.6.0 — 2026-11-01
 
 ### Added

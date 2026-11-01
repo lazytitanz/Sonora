@@ -1,5 +1,6 @@
 using Sonora.Audio.Abstractions;
 using Sonora.Audio.Formats;
+using Sonora.Audio.Seeking;
 using Sonora.Audio.Tests.Fakes;
 
 namespace Sonora.Audio.Tests;
@@ -89,7 +90,7 @@ public sealed class UnderrunTests
             return 0;
         }
 
-        public void Seek(TimeSpan position) => throw new NotSupportedException();
+        public AudioSeekResult Seek(TimeSpan position) => throw new NotSupportedException();
 
         public void Dispose()
         {

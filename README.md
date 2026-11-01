@@ -76,7 +76,8 @@ Console.WriteLine(player.Duration);
 | `Play` | Starts or resumes |
 | `Pause` | Preserves position |
 | `Stop` | Stops and resets to the beginning (does not raise completion) |
-| `Seek` | Seeks when the decoder supports it |
+| `Seek` | Seeks when the decoder supports it (preserves a safe next track) |
+| `SeekWithResult` | Same as `Seek`, returns `AudioSeekResult` (requested / actual / accuracy) |
 | `Volume` | Linear gain in `[0, 1]` |
 
 **Events:** `StateChanged`, `PlaybackCompleted`, `TrackTransitioned`, `OutputDeviceChanged`, `OutputConfigurationChanged`, `ErrorOccurred`, `Underrun`. Raised on worker threads (not marshaled to a UI sync context). `TrackTransitioned` is never raised on the WASAPI callback and may fire after the next track’s samples have already entered the output pipeline.
@@ -180,11 +181,18 @@ Mismatched sample rates/channels are converted on the decode pump (NAudio WDL on
 
 ### Position accuracy
 
-- **`BufferedPosition`** — timeline of the latest sample written into the **active** track’s PCM ring.
-- **`Position`** — estimated audible position within the active track (device clock when available, rebased across seeks and gapless handoffs; accounts for reported output latency when available).
+- **`BufferedPosition`** — timeline of the latest sample written into the **active** track’s PCM ring (decode frontier).
+- **`Position`** — estimated **audible** position within the active track (device clock when available, rebased across seeks and gapless handoffs; accounts for reported output latency when available). Not the last seek request and not a verified decoded cursor.
+- **`SeekWithResult`** — reports `RequestedPosition`, optional `ActualPosition` (null when `Unknown`), and `AudioSeekAccuracy`. Timestamps are source-decoder frame times (floor frame rounding).
 - **Track identity** (`SourcePath` / `Duration`) — updates at the **output-consumption** handoff, which can precede what the listener hears by device buffering/latency.
 
-Shared-mode resampling, device padding, and underruns introduce error. Positions and transition timing are suitable for UI scrubbers, but are **not** sample-accurate broadcast / lip-sync grade.
+| Accuracy | Meaning |
+| --- | --- |
+| `Exact` | First retained source frame matches the requested frame (proven; WAV/AIFF when byte math verifies) |
+| `Approximate` | Landed near the request with evidence-backed `ActualPosition` (not mere container timestamps) |
+| `Unknown` | Reposition attempted; actual landing could not be established (`ActualPosition` is null) |
+
+Shared-mode resampling, device padding, and underruns introduce error. Positions and transition timing are suitable for UI scrubbers, but are **not** sample-accurate broadcast / lip-sync grade. Media Foundation seeks are never labeled `Exact` solely because a timestamp was accepted.
 
 ### Console sample
 
@@ -207,7 +215,7 @@ Formats are selected by container/header sniffing (not extension alone). Only fo
 | M4A (AAC) | Media Foundation | MPEG-4 AAC |
 | M4A (ALAC) | Media Foundation | Apple Lossless in `.m4a` (Win10+) |
 | WMA | Media Foundation | ASF / WMA |
-| FLAC | Media Foundation | Seek is content-verified but not sample-accurate |
+| FLAC | Media Foundation | Content-verified seeks; accuracy is `Unknown`/`Approximate`, never Exact from MF timestamps |
 | Ogg Vorbis | NVorbis + NAudio.Vorbis | Managed MIT |
 | Ogg Opus (`.opus`) | Concentus + Concentus.Oggfile | Managed MIT; MF does not open bare `.opus` reliably |
 | WebM (Opus) | Media Foundation | Fixture-verified; WebM Vorbis is not claimed (MF codecs vary by Windows SKU) |
@@ -313,7 +321,7 @@ dotnet add package Sonora.Audio.Windows
 - No metadata extraction or network streaming
 - Gapless joins are continuous PCM hard-cuts; encoder delay/padding trimming for lossy codecs is not applied
 - Audible track-change timing is not sample-accurate under shared-mode WASAPI
-- FLAC / Media Foundation seeking is reliable for playback but not guaranteed sample-accurate
+- FLAC / Media Foundation seeking is reliable for playback; sample-accurate (`Exact`) seeking is not claimed for MF-backed formats
 - Bare Ogg Opus uses managed Concentus (not MF); WebM Opus depends on host Media Foundation codecs
 - WASAPI playback integration tests are tagged `Hardware` (skipped in default CI)
 - Zero-lookahead limiting can allow brief overs under extreme boosts

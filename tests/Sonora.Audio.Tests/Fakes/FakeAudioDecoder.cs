@@ -1,5 +1,6 @@
 using Sonora.Audio.Abstractions;
 using Sonora.Audio.Formats;
+using Sonora.Audio.Seeking;
 
 namespace Sonora.Audio.Tests.Fakes;
 
@@ -18,6 +19,18 @@ internal sealed class FakeAudioDecoder : IAudioDecoder
         Duration = format.SamplesToTime(samples.Length);
         _readDelay = readDelay;
     }
+
+    /// <summary>
+    /// When set, <see cref="Seek"/> returns this accuracy after applying the configured landing policy.
+    /// Defaults to Exact at the frame-rounded request.
+    /// </summary>
+    public AudioSeekAccuracy SeekAccuracy { get; set; } = AudioSeekAccuracy.Exact;
+
+    /// <summary>
+    /// Optional early landing offset applied before discard simulation (source frames).
+    /// Used to exercise Approximate/Exact discard behavior.
+    /// </summary>
+    public long SeekEarlyFrames { get; set; }
 
     public static FakeAudioDecoder CreateSilence(AudioFormat format, TimeSpan duration)
     {
@@ -66,7 +79,7 @@ internal sealed class FakeAudioDecoder : IAudioDecoder
         return toCopy;
     }
 
-    public void Seek(TimeSpan position)
+    public AudioSeekResult Seek(TimeSpan position)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (!CanSeek)
@@ -84,7 +97,31 @@ internal sealed class FakeAudioDecoder : IAudioDecoder
             position = Duration;
         }
 
-        _position = (int)Math.Min(Format.TimeToSamples(position), _samples.Length);
+        var requestedFrames = Format.TimeToFrames(position);
+        var maxFrames = Format.TimeToFrames(Duration);
+        requestedFrames = AudioFormat.ClampFrameIndex(requestedFrames, maxFrames);
+        var requested = Format.FramesToTime(requestedFrames);
+
+        if (SeekAccuracy == AudioSeekAccuracy.Unknown)
+        {
+            _position = (int)Math.Min(requestedFrames * Format.ChannelCount, _samples.Length);
+            return AudioSeekResult.Unknown(requested);
+        }
+
+        var landingFrames = Math.Max(0, requestedFrames - Math.Max(0, SeekEarlyFrames));
+        _position = (int)Math.Min(landingFrames * Format.ChannelCount, _samples.Length);
+
+        // Simulate forward discard to the request when we landed early.
+        if (landingFrames < requestedFrames)
+        {
+            _position = (int)Math.Min(requestedFrames * Format.ChannelCount, _samples.Length);
+            landingFrames = requestedFrames;
+        }
+
+        var actual = Format.FramesToTime(landingFrames);
+        return SeekAccuracy == AudioSeekAccuracy.Approximate
+            ? AudioSeekResult.Approximate(requested, actual)
+            : AudioSeekResult.Exact(requested, actual);
     }
 
     public void Dispose()

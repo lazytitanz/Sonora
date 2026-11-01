@@ -1,5 +1,6 @@
 using Sonora.Audio.Abstractions;
 using Sonora.Audio.Formats;
+using Sonora.Audio.Seeking;
 
 namespace Sonora.Audio.Tests.Fakes;
 
@@ -23,6 +24,9 @@ internal sealed class SequenceFakeDecoder : IAudioDecoder
     public TimeSpan Duration { get; }
     public bool CanSeek => true;
 
+    /// <summary>Current interleaved sample read cursor.</summary>
+    public int PositionSamples => _position;
+
     public int Read(Span<float> destination)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -38,10 +42,20 @@ internal sealed class SequenceFakeDecoder : IAudioDecoder
         return toCopy;
     }
 
-    public void Seek(TimeSpan position)
+    public AudioSeekResult Seek(TimeSpan position)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        _position = (int)Math.Min(Format.TimeToSamples(position), _samples.Length);
+        if (position < TimeSpan.Zero)
+        {
+            position = TimeSpan.Zero;
+        }
+
+        var frames = Format.TimeToFrames(position);
+        var maxFrames = _samples.Length / Format.ChannelCount;
+        frames = AudioFormat.ClampFrameIndex(frames, maxFrames);
+        _position = (int)(frames * Format.ChannelCount);
+        var requested = Format.FramesToTime(frames);
+        return AudioSeekResult.Exact(requested, requested);
     }
 
     public void Dispose() => _disposed = true;

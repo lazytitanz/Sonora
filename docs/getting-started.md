@@ -75,6 +75,8 @@ When the current track drains and the next track is `Ready`, Sonora transitions 
 player.Pause();
 player.Play();                         // resume
 player.Seek(TimeSpan.FromMinutes(1));  // preserves a safe preloaded next track
+var seek = player.SeekWithResult(TimeSpan.FromSeconds(30));
+// seek.RequestedPosition / seek.ActualPosition / seek.Accuracy
 player.Stop();                         // resets to 00:00; clears next; does not raise PlaybackCompleted
 ```
 
@@ -113,7 +115,7 @@ Console.WriteLine(player.Position);           // estimated audible (active track
 Console.WriteLine(player.BufferedPosition);   // buffered decode frontier
 ```
 
-`Position` is an estimate. Gapless handoffs update identity at the output-consumption boundary and are not ear-sample-accurate. See the README for accuracy caveats.
+`Position` is an audible estimate — not the last seek request. Use `SeekWithResult` for requested vs actual decoded landings (`ActualPosition` is null when accuracy is `Unknown`). Gapless handoffs update identity at the output-consumption boundary and are not ear-sample-accurate. See the README for accuracy caveats.
 
 ## Console sample
 
@@ -142,4 +144,4 @@ Effects process after the PCM buffer so slider changes are audible immediately. 
 
 On Windows, Sonora supports WAV, AIFF, MP3, ADTS AAC, M4A (AAC and ALAC), WMA, FLAC, Ogg Vorbis, Ogg Opus, and WebM Opus when the host can decode them. See the README format table for backends and caveats.
 
-FLAC / Media Foundation seeking is fixture-verified for correct audio content after seeks, but positioning is not guaranteed to be sample-accurate.
+FLAC / Media Foundation seeking is fixture-verified for correct audio content after seeks. Those backends do not report `AudioSeekAccuracy.Exact` from container timestamps alone; WAV/AIFF may report Exact when byte-position math verifies the landing.

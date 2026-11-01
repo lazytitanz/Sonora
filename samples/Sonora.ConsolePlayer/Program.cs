@@ -124,7 +124,14 @@ static void SeekBy(AudioPlayer player, TimeSpan delta)
 
     try
     {
-        player.Seek(target);
+        var result = player.SeekWithResult(target);
+        if (result.Accuracy != Sonora.Audio.Seeking.AudioSeekAccuracy.Exact)
+        {
+            Console.WriteLine();
+            Console.WriteLine(
+                $"Seek {result.Accuracy}: requested {FormatTime(result.RequestedPosition)}" +
+                (result.ActualPosition is { } actual ? $", actual {FormatTime(actual)}" : ", actual unknown"));
+        }
     }
     catch (Exception ex)
     {

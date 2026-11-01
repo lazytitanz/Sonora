@@ -1,5 +1,6 @@
 using Sonora.Audio.Abstractions;
 using Sonora.Audio.Formats;
+using Sonora.Audio.Seeking;
 
 namespace Sonora.Audio.Playback;
 
@@ -74,7 +75,7 @@ internal sealed class ChannelMixingDecoder : IAudioDecoder
         return frames * dstCh;
     }
 
-    public void Seek(TimeSpan position) => _inner.Seek(position);
+    public AudioSeekResult Seek(TimeSpan position) => _inner.Seek(position);
 
     public void Dispose()
     {
