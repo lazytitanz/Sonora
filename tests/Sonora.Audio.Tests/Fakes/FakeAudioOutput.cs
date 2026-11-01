@@ -1,5 +1,6 @@
 using Sonora.Audio.Abstractions;
 using Sonora.Audio.Formats;
+using Sonora.Audio.Output;
 
 namespace Sonora.Audio.Tests.Fakes;
 
@@ -13,7 +14,7 @@ internal class FakeAudioOutput : IAudioOutput
     private readonly TimeSpan _shutdownTimeout;
     private IPcmSampleSource? _source;
     private CancellationTokenSource? _cts;
-    private Task? _loop;
+    private Thread? _loopThread;
     private long _renderedSamples;
     private int _playing;
     private bool _shutdown;
@@ -44,6 +45,19 @@ internal class FakeAudioOutput : IAudioOutput
     public int PullThreadId { get; private set; }
     public List<float> CapturedSamples { get; } = new();
     public bool IsShutdown => _shutdown;
+
+    /// <summary>
+    /// True when no pull loop is running. Use after <see cref="Pause"/> / <see cref="Stop"/>
+    /// to synchronize before output rebind without relying on wall-clock delays.
+    /// </summary>
+    public bool IsPullLoopIdle
+    {
+        get
+        {
+            var thread = _loopThread;
+            return thread is null || !thread.IsAlive;
+        }
+    }
 
     /// <summary>When set, <see cref="Shutdown"/> throws after attempting to stop the loop.</summary>
     public Func<Exception>? ShutdownFault { get; set; }
@@ -77,9 +91,15 @@ internal class FakeAudioOutput : IAudioOutput
 
         _cts = new CancellationTokenSource();
         var token = _cts.Token;
-        // Do not pass token to Task.Run — Pause/Stop cancel the CTS cooperatively inside Loop
-        // without marking the task cancelled before Shutdown can join it.
-        _loop = Task.Run(() => Loop(token));
+        // Dedicated thread (not ThreadPool): under parallel xUnit load, Task.Run pull loops
+        // can starve so Shutdown's join times out with Unspecified before exclusive create runs.
+        var thread = new Thread(() => Loop(token))
+        {
+            IsBackground = true,
+            Name = "Sonora.FakeAudioOutput.Pull",
+        };
+        _loopThread = thread;
+        thread.Start();
     }
 
     public void Pause()
@@ -93,6 +113,9 @@ internal class FakeAudioOutput : IAudioOutput
         {
             // ignored
         }
+
+        // Join so Pause → ConfigureOutputAsync always sees an idle consumer (deterministic quiescence).
+        JoinLoop(TimeSpan.FromSeconds(2));
     }
 
     public void Stop()
@@ -137,8 +160,10 @@ internal class FakeAudioOutput : IAudioOutput
 
         if (!JoinLoop(_shutdownTimeout))
         {
+            // Match WasapiAudioOutput: quiescence failure is ShutdownFailed, not Unspecified.
             throw new AudioOutputException(
-                "Timed out waiting for the output pull loop to stop; replacement output was not started.");
+                "Timed out waiting for the output pull loop to stop; replacement output was not started.",
+                AudioOutputFailureKind.ShutdownFailed);
         }
 
         var fault = ShutdownFault?.Invoke();
@@ -215,25 +240,13 @@ internal class FakeAudioOutput : IAudioOutput
 
     private bool JoinLoop(TimeSpan timeout)
     {
-        var loop = _loop;
-        if (loop is null || loop.IsCompleted)
+        var thread = _loopThread;
+        if (thread is null || !thread.IsAlive)
         {
             return true;
         }
 
-        try
-        {
-            return loop.Wait(timeout);
-        }
-        catch (AggregateException)
-        {
-            // Pull loop finished (possibly with an error); it will not read again.
-            return loop.IsCompleted;
-        }
-        catch
-        {
-            return loop.IsCompleted;
-        }
+        return thread.Join(timeout);
     }
 
     private void Loop(CancellationToken token)

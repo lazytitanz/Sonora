@@ -168,36 +168,66 @@ public sealed class GaplessPlaybackTests
     [Fact]
     public async Task Gapless_DoesNotRaisePlaybackCompletedBetweenTracks()
     {
+        // Root cause of CI flake: both tracks were short finite tones. By the time the test
+        // observed TrackTransitioned, B had often already reached EOS and raised the single
+        // legitimate PlaybackCompleted — so "expected 0 completed" failed even though the
+        // completion was not premature at the A→B boundary. Hold B open after promotion.
+        HoldableFakeDecoder? trackB = null;
         var factory = new FakeAudioDecoderFactory((path, _) =>
-            Task.FromResult<IAudioDecoder>(
-                FakeAudioDecoder.CreateTone(Format, TimeSpan.FromMilliseconds(80))));
+        {
+            if (path == "a.wav")
+            {
+                return Task.FromResult<IAudioDecoder>(
+                    FakeAudioDecoder.CreateTone(Format, TimeSpan.FromMilliseconds(50)));
+            }
+
+            trackB = new HoldableFakeDecoder(
+                FakeAudioDecoder.CreateTone(Format, TimeSpan.FromMilliseconds(50)));
+            return Task.FromResult<IAudioDecoder>(trackB);
+        });
+
         using var engine = new AudioEngine(factory, new FakeAudioOutputFactory(), new AudioEngineOptions { PrimeDuration = TimeSpan.Zero });
         using var player = engine.CreatePlayer();
         var completed = 0;
         var transitions = 0;
-        player.PlaybackCompleted += (_, _) => Interlocked.Increment(ref completed);
-        player.TrackTransitioned += (_, _) => Interlocked.Increment(ref transitions);
+        var eventOrder = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        player.TrackTransitioned += (_, _) =>
+        {
+            Interlocked.Increment(ref transitions);
+            eventOrder.Enqueue(
+                $"transition source={player.SourcePath} next={player.NextTrackState} completed={Volatile.Read(ref completed)}");
+        };
+        player.PlaybackCompleted += (_, _) =>
+        {
+            Interlocked.Increment(ref completed);
+            eventOrder.Enqueue(
+                $"complete source={player.SourcePath} next={player.NextTrackState}");
+        };
 
         await player.LoadAsync("a.wav");
         await player.PreloadNextAsync("b.wav");
+        Assert.NotNull(trackB);
+        Assert.Equal(NextTrackState.Ready, player.NextTrackState);
         player.Play();
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (Volatile.Read(ref transitions) == 0 && sw.Elapsed < TimeSpan.FromSeconds(5))
-        {
-            await Task.Delay(20);
-        }
+        await WaitForAsync(() => Volatile.Read(ref transitions) >= 1, TimeSpan.FromSeconds(10));
 
         Assert.Equal(1, Volatile.Read(ref transitions));
-        Assert.Equal(0, Volatile.Read(ref completed));
+        Assert.Equal("b.wav", player.SourcePath);
+        Assert.Equal(NextTrackState.None, player.NextTrackState);
+        Assert.True(
+            Volatile.Read(ref completed) == 0,
+            "PlaybackCompleted must not fire at A→B while B is still held open. Order: "
+            + string.Join(" | ", eventOrder));
 
-        sw.Restart();
-        while (Volatile.Read(ref completed) == 0 && sw.Elapsed < TimeSpan.FromSeconds(5))
-        {
-            await Task.Delay(20);
-        }
+        trackB.Release();
+        await WaitForAsync(() => Volatile.Read(ref completed) >= 1, TimeSpan.FromSeconds(10));
 
         Assert.Equal(1, Volatile.Read(ref completed));
+        Assert.Equal(1, Volatile.Read(ref transitions));
+        Assert.Equal(
+            new[] { "transition", "complete" },
+            eventOrder.Select(e => e.Split(' ')[0]).ToArray());
     }
 
     [Fact]
@@ -327,5 +357,21 @@ public sealed class GaplessPlaybackTests
         await Task.Delay(50);
         Assert.Equal(0, Volatile.Read(ref completed));
         Assert.Equal(NextTrackState.None, player.NextTrackState);
+    }
+
+    private static async Task WaitForAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.Elapsed < timeout)
+        {
+            if (condition())
+            {
+                return;
+            }
+
+            await Task.Delay(10);
+        }
+
+        Assert.True(condition(), "Condition not met before timeout.");
     }
 }

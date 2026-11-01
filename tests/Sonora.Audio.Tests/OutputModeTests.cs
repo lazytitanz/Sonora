@@ -46,18 +46,25 @@ public class OutputModeTests
     [Fact]
     public async Task StrictExclusive_CreateFailure_PreservesSourceForRetry()
     {
-        var count = 0;
+        // Instrumentation: exclusive create must run only after old-output Shutdown succeeds.
+        // Prior CI flake: Pause left a ThreadPool pull loop runnable; under parallel load the
+        // join timed out and ConfigureOutputAsync threw Unspecified *before* exclusive create.
+        var exclusiveCreateCount = 0;
+        var sharedCreateCount = 0;
+        FakeAudioOutput? sharedOutput = null;
         var outputs = new FakeAudioOutputFactory((req, _) =>
         {
-            count++;
             if (req.Mode == AudioOutputMode.Exclusive)
             {
+                Interlocked.Increment(ref exclusiveCreateCount);
                 throw new AudioOutputException(
                     "busy",
                     AudioOutputFailureKind.DeviceBusy);
             }
 
-            return new FakeAudioOutput(endpointId: req.DeviceId ?? "a");
+            Interlocked.Increment(ref sharedCreateCount);
+            sharedOutput = new FakeAudioOutput(endpointId: req.DeviceId ?? "a");
+            return sharedOutput;
         });
 
         using var engine = CreateEngine(outputs: outputs);
@@ -67,6 +74,13 @@ public class OutputModeTests
         player.Play();
         player.Pause();
 
+        Assert.NotNull(sharedOutput);
+        Assert.True(
+            sharedOutput.IsPullLoopIdle,
+            "Pause must join the pull loop so Shutdown cannot time out before exclusive create.");
+        Assert.Equal(1, Volatile.Read(ref sharedCreateCount));
+        Assert.Equal(0, Volatile.Read(ref exclusiveCreateCount));
+
         var exclusiveError = await Assert.ThrowsAsync<AudioOutputException>(() => player.ConfigureOutputAsync(
             new AudioOutputConfiguration
             {
@@ -74,6 +88,9 @@ public class OutputModeTests
                 ExclusiveFallback = ExclusiveModeFallback.None,
             }));
 
+        Assert.True(
+            Volatile.Read(ref exclusiveCreateCount) >= 1,
+            "Exclusive factory must be invoked; Unspecified usually means Shutdown failed first.");
         Assert.Equal(AudioOutputFailureKind.DeviceBusy, exclusiveError.FailureKind);
         Assert.True(player.HasSource);
         Assert.Equal(PlaybackState.Stopped, player.State);
