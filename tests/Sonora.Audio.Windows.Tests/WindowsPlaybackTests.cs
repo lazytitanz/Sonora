@@ -8,6 +8,7 @@ public sealed class WindowsPlaybackTests
     [Fact]
     public async Task Wav_PlayCompletesNaturally()
     {
+        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
         var path = FixtureHelper.EnsureToneWav(TimeSpan.FromMilliseconds(200));
         using var engine = SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();
@@ -35,17 +36,8 @@ public sealed class WindowsPlaybackTests
     [Fact]
     public async Task M4a_PlayCompletesNaturally()
     {
-        string path;
-        try
-        {
-            path = FixtureHelper.EnsureToneM4a(TimeSpan.FromMilliseconds(250));
-        }
-        catch (Exception ex)
-        {
-            Assert.Fail($"M4A fixture generation failed: {ex}");
-            return;
-        }
-
+        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
+        var path = FixtureHelper.EnsureToneM4a(TimeSpan.FromMilliseconds(250));
         using var engine = SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();
 
@@ -72,17 +64,8 @@ public sealed class WindowsPlaybackTests
     [Fact]
     public async Task M4a_SeekDuringPlayback()
     {
-        string path;
-        try
-        {
-            path = FixtureHelper.EnsureToneM4a(TimeSpan.FromMilliseconds(800));
-        }
-        catch (Exception ex)
-        {
-            Assert.Fail($"M4A fixture generation failed: {ex}");
-            return;
-        }
-
+        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
+        var path = FixtureHelper.EnsureToneM4a(TimeSpan.FromMilliseconds(800));
         using var engine = SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();
         await player.LoadAsync(path);
@@ -103,6 +86,7 @@ public sealed class WindowsPlaybackTests
     [Fact]
     public async Task Wav_SeekAndPositionsAdvance()
     {
+        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
         var path = FixtureHelper.EnsureToneWav(TimeSpan.FromMilliseconds(800));
         using var engine = SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();

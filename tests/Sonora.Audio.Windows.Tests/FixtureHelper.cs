@@ -33,108 +33,76 @@ internal static class FixtureHelper
     }
 
     public static string EnsureToneMp3(TimeSpan duration)
-    {
-        var path = Path.Combine(FixturesDirectory, $"tone-{duration.TotalMilliseconds:0}ms.mp3");
-        lock (Gate)
-        {
-            if (File.Exists(path))
+        => EnsureEncodedOrCommitted(
+            $"tone-{duration.TotalMilliseconds:0}ms.mp3",
+            "tone-1s.mp3",
+            duration,
+            path =>
             {
-                return path;
-            }
-
-            var wav = EnsureToneWav(duration);
-            using var reader = new AudioFileReader(wav);
-            MediaFoundationEncoder.EncodeToMp3(reader, path, 128000);
-            return path;
-        }
-    }
+                var wav = EnsureToneWav(duration);
+                using var reader = new AudioFileReader(wav);
+                MediaFoundationEncoder.EncodeToMp3(reader, path, 128000);
+            });
 
     public static string EnsureToneFlac(TimeSpan duration)
-    {
-        var path = Path.Combine(FixturesDirectory, $"tone-{duration.TotalMilliseconds:0}ms.flac");
-        lock (Gate)
-        {
-            if (File.Exists(path))
+        => EnsureEncodedOrCommitted(
+            $"tone-{duration.TotalMilliseconds:0}ms.flac",
+            "tone-1s.flac",
+            duration,
+            path =>
             {
-                return path;
-            }
-
-            var wav = EnsureToneWav(duration);
-            using var reader = new AudioFileReader(wav);
-            MediaFoundationEncoder.EncodeToFlac(reader, path);
-            return path;
-        }
-    }
+                var wav = EnsureToneWav(duration);
+                using var reader = new AudioFileReader(wav);
+                MediaFoundationEncoder.EncodeToFlac(reader, path);
+            });
 
     public static string EnsureToneM4a(TimeSpan duration)
-    {
-        var path = Path.Combine(FixturesDirectory, $"tone-{duration.TotalMilliseconds:0}ms.m4a");
-        lock (Gate)
-        {
-            if (File.Exists(path))
+        => EnsureEncodedOrCommitted(
+            $"tone-{duration.TotalMilliseconds:0}ms.m4a",
+            "tone-1s.m4a",
+            duration,
+            path =>
             {
-                return path;
-            }
-
-            var wav = EnsureToneWav(duration);
-            using var reader = new AudioFileReader(wav);
-            // AAC in an MPEG-4 container (.m4a) via Media Foundation.
-            MediaFoundationEncoder.EncodeToAac(reader, path, 128000);
-            return path;
-        }
-    }
+                var wav = EnsureToneWav(duration);
+                using var reader = new AudioFileReader(wav);
+                MediaFoundationEncoder.EncodeToAac(reader, path, 128000);
+            });
 
     public static string EnsureToneAiff(TimeSpan duration)
-    {
-        var path = Path.Combine(FixturesDirectory, $"tone-{duration.TotalMilliseconds:0}ms.aiff");
-        lock (Gate)
-        {
-            if (File.Exists(path))
+        => EnsureEncodedOrCommitted(
+            $"tone-{duration.TotalMilliseconds:0}ms.aiff",
+            "tone-1s.aiff",
+            duration,
+            path =>
             {
-                return path;
-            }
-
-            var wav = EnsureToneWav(duration);
-            using var reader = new AudioFileReader(wav);
-            AiffFileWriter.CreateAiffFile(path, reader);
-            return path;
-        }
-    }
+                var wav = EnsureToneWav(duration);
+                using var reader = new AudioFileReader(wav);
+                AiffFileWriter.CreateAiffFile(path, reader);
+            });
 
     public static string EnsureToneWma(TimeSpan duration)
-    {
-        var path = Path.Combine(FixturesDirectory, $"tone-{duration.TotalMilliseconds:0}ms.wma");
-        lock (Gate)
-        {
-            if (File.Exists(path))
+        => EnsureEncodedOrCommitted(
+            $"tone-{duration.TotalMilliseconds:0}ms.wma",
+            "tone-1s.wma",
+            duration,
+            path =>
             {
-                return path;
-            }
-
-            var wav = EnsureToneWav(duration);
-            using var reader = new AudioFileReader(wav);
-            MediaFoundationEncoder.EncodeToWma(reader, path, 128000);
-            return path;
-        }
-    }
+                var wav = EnsureToneWav(duration);
+                using var reader = new AudioFileReader(wav);
+                MediaFoundationEncoder.EncodeToWma(reader, path, 128000);
+            });
 
     public static string EnsureToneAdtsAac(TimeSpan duration)
-    {
-        var path = Path.Combine(FixturesDirectory, $"tone-{duration.TotalMilliseconds:0}ms.aac");
-        lock (Gate)
-        {
-            if (File.Exists(path))
+        => EnsureEncodedOrCommitted(
+            $"tone-{duration.TotalMilliseconds:0}ms.aac",
+            "tone-1s.aac",
+            duration,
+            path =>
             {
-                return path;
-            }
-
-            var wav = EnsureToneWav(duration);
-            using var reader = new AudioFileReader(wav);
-            // NAudio MF AAC encoder writes ADTS when the destination extension is .aac.
-            MediaFoundationEncoder.EncodeToAac(reader, path, 128000);
-            return path;
-        }
-    }
+                var wav = EnsureToneWav(duration);
+                using var reader = new AudioFileReader(wav);
+                MediaFoundationEncoder.EncodeToAac(reader, path, 128000);
+            });
 
     /// <summary>
     /// ALAC-in-M4A fixture. Uses a committed sample (MF ALAC encode is not reliably available via NAudio).
@@ -154,28 +122,6 @@ internal static class FixtureHelper
     public static string EnsureToneWebmVorbis()
         => EnsureCommittedFixture("tone-1s-vorbis.webm");
 
-    private static string EnsureCommittedFixture(string fileName)
-    {
-        var dest = Path.Combine(FixturesDirectory, fileName);
-        lock (Gate)
-        {
-            if (File.Exists(dest))
-            {
-                return dest;
-            }
-
-            var source = Path.Combine(AppContext.BaseDirectory, "CommittedFixtures", fileName);
-            if (!File.Exists(source))
-            {
-                throw new FileNotFoundException(
-                    $"Committed fixture '{fileName}' was not found next to the test assembly.", source);
-            }
-
-            File.Copy(source, dest, overwrite: true);
-            return dest;
-        }
-    }
-
     /// <summary>
     /// Segment frequencies used by the deterministic multi-tone FLAC fixture.
     /// </summary>
@@ -183,6 +129,7 @@ internal static class FixtureHelper
 
     /// <summary>
     /// Creates a FLAC file with four equal-length pure-tone segments (220/440/880/1760 Hz).
+    /// Falls back to the committed fixture when Media Foundation FLAC encoding is unavailable.
     /// </summary>
     public static string EnsureSegmentedFlac(int segmentMs = 250, int sampleRate = 44100, int channels = 2)
     {
@@ -194,11 +141,18 @@ internal static class FixtureHelper
                 return path;
             }
 
-            var wavPath = Path.Combine(FixturesDirectory, $"segments-{segmentMs}ms.wav");
-            WriteSegmentedToneWav(wavPath, TimeSpan.FromMilliseconds(segmentMs), sampleRate, channels, SegmentFrequenciesHz);
-            using var reader = new AudioFileReader(wavPath);
-            MediaFoundationEncoder.EncodeToFlac(reader, path);
-            return path;
+            try
+            {
+                var wavPath = Path.Combine(FixturesDirectory, $"segments-{segmentMs}ms.wav");
+                WriteSegmentedToneWav(wavPath, TimeSpan.FromMilliseconds(segmentMs), sampleRate, channels, SegmentFrequenciesHz);
+                using var reader = new AudioFileReader(wavPath);
+                MediaFoundationEncoder.EncodeToFlac(reader, path);
+                return path;
+            }
+            catch (Exception) when (segmentMs == 250)
+            {
+                return EnsureCommittedFixture("segments-250ms.flac");
+            }
         }
     }
 
@@ -250,6 +204,60 @@ internal static class FixtureHelper
 
                 stream.Write(frame);
             }
+        }
+    }
+
+    private static string EnsureEncodedOrCommitted(
+        string generatedFileName,
+        string committedFileName,
+        TimeSpan requestedDuration,
+        Action<string> encode)
+    {
+        var path = Path.Combine(FixturesDirectory, generatedFileName);
+        lock (Gate)
+        {
+            if (File.Exists(path))
+            {
+                return path;
+            }
+
+            try
+            {
+                encode(path);
+                return path;
+            }
+            catch (Exception) when (requestedDuration <= TimeSpan.FromSeconds(1.05))
+            {
+                // GitHub-hosted Windows runners often lack MF encoders; use checked-in tones.
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+
+                return EnsureCommittedFixture(committedFileName);
+            }
+        }
+    }
+
+    private static string EnsureCommittedFixture(string fileName)
+    {
+        var dest = Path.Combine(FixturesDirectory, fileName);
+        lock (Gate)
+        {
+            if (File.Exists(dest))
+            {
+                return dest;
+            }
+
+            var source = Path.Combine(AppContext.BaseDirectory, "CommittedFixtures", fileName);
+            if (!File.Exists(source))
+            {
+                throw new FileNotFoundException(
+                    $"Committed fixture '{fileName}' was not found next to the test assembly.", source);
+            }
+
+            File.Copy(source, dest, overwrite: true);
+            return dest;
         }
     }
 

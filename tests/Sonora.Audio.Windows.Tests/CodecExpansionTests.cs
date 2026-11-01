@@ -48,6 +48,7 @@ public sealed class CodecExpansionTests
     [InlineData("webm-opus")]
     public async Task Format_NaturalCompletion(string formatKey)
     {
+        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
         var path = ResolveFixture(formatKey);
         using var engine = SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();

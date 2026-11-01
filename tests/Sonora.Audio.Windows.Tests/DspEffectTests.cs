@@ -223,6 +223,7 @@ public sealed class DspEffectTests
     [Fact]
     public async Task PlayerEffects_PreserveAcrossReload_ResetOnSeek()
     {
+        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
         using var engine = Sonora.Audio.Windows.SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();
         var eq = player.Effects.AddEqualizer();
