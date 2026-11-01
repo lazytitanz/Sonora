@@ -32,6 +32,8 @@
     <None Include="..\Sonora.Audio.Windows.Tests\CommittedFixtures\*"
           Link="CommittedFixtures\%(Filename)%(Extension)"
           CopyToOutputDirectory="PreserveNewest" />
+    <!-- Public API baselines: resolve via AppContext.BaseDirectory (SourceLink maps CallerFilePath to /_/). -->
+    <None Include="Baselines\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

@@ -1,5 +1,4 @@
 using System.Reflection;
-using System.Runtime.CompilerServices;
 using System.Text;
 using Sonora.Audio.Windows;
 
@@ -7,7 +6,7 @@ namespace Sonora.Audio.Windows.Tests;
 
 /// <summary>
 /// Locks the Sonora.Audio.Windows public API for the v1.0 RC baseline.
-/// Set SONORA_UPDATE_PUBLIC_API_BASELINE=1 to regenerate Baselines/Sonora.Audio.Windows.PublicApi.txt.
+/// Set SONORA_UPDATE_PUBLIC_API_BASELINE=1 to regenerate Baselines under the test project.
 /// </summary>
 public sealed class PublicApiSnapshotTests
 {
@@ -19,11 +18,13 @@ public sealed class PublicApiSnapshotTests
 
         if (ShouldUpdateBaseline())
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(baselinePath)!);
-            File.WriteAllText(baselinePath, actual);
+            WriteBaselineUpdate(actual);
+            baselinePath = GetBaselinePath("Sonora.Audio.Windows.PublicApi.txt");
         }
 
-        Assert.True(File.Exists(baselinePath), $"Missing baseline at {baselinePath}. Run with SONORA_UPDATE_PUBLIC_API_BASELINE=1.");
+        Assert.True(
+            File.Exists(baselinePath),
+            $"Missing baseline at {baselinePath}. Ensure Baselines are CopyToOutputDirectory, or run with SONORA_UPDATE_PUBLIC_API_BASELINE=1.");
         var expected = File.ReadAllText(baselinePath).Replace("\r\n", "\n");
         Assert.Equal(expected, actual);
     }
@@ -31,10 +32,41 @@ public sealed class PublicApiSnapshotTests
     private static bool ShouldUpdateBaseline()
         => string.Equals(Environment.GetEnvironmentVariable("SONORA_UPDATE_PUBLIC_API_BASELINE"), "1", StringComparison.Ordinal);
 
-    private static string GetBaselinePath(string fileName, [CallerFilePath] string sourceFile = "")
+    /// <summary>
+    /// Baseline files are copied next to the test assembly. Do not use <c>CallerFilePath</c>:
+    /// deterministic CI builds / SourceLink rewrite it to mapped paths such as <c>/_/tests/...</c>.
+    /// </summary>
+    private static string GetBaselinePath(string fileName)
+        => Path.Combine(AppContext.BaseDirectory, "Baselines", fileName);
+
+    private static void WriteBaselineUpdate(string actual)
     {
-        var testProjectDir = Path.GetDirectoryName(sourceFile)!;
-        return Path.Combine(testProjectDir, "Baselines", fileName);
+        var projectBaselines = FindProjectBaselinesDirectory();
+        var targetDir = projectBaselines ?? Path.Combine(AppContext.BaseDirectory, "Baselines");
+        Directory.CreateDirectory(targetDir);
+        File.WriteAllText(Path.Combine(targetDir, "Sonora.Audio.Windows.PublicApi.txt"), actual);
+    }
+
+    private static string? FindProjectBaselinesDirectory()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        for (var i = 0; i < 6 && dir is not null; i++, dir = dir.Parent)
+        {
+            var candidate = Path.Combine(dir.FullName, "Baselines");
+            if (Directory.Exists(candidate)
+                && File.Exists(Path.Combine(candidate, "Sonora.Audio.Windows.PublicApi.txt")))
+            {
+                return candidate;
+            }
+
+            var nested = Path.Combine(dir.FullName, "tests", "Sonora.Audio.Windows.Tests", "Baselines");
+            if (Directory.Exists(nested))
+            {
+                return nested;
+            }
+        }
+
+        return null;
     }
 
     private static string Dump(Assembly assembly)

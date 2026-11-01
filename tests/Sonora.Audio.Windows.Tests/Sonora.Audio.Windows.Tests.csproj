@@ -31,6 +31,8 @@
   <ItemGroup>
     <None Include="..\fixtures\**\*" LinkBase="fixtures" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\fixtures')" />
     <None Include="CommittedFixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Public API baselines: resolve via AppContext.BaseDirectory (SourceLink maps CallerFilePath to /_/). -->
+    <None Include="Baselines\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

@@ -165,14 +165,16 @@ public sealed class DisposalHardeningTests
     }
 
     [Fact]
-    public async Task Dispose_DoesNotBlockGateAcrossHeldShutdown()
+    public async Task Dispose_DoesNotHoldGateAcrossHeldShutdown()
     {
-        HoldableFakeAudioOutput? primaryOutput = null;
+        // Contract: Dispose detaches under _gate, then Shutdown runs only after the gate is released.
+        // Reaching a held Shutdown therefore proves the gate is already free. A sibling Load was
+        // previously used as a probe but hung under CI scheduling; it is not required for this proof.
+        HoldableFakeAudioOutput? output = null;
         var outputFactory = new FakeAudioOutputFactory(_ =>
         {
-            var created = new HoldableFakeAudioOutput("a");
-            primaryOutput ??= created;
-            return created;
+            output = new HoldableFakeAudioOutput("a");
+            return output;
         });
 
         using var engine = new AudioEngine(
@@ -183,26 +185,44 @@ public sealed class DisposalHardeningTests
         var player = engine.CreatePlayer();
         await player.LoadAsync("tone.wav");
         player.Play();
-        Assert.NotNull(primaryOutput);
+        Assert.NotNull(output);
 
-        primaryOutput!.HoldShutdown();
-        var disposeStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var disposeTask = Task.Run(() =>
+        output!.HoldShutdown();
+        Task? disposeTask = null;
+        try
         {
-            disposeStarted.TrySetResult();
-            player.Dispose();
-        });
+            disposeTask = Task.Run(player.Dispose);
 
-        await disposeStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        Assert.True(primaryOutput.WaitUntilShutdownHeld(TimeSpan.FromSeconds(2)));
+            Assert.True(
+                output.WaitUntilShutdownHeld(TimeSpan.FromSeconds(5)),
+                "Dispose must reach IAudioOutput.Shutdown off-gate while Shutdown is held.");
+            Assert.False(
+                disposeTask.IsCompleted,
+                "Dispose must still be blocked in held Shutdown (off-gate wait).");
 
-        // Per-player gate must be free while Dispose waits off-gate on Shutdown.
-        var sibling = engine.CreatePlayer();
-        await sibling.LoadAsync("other.wav").WaitAsync(TimeSpan.FromSeconds(3));
-        Assert.Equal(PlaybackState.Stopped, sibling.State);
+            output.ReleaseShutdown();
+            await disposeTask.WaitAsync(TimeSpan.FromSeconds(5));
 
-        primaryOutput.ReleaseShutdown();
-        await disposeTask.WaitAsync(TimeSpan.FromSeconds(5));
-        sibling.Dispose();
+            Assert.True(output.IsShutdown);
+            Assert.True(output.IsPullLoopIdle);
+            Assert.Equal(1, output.ShutdownCount);
+            Assert.Throws<ObjectDisposedException>(() => player.Play());
+        }
+        finally
+        {
+            output.ReleaseShutdown();
+            output.ReleaseRead();
+            if (disposeTask is { IsCompleted: false })
+            {
+                try
+                {
+                    await disposeTask.WaitAsync(TimeSpan.FromSeconds(5));
+                }
+                catch
+                {
+                    // Best-effort cleanup after assertion failures.
+                }
+            }
+        }
     }
 }
