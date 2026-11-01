@@ -104,6 +104,7 @@ public sealed class UnderrunTests
         private IPcmSampleSource? _source;
 
         public AudioFormat? Format { get; private set; }
+        public string? EndpointId => null;
         public TimeSpan AverageLatency => TimeSpan.FromMilliseconds(10);
         public TimeSpan CurrentLatency => AverageLatency;
         public event EventHandler<AudioOutputStoppedEventArgs>? Stopped;

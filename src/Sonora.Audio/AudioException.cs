@@ -89,3 +89,21 @@ public sealed class AudioOutputException : AudioException
     {
     }
 }
+
+/// <summary>
+/// Thrown when an output device selection is invalid or the endpoint cannot be resolved.
+/// </summary>
+public sealed class AudioDeviceException : AudioException
+{
+    /// <inheritdoc cref="AudioException(string)"/>
+    public AudioDeviceException(string message)
+        : base(message)
+    {
+    }
+
+    /// <inheritdoc cref="AudioException(string, Exception)"/>
+    public AudioDeviceException(string message, Exception innerException)
+        : base(message, innerException)
+    {
+    }
+}

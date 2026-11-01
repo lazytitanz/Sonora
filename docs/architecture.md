@@ -59,6 +59,33 @@ LoadAsync → WindowsAudioDecoderFactory → DecoderSelector (sniff)
   → Wave / AIFF / MF / Vorbis / Opus → IAudioDecoder → decode pump
 ```
 
+## Output devices (0.5.0)
+
+```text
+IAudioOutputDevices (Windows: MMDeviceEnumerator + notification client)
+        │
+        ▼
+AudioPlayer.SetOutputDeviceAsync / recovery
+        │ output-only rebind
+        ▼
+IAudioOutputFactory.CreateOutputAsync(deviceId?)
+        │
+        ▼
+WasapiAudioOutput (WithDevice, Multimedia default when following)
+```
+
+| Concern | Behavior |
+|---|---|
+| Default role | Windows **Multimedia** render endpoint |
+| Follow default | Notification-driven rebind when the Multimedia default id changes |
+| Explicit select | `WithDevice(id)`; ignore unrelated default changes |
+| Preferred lost | Fall back to Multimedia default; keep preferred id; no auto-restore |
+| Recovery intent | Separate from `PlaybackState`; cleared by `Stop` / `LoadAsync` / `Dispose` |
+| Rebind | Dispose old WASAPI only; keep rings, next track, DSP rack; rebase position clock |
+| Clock / PCM | Ring preserved; old endpoint padding skipped (~`CurrentLatency`); brief gap expected |
+| Sync | Switch generation + CTS; create runs **off** the command gate; stale outputs disposed |
+| Events | Marshaled off native IMM / WASAPI threads |
+
 ## Gapless (0.4.0)
 
 ```text

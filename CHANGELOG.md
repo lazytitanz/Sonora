@@ -2,6 +2,35 @@
 
 All notable changes to Sonora will be documented in this file.
 
+## 0.5.0 — 2026-11-01
+
+### Added
+
+- Platform-neutral output device API: `IAudioOutputDevices`, `AudioOutputDevice`, `AudioDeviceState`
+- `AudioEngine.OutputDevices` enumeration and change notifications (`DevicesChanged`, `DefaultDeviceChanged`)
+- `AudioPlayer.SetOutputDeviceAsync(string? deviceId)` — `null` follows the system default
+- Preferred vs active endpoint separation (`PreferredOutputDeviceId`, `ActiveOutputDeviceId`)
+- `OutputDeviceStatus` and `OutputRecoveryIntent` (independent of `PlaybackState`)
+- `OutputDeviceChanged` event with explicit change reasons
+- Windows Core Audio enumeration via NAudio `MMDeviceEnumerator` (Multimedia default render role)
+- Notification-driven follow-default rebinds and explicit-device fallback to the Multimedia default
+- Output-only rebind that preserves decode pipelines, gapless next track, volume, and DSP configuration
+- Deterministic device-management tests (hardware-free) plus Windows state-mapping tests
+- `AudioDeviceException` for invalid device selection
+
+### Changed
+
+- `IAudioOutputFactory` now exposes `CreateOutputAsync(string? deviceId, CancellationToken)` (replaces `CreateDefaultOutput`)
+- `IAudioOutput` reports `EndpointId` when known
+
+### Notes
+
+- Device switches reinitialize WASAPI and may briefly interrupt audible playback; endpoint padding already submitted to the old device is skipped (typically on the order of `CurrentLatency`).
+- Follow-default correctness uses notification-driven rebinds with `WithDevice(Multimedia default)` — NAudio stream routing is not relied on for correctness.
+- When an explicitly preferred device is lost, Sonora falls back to the system default and does **not** auto-restore when the preferred endpoint returns.
+- Explicit `Stop`, `LoadAsync`, and `Dispose` clear recovery intent so auto-resume cannot revive a stopped session.
+- Existing codecs, DSP, gapless playback, and transport APIs are preserved.
+
 ## 0.4.0 — 2026-11-01
 
 ### Added

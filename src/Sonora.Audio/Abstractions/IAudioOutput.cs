@@ -11,6 +11,11 @@ public interface IAudioOutput : IDisposable
     AudioFormat? Format { get; }
 
     /// <summary>
+    /// Stable host endpoint id this output was opened on, when known; otherwise <see langword="null"/>.
+    /// </summary>
+    string? EndpointId { get; }
+
+    /// <summary>
     /// Steady-state output latency estimate. <see cref="TimeSpan.Zero"/> when unknown.
     /// </summary>
     TimeSpan AverageLatency { get; }

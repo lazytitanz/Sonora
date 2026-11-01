@@ -1,3 +1,4 @@
+using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using Sonora.Audio.Abstractions;
 using Sonora.Audio.Formats;
@@ -12,30 +13,79 @@ namespace Sonora.Audio.Windows.Output;
 internal sealed class WasapiAudioOutput : IAudioOutput
 {
     private readonly WasapiPlayer _player;
+    private readonly string? _endpointId;
     private IPcmSampleSource? _source;
     private PcmSampleProviderAdapter? _adapter;
     private AudioFormat? _format;
     private bool _initialized;
     private bool _disposed;
 
-    public WasapiAudioOutput()
+    private WasapiAudioOutput(WasapiPlayer player, string? endpointId)
     {
-        try
-        {
-            _player = new WasapiPlayerBuilder()
-                .WithSharedMode()
-                .WithEventSync()
-                .Build();
-        }
-        catch (Exception ex)
-        {
-            throw new AudioOutputException("Failed to create the WASAPI shared-mode output device.", ex);
-        }
-
+        _player = player;
+        _endpointId = endpointId;
         _player.PlaybackStopped += OnPlaybackStopped;
     }
 
+    /// <summary>
+    /// Creates shared-mode WASAPI output for the Multimedia default endpoint, or a specific endpoint id.
+    /// </summary>
+    public static WasapiAudioOutput Create(string? deviceId)
+    {
+        MMDevice? ownedDevice = null;
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            if (deviceId is null)
+            {
+                if (!enumerator.HasDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia))
+                {
+                    throw new AudioDeviceException("No default Windows multimedia audio output device is available.");
+                }
+
+                ownedDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            }
+            else
+            {
+                ownedDevice = enumerator.GetDevice(deviceId);
+                if (ownedDevice.DataFlow != DataFlow.Render)
+                {
+                    throw new AudioDeviceException($"Device '{deviceId}' is not an audio render endpoint.");
+                }
+
+                if (ownedDevice.State != DeviceState.Active)
+                {
+                    throw new AudioDeviceException(
+                        $"Output device '{ownedDevice.FriendlyName}' is not active (state: {ownedDevice.State}).");
+                }
+            }
+
+            var endpointId = ownedDevice.ID;
+            var player = new WasapiPlayerBuilder()
+                .WithSharedMode()
+                .WithEventSync()
+                .WithDevice(ownedDevice)
+                .Build();
+
+            // WasapiPlayer retains the MMDevice; do not dispose ownedDevice here.
+            ownedDevice = null;
+            return new WasapiAudioOutput(player, endpointId);
+        }
+        catch (AudioException)
+        {
+            ownedDevice?.Dispose();
+            throw;
+        }
+        catch (Exception ex)
+        {
+            ownedDevice?.Dispose();
+            throw new AudioOutputException("Failed to create the WASAPI shared-mode output device.", ex);
+        }
+    }
+
     public AudioFormat? Format => _format;
+
+    public string? EndpointId => _endpointId;
 
     public TimeSpan AverageLatency
     {

@@ -6,7 +6,15 @@ namespace Sonora.Audio.Abstractions;
 public interface IAudioOutputFactory
 {
     /// <summary>
-    /// Creates an output bound to the default render device.
+    /// Creates an output bound to the specified render endpoint, or the system default when
+    /// <paramref name="deviceId"/> is <see langword="null"/>.
     /// </summary>
-    IAudioOutput CreateDefaultOutput();
+    /// <param name="deviceId">
+    /// Stable endpoint id, or <see langword="null"/> to follow the platform default
+    /// (Windows: Multimedia render role via notification-driven rebinds).
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    Task<IAudioOutput> CreateOutputAsync(
+        string? deviceId = null,
+        CancellationToken cancellationToken = default);
 }

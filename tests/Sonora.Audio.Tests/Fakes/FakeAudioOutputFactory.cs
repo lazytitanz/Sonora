@@ -4,19 +4,34 @@ namespace Sonora.Audio.Tests.Fakes;
 
 internal sealed class FakeAudioOutputFactory : IAudioOutputFactory
 {
-    private readonly Func<IAudioOutput> _factory;
+    private readonly Func<string?, IAudioOutput> _factory;
 
     public FakeAudioOutputFactory(Func<IAudioOutput>? factory = null)
     {
-        _factory = factory ?? (() => new FakeAudioOutput());
+        if (factory is null)
+        {
+            _factory = id => new FakeAudioOutput(endpointId: id ?? "default");
+        }
+        else
+        {
+            _factory = _ => factory();
+        }
     }
 
-    public List<IAudioOutput> Created { get; } = new();
-
-    public IAudioOutput CreateDefaultOutput()
+    public FakeAudioOutputFactory(Func<string?, IAudioOutput> factory)
     {
-        var output = _factory();
-        Created.Add(output);
-        return output;
+        _factory = factory ?? throw new ArgumentNullException(nameof(factory));
+    }
+
+    public List<(string? DeviceId, IAudioOutput Output)> Created { get; } = new();
+
+    public Task<IAudioOutput> CreateOutputAsync(
+        string? deviceId = null,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var output = _factory(deviceId);
+        Created.Add((deviceId, output));
+        return Task.FromResult(output);
     }
 }

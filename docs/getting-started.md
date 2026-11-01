@@ -27,6 +27,33 @@ player.ErrorOccurred += (_, ex) => Console.WriteLine(ex.Message);
 player.Play();
 ```
 
+## Output devices
+
+```csharp
+using Sonora.Audio.Devices;
+
+foreach (var device in engine.OutputDevices.GetDevices())
+{
+    Console.WriteLine($"{device.Name} ({device.State}) default={device.IsDefault}");
+}
+
+var headphones = engine.OutputDevices.GetDevices()
+    .FirstOrDefault(d => d.State == AudioDeviceState.Active && d.Name.Contains("Headphone"));
+
+if (headphones is not null)
+{
+    await player.SetOutputDeviceAsync(headphones.Id);
+}
+
+// null = follow the Windows Multimedia default render endpoint
+await player.SetOutputDeviceAsync(null);
+
+player.OutputDeviceChanged += (_, e) =>
+    Console.WriteLine($"{e.Reason}: preferred={e.PreferredDeviceId} active={e.ActiveDeviceId} status={e.Status}");
+```
+
+Device switches reinitialize WASAPI and may briefly interrupt audio. Volume, DSP settings, and a ready next track are preserved. Prefer `Stop` when you do not want auto-resume after a device is restored.
+
 ## Gapless next track
 
 ```csharp

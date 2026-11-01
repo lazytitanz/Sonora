@@ -1,5 +1,6 @@
 using Sonora.Audio.Playback;
 using Sonora.Audio.Windows.Decoding;
+using Sonora.Audio.Windows.Devices;
 using Sonora.Audio.Windows.DSP;
 using Sonora.Audio.Windows.Output;
 
@@ -12,7 +13,8 @@ public static class SonoraWindows
 {
     /// <summary>
     /// Creates an <see cref="AudioEngine"/> configured with Windows decoding, WASAPI shared-mode output,
-    /// and NAudio-backed DSP effects (equalizer, preamp, limiter). NAudio types are not exposed through this API.
+    /// Multimedia-role output device management, and NAudio-backed DSP effects (equalizer, preamp, limiter).
+    /// NAudio types are not exposed through this API.
     /// </summary>
     /// <param name="options">Optional engine options. When <see cref="AudioEngineOptions.EffectFactory"/> is null, a Windows factory is supplied.</param>
     public static AudioEngine CreateEngine(AudioEngineOptions? options = null)
@@ -33,6 +35,7 @@ public static class SonoraWindows
         return new AudioEngine(
             new WindowsAudioDecoderFactory(),
             new WindowsAudioOutputFactory(),
-            options);
+            options,
+            new WindowsAudioOutputDevices());
     }
 }

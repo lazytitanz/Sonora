@@ -17,13 +17,15 @@ internal sealed class FakeAudioOutput : IAudioOutput
     private int _playing;
     private bool _disposed;
 
-    public FakeAudioOutput(int blockSamples = 256, TimeSpan? latency = null)
+    public FakeAudioOutput(int blockSamples = 256, TimeSpan? latency = null, string? endpointId = null)
     {
         _blockSamples = blockSamples;
         _latency = latency ?? TimeSpan.FromMilliseconds(20);
+        EndpointId = endpointId;
     }
 
     public AudioFormat? Format { get; private set; }
+    public string? EndpointId { get; }
     public TimeSpan AverageLatency => _latency;
     public TimeSpan CurrentLatency => _playing == 1 ? _latency : _latency;
     public event EventHandler<AudioOutputStoppedEventArgs>? Stopped;
@@ -123,6 +125,22 @@ internal sealed class FakeAudioOutput : IAudioOutput
         _disposed = true;
         Stop();
         _cts?.Dispose();
+    }
+
+    /// <summary>Simulates a device-loss / output failure stop.</summary>
+    public void InjectFailure(Exception exception)
+    {
+        Interlocked.Exchange(ref _playing, 0);
+        try
+        {
+            _cts?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // ignored
+        }
+
+        Stopped?.Invoke(this, new AudioOutputStoppedEventArgs(reachedEndOfStream: false, exception: exception));
     }
 
     private void Loop(CancellationToken token)

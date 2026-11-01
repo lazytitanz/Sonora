@@ -11,7 +11,13 @@ internal sealed class NoOpAudioOutput : IAudioOutput
     private IPcmSampleSource? _source;
     private bool _disposed;
 
+    public NoOpAudioOutput(string? endpointId = null)
+    {
+        EndpointId = endpointId;
+    }
+
     public AudioFormat? Format { get; private set; }
+    public string? EndpointId { get; }
     public TimeSpan AverageLatency => TimeSpan.FromMilliseconds(20);
     public TimeSpan CurrentLatency => AverageLatency;
     public event EventHandler<AudioOutputStoppedEventArgs>? Stopped;
@@ -49,5 +55,11 @@ internal sealed class NoOpAudioOutput : IAudioOutput
 
 internal sealed class NoOpAudioOutputFactory : IAudioOutputFactory
 {
-    public IAudioOutput CreateDefaultOutput() => new NoOpAudioOutput();
+    public Task<IAudioOutput> CreateOutputAsync(
+        string? deviceId = null,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult<IAudioOutput>(new NoOpAudioOutput(deviceId));
+    }
 }
