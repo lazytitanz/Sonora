@@ -82,6 +82,20 @@ internal sealed class FakeAudioOutput : IAudioOutput
             // ignored
         }
 
+        var loop = _loop;
+        if (loop is not null)
+        {
+            // Prevent in-flight EOS Stopped notifications from racing command-thread Stop.
+            try
+            {
+                loop.Wait(TimeSpan.FromSeconds(2));
+            }
+            catch
+            {
+                // ignored
+            }
+        }
+
         Interlocked.Exchange(ref _renderedSamples, 0);
     }
 

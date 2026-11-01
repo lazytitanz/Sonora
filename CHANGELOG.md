@@ -15,6 +15,10 @@ All notable changes to Sonora will be documented in this file.
 - Thread-safe parameter handoff (`ApplyPendingUpdates` on the audio thread) and deferred effect disposal
 - Core rack tests and Windows frequency / gain / peak limiter tests
 
+### Fixed
+
+- Explicit `Stop()` no longer raises `PlaybackCompleted` when the output device reports end-of-stream as a side effect of stopping (WASAPI/NAudio `PlaybackStopped` race).
+
 ### Notes
 
 - NAudio DSP types remain internal to `Sonora.Audio.Windows`; core public APIs stay NAudio-free.

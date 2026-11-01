@@ -1,4 +1,5 @@
 using Sonora.Audio.Formats;
+using Sonora.Audio.Playback;
 using Sonora.Audio.Tests.Fakes;
 
 namespace Sonora.Audio.Tests;
@@ -38,20 +39,52 @@ public sealed class AudioPlayerTests
     [Fact]
     public async Task Stop_DoesNotRaisePlaybackCompleted()
     {
-        // Long enough that natural EOS cannot race Stop on a fast CI agent.
-        var decoder = FakeAudioDecoder.CreateTone(Format, TimeSpan.FromSeconds(5));
-        using var engine = CreateEngine(decoder);
+        // Hold decoder reads so playback cannot reach EOF before Stop (no wall-clock race).
+        var hold = new HoldableFakeDecoder(FakeAudioDecoder.CreateTone(Format, TimeSpan.FromSeconds(2)));
+        using var engine = new AudioEngine(
+            new FakeAudioDecoderFactory(hold),
+            new FakeAudioOutputFactory(),
+            new AudioEngineOptions { PrimeDuration = TimeSpan.Zero });
         using var player = engine.CreatePlayer();
         var completed = 0;
         player.PlaybackCompleted += (_, _) => Interlocked.Increment(ref completed);
 
         await player.LoadAsync("a.wav");
         player.Play();
-        await Task.Delay(30);
-        player.Stop();
-        await Task.Delay(100);
+        // Pump/output are alive; held decoder emits silence so EOF cannot arrive before Stop.
+        Assert.Equal(PlaybackState.Playing, player.State);
 
+        player.Stop();
+        Assert.Equal(PlaybackState.Stopped, player.State);
         Assert.Equal(0, Volatile.Read(ref completed));
+
+        hold.Release();
+        await Task.Delay(50);
+        Assert.Equal(0, Volatile.Read(ref completed));
+    }
+
+    [Fact]
+    public async Task Stop_AfterNaturalCompletion_DoesNotRaiseAgain()
+    {
+        var decoder = FakeAudioDecoder.CreateTone(Format, TimeSpan.FromMilliseconds(80));
+        using var engine = CreateEngine(decoder);
+        using var player = engine.CreatePlayer();
+        var completed = 0;
+        player.PlaybackCompleted += (_, _) => Interlocked.Increment(ref completed);
+
+        await player.LoadAsync("short.wav");
+        player.Play();
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (Volatile.Read(ref completed) == 0 && sw.Elapsed < TimeSpan.FromSeconds(5))
+        {
+            await Task.Delay(20);
+        }
+
+        Assert.Equal(1, Volatile.Read(ref completed));
+        player.Stop();
+        await Task.Delay(50);
+        Assert.Equal(1, Volatile.Read(ref completed));
     }
 
     [Fact]

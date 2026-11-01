@@ -1,6 +1,9 @@
 using Sonora.Audio.DSP;
 using Sonora.Audio.Formats;
+using Sonora.Audio.Playback;
+using Sonora.Audio.Windows.Decoding;
 using Sonora.Audio.Windows.DSP;
+using Sonora.Audio.Windows.Tests.Fakes;
 
 namespace Sonora.Audio.Windows.Tests;
 
@@ -223,8 +226,11 @@ public sealed class DspEffectTests
     [Fact]
     public async Task PlayerEffects_PreserveAcrossReloadAndSeek()
     {
-        // Load/seek only — no WASAPI Play (keeps this test CI-safe).
-        using var engine = Sonora.Audio.Windows.SonoraWindows.CreateEngine();
+        // Real Windows decoder + NAudio EQ factory, but no WASAPI (CI has no audio endpoint).
+        using var engine = new AudioEngine(
+            new WindowsAudioDecoderFactory(),
+            new NoOpAudioOutputFactory(),
+            new AudioEngineOptions { EffectFactory = new WindowsAudioEffectFactory() });
         using var player = engine.CreatePlayer();
         var eq = player.Effects.AddEqualizer();
         eq.SetBandGain(0, 3f);
@@ -233,11 +239,30 @@ public sealed class DspEffectTests
         await player.LoadAsync(path);
         Assert.Equal(3f, eq.GetBandGain(0));
 
+        // Configure runs on load; seek resets processing state without clearing user gains.
         player.Seek(TimeSpan.FromMilliseconds(100));
         Assert.Equal(3f, eq.GetBandGain(0));
 
         await player.LoadAsync(path);
         Assert.Equal(3f, eq.GetBandGain(0));
+
+        // Still the live NAudio-backed equalizer — process a tone and confirm boost.
+        eq.SetBandGain(3, 9f); // ~1000 Hz peaking in the six-band layout
+        if (eq is IAudioEffectRuntime runtime)
+        {
+            var format = AudioFormat.CreateFloat32(44100, 1);
+            runtime.Configure(format);
+            runtime.ApplyPendingUpdates();
+            var buffer = new float[8192];
+            for (var i = 0; i < buffer.Length; i++)
+            {
+                buffer[i] = 0.1f * MathF.Sin(2 * MathF.PI * 1000f * i / 44100f);
+            }
+
+            var before = Rms(buffer);
+            runtime.Process(buffer, format);
+            Assert.True(Rms(buffer) > before * 1.2f);
+        }
     }
 
     private static float[] Tone(float hz, AudioFormat format, float amplitude, int frames)

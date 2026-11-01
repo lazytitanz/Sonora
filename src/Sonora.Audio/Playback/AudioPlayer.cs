@@ -28,6 +28,12 @@ public sealed class AudioPlayer : IDisposable
     private bool _completionRaised;
     private long _underrunCount;
     private int _underrunLatched;
+    /// <summary>
+    /// When 0, end-of-stream notifications from the output device are ignored.
+    /// Cleared before explicit <see cref="Stop"/> / teardown so NAudio/WASAPI Stopped
+    /// callbacks cannot raise <see cref="PlaybackCompleted"/> after a user stop.
+    /// </summary>
+    private int _acceptEndOfStreamCompletion;
 
     private IAudioDecoder? _decoder;
     private IAudioOutput? _output;
@@ -255,6 +261,7 @@ public sealed class AudioPlayer : IDisposable
             EnsurePumpRunning_NoLock();
             PrimeBuffer_NoLock();
             _completionRaised = false;
+            Volatile.Write(ref _acceptEndOfStreamCompletion, 1);
             // Publish Playing before starting the device so callback underrun detection sees the active state.
             SetState_NoLock(PlaybackState.Playing);
             _output.Play();
@@ -494,6 +501,8 @@ public sealed class AudioPlayer : IDisposable
 
     private async Task TearDownSession_NoLockAsync()
     {
+        Volatile.Write(ref _acceptEndOfStreamCompletion, 0);
+
         try
         {
             _sessionCts?.Cancel();
@@ -541,6 +550,10 @@ public sealed class AudioPlayer : IDisposable
 
     private void StopTransport_NoLock(bool resetToStart, bool raiseCompletion)
     {
+        // Suppress EOS completion before stopping the device — WASAPI/NAudio may raise
+        // PlaybackStopped asynchronously (or synchronously) as a result of Stop().
+        Volatile.Write(ref _acceptEndOfStreamCompletion, 0);
+
         _output?.Stop();
         StopPump_NoLock();
 
@@ -625,6 +638,12 @@ public sealed class AudioPlayer : IDisposable
 
         if (e.ReachedEndOfStream)
         {
+            // Ignore EOS after explicit Stop/teardown, or from a stale callback.
+            if (Volatile.Read(ref _acceptEndOfStreamCompletion) == 0)
+            {
+                return;
+            }
+
             if (_state is PlaybackState.Playing or PlaybackState.Paused or PlaybackState.Buffering)
             {
                 StopTransport_NoLock(resetToStart: true, raiseCompletion: true);
@@ -632,6 +651,7 @@ public sealed class AudioPlayer : IDisposable
         }
         else if (e.Exception is not null && _state == PlaybackState.Playing)
         {
+            Volatile.Write(ref _acceptEndOfStreamCompletion, 0);
             _heldPosition = EstimateAudiblePosition();
             SetState_NoLock(PlaybackState.Stopped);
         }
