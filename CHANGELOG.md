@@ -2,6 +2,47 @@
 
 All notable changes to Sonora will be documented in this file.
 
+## 0.9.0 — 2026-11-01
+
+### Added
+
+- HTTP/HTTPS audio playback via `HttpAudioSource` and `AudioPlayer.LoadAsync(AudioSource)` / `PreloadNextAsync(AudioSource)`
+- `FileAudioSource` preserves existing path-based `LoadAsync(string)` behavior (strings are never interpreted as URLs)
+- Bounded HTTP transport in `Sonora.Audio` (`HttpStreamingOptions`, `HttpContentByteStream`, `HttpRandomAccessStream`) using built-in `HttpClient` — **no new NuGet packages**
+- Range-verified seeking with strong ETag / `If-Range` validation; refuses to mix bytes from different resource versions
+- `NetworkTransportStatus`, `NetworkBytesBuffered`, and `NetworkStatusChanged` (separate from `PlaybackState`)
+- `NetworkAudioException` for transport failures
+- `IAudioDecoder.HasKnownDuration` / `AudioPlayer.HasKnownDuration` to distinguish unknown duration from zero-length sources
+- Stream-backed Windows decoders (`StreamMediaFoundationReader`, Wave/AIFF/Vorbis/Opus stream opens)
+- Deterministic in-process HTTP tests (core) and fixture-backed HTTP format matrix (Windows)
+
+### Changed
+
+- Output format renegotiation reopens via stored `AudioSource` (not path-only); non-seekable HTTP at a non-zero position fails honestly when seamless continuity is impossible
+- Audible `Position` freezes during underrun silence and network buffering/reconnect so WASAPI silence does not advance the timeline
+- Decode-facing HTTP reads never return `0` on a temporary stall (`0` means genuine EOF only)
+
+### HTTP format compatibility (verified with committed fixtures)
+
+| Format | Range / seekable HTTP | Forward-only HTTP |
+| --- | --- | --- |
+| MP3 | Supported (MF) | Not claimed (MF requires seekable body) |
+| FLAC | Supported (MF) | Not claimed |
+| AAC (ADTS) | Supported (MF) | Not claimed |
+| M4A | Supported when ranges reach indexes (MF) | Not claimed |
+| WMA | Supported (MF) | Not claimed |
+| WebM Opus | Supported when ranges reach cues (MF) | Not claimed |
+| Ogg Vorbis | Supported | Supported (progressive) |
+| Ogg Opus | Supported | Supported (progressive) |
+| WAV | Supported when available as stream | Header-first progressive when reader allows |
+
+### Notes
+
+- Applications that accept arbitrary URLs should apply their own SSRF / network-egress controls
+- Sensitive URL query parameters and `Authorization` headers are not logged; `Authorization` is stripped on cross-origin redirects
+- Transport failure never raises `PlaybackCompleted`; network stalls never promote a gapless next track
+- Live / non-range reconnect does not claim seamless continuity
+
 ## 0.8.0 — 2026-11-01
 
 ### Added

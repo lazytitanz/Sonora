@@ -12,8 +12,19 @@ public interface IAudioDecoder : IDisposable
     /// <summary>Decoded PCM format exposed to the playback pipeline.</summary>
     AudioFormat Format { get; }
 
-    /// <summary>Total duration when known; <see cref="TimeSpan.Zero"/> if unknown.</summary>
+    /// <summary>
+    /// Total duration when <see cref="HasKnownDuration"/> is <see langword="true"/>.
+    /// When duration is unknown, this is <see cref="TimeSpan.Zero"/> for compatibility —
+    /// use <see cref="HasKnownDuration"/> to distinguish unknown from a genuine zero-length source.
+    /// Live and forward-only sources must not fabricate durations.
+    /// </summary>
     TimeSpan Duration { get; }
+
+    /// <summary>
+    /// Whether <see cref="Duration"/> is a known finite length.
+    /// <see langword="false"/> for live/unknown-length sources (do not treat <see cref="Duration"/> as zero-length).
+    /// </summary>
+    bool HasKnownDuration { get; }
 
     /// <summary>Whether seeking is supported for this source.</summary>
     bool CanSeek { get; }

@@ -21,6 +21,7 @@ internal sealed class HoldableFakeDecoder : IAudioDecoder
 
     public AudioFormat Format => _inner.Format;
     public TimeSpan Duration => _inner.Duration;
+    public bool HasKnownDuration => _inner.HasKnownDuration;
     public bool CanSeek => _inner.CanSeek;
 
     /// <summary>Allows subsequent reads to consume the inner decoder (and eventually EOF).</summary>

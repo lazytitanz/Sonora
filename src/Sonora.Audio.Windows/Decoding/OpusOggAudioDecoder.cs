@@ -19,9 +19,10 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
 
     private static readonly TimeSpan MaxDiscardWindow = TimeSpan.FromSeconds(2);
 
-    private readonly string _sourcePath;
+    private readonly string _originName;
+    private readonly Stream _stream;
+    private readonly bool _leaveOpen;
     private readonly int _channels;
-    private FileStream _file;
     private IOpusDecoder _opusDecoder;
     private OpusOggReadStream _ogg;
     private readonly float[] _packetScratch;
@@ -30,37 +31,65 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
     private bool _disposed;
     private bool _reachedEnd;
 
-    private OpusOggAudioDecoder(string sourcePath, int channels, FileStream file, IOpusDecoder opusDecoder, OpusOggReadStream ogg)
+    private OpusOggAudioDecoder(
+        string originName,
+        Stream stream,
+        bool leaveOpen,
+        int channels,
+        IOpusDecoder opusDecoder,
+        OpusOggReadStream ogg)
     {
-        _sourcePath = sourcePath;
+        _originName = originName;
+        _stream = stream;
+        _leaveOpen = leaveOpen;
         _channels = channels;
-        _file = file;
         _opusDecoder = opusDecoder;
         _ogg = ogg;
         Format = AudioFormat.CreateFloat32(OpusSampleRate, channels);
         Duration = ogg.TotalTime > TimeSpan.Zero ? ogg.TotalTime : TimeSpan.Zero;
         CanSeek = ogg.CanSeek;
+        HasKnownDuration = DetermineDurationKnown(ogg, stream);
         // Max Opus packet is 120 ms; at 48 kHz stereo that is 11520 samples.
         _packetScratch = new float[OpusSampleRate / 1000 * 120 * channels];
     }
 
     public AudioFormat Format { get; }
     public TimeSpan Duration { get; private set; }
+    public bool HasKnownDuration { get; }
     public bool CanSeek { get; }
 
     public static OpusOggAudioDecoder Open(string filePath)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
         var channels = ReadOpusChannelCount(filePath);
         var file = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
         try
         {
-            var opusDecoder = OpusCodecFactory.CreateDecoder(OpusSampleRate, channels);
-            var ogg = new OpusOggReadStream(opusDecoder, file);
-            return new OpusOggAudioDecoder(filePath, channels, file, opusDecoder, ogg);
+            return OpenCore(file, filePath, leaveOpen: false, channels);
         }
         catch
         {
             file.Dispose();
+            throw;
+        }
+    }
+
+    public static OpusOggAudioDecoder Open(Stream stream, string? originName = null, bool leaveOpen = false)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        var name = string.IsNullOrWhiteSpace(originName) ? stream.GetType().Name : originName;
+        var channels = ReadOpusChannelCount(stream);
+        try
+        {
+            return OpenCore(stream, name, leaveOpen, channels);
+        }
+        catch
+        {
+            if (!leaveOpen)
+            {
+                stream.Dispose();
+            }
+
             throw;
         }
     }
@@ -98,7 +127,7 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
         }
         catch (Exception ex) when (ex is not OperationCanceledException and not ObjectDisposedException)
         {
-            throw new DecoderException($"Failed while decoding Opus file '{_sourcePath}'.", ex);
+            throw new DecoderException($"Failed while decoding Opus source '{_originName}'.", ex);
         }
     }
 
@@ -124,7 +153,7 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
                 Recreate();
                 if (!TrySeekInPlace(coarse))
                 {
-                    throw new DecoderException($"Failed to seek in Opus file '{_sourcePath}' after recreate.");
+                    throw new DecoderException($"Failed to seek in Opus source '{_originName}' after recreate.");
                 }
             }
 
@@ -150,7 +179,7 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
         }
         catch (Exception ex) when (ex is not OperationCanceledException and not ObjectDisposedException)
         {
-            throw new DecoderException($"Failed to seek in Opus file '{_sourcePath}'.", ex);
+            throw new DecoderException($"Failed to seek in Opus source '{_originName}'.", ex);
         }
     }
 
@@ -163,7 +192,45 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
 
         _disposed = true;
         _ogg.Close();
-        _file.Dispose();
+        if (!_leaveOpen)
+        {
+            _stream.Dispose();
+        }
+    }
+
+    private static OpusOggAudioDecoder OpenCore(Stream stream, string originName, bool leaveOpen, int channels)
+    {
+        var opusDecoder = OpusCodecFactory.CreateDecoder(OpusSampleRate, channels);
+        var ogg = new OpusOggReadStream(opusDecoder, stream);
+        return new OpusOggAudioDecoder(originName, stream, leaveOpen, channels, opusDecoder, ogg);
+    }
+
+    private static bool DetermineDurationKnown(OpusOggReadStream ogg, Stream stream)
+    {
+        if (ogg.TotalTime > TimeSpan.Zero)
+        {
+            return true;
+        }
+
+        if (!ogg.CanSeek && !stream.CanSeek)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (stream.CanSeek)
+            {
+                _ = stream.Length;
+                return true;
+            }
+        }
+        catch (NotSupportedException)
+        {
+            return false;
+        }
+
+        return ogg.CanSeek;
     }
 
     private long ClampRequestedFrames(TimeSpan position)
@@ -174,7 +241,7 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
         }
 
         var frames = Format.TimeToFrames(position);
-        if (Duration > TimeSpan.Zero)
+        if (HasKnownDuration && Duration > TimeSpan.Zero)
         {
             frames = AudioFormat.ClampFrameIndex(frames, Format.TimeToFrames(Duration));
         }
@@ -244,7 +311,7 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
         try
         {
             _ogg.SeekTo(position);
-            if (_reachedEnd && !_ogg.HasNextPacket && position < Duration)
+            if (_reachedEnd && !_ogg.HasNextPacket && (!HasKnownDuration || position < Duration))
             {
                 return false;
             }
@@ -259,12 +326,16 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
 
     private void Recreate()
     {
-        _ogg.Close();
-        _file.Dispose();
+        if (!_stream.CanSeek)
+        {
+            throw new DecoderException(
+                $"Cannot recreate Opus decoder for non-seekable source '{_originName}'.");
+        }
 
-        _file = new FileStream(_sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        _ogg.Close();
+        _stream.Position = 0;
         _opusDecoder = OpusCodecFactory.CreateDecoder(OpusSampleRate, _channels);
-        _ogg = new OpusOggReadStream(_opusDecoder, _file);
+        _ogg = new OpusOggReadStream(_opusDecoder, _stream);
         if (_ogg.TotalTime > TimeSpan.Zero)
         {
             Duration = _ogg.TotalTime;
@@ -281,9 +352,59 @@ internal sealed class OpusOggAudioDecoder : IAudioDecoder
     internal static int ReadOpusChannelCount(string filePath)
     {
         using var stream = File.OpenRead(filePath);
-        var buffer = new byte[Math.Min(8192, (int)stream.Length)];
-        var n = stream.Read(buffer);
-        var span = buffer.AsSpan(0, n);
+        return ReadOpusChannelCount(stream);
+    }
+
+    /// <summary>
+    /// Reads channel count from the OpusHead identification header.
+    /// When <paramref name="stream"/> is seekable, position is restored after the peek.
+    /// <see cref="PeekBufferStream"/> uses its prefetched prefix without consuming the stream.
+    /// </summary>
+    internal static int ReadOpusChannelCount(Stream stream)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+
+        if (stream is PeekBufferStream peek)
+        {
+            return ParseOpusChannelCount(peek.PrefetchSpan);
+        }
+
+        long? restore = null;
+        if (stream.CanSeek)
+        {
+            restore = stream.Position;
+        }
+
+        try
+        {
+            var max = 8192;
+            if (stream.CanSeek)
+            {
+                try
+                {
+                    max = (int)Math.Min(8192, Math.Max(0, stream.Length - stream.Position));
+                }
+                catch (NotSupportedException)
+                {
+                    max = 8192;
+                }
+            }
+
+            var buffer = new byte[Math.Max(64, max)];
+            var n = stream.Read(buffer);
+            return ParseOpusChannelCount(buffer.AsSpan(0, n));
+        }
+        finally
+        {
+            if (restore is long pos)
+            {
+                stream.Position = pos;
+            }
+        }
+    }
+
+    private static int ParseOpusChannelCount(ReadOnlySpan<byte> span)
+    {
         var needle = "OpusHead"u8;
         for (var i = 0; i <= span.Length - needle.Length - 2; i++)
         {

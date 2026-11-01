@@ -27,6 +27,31 @@ player.ErrorOccurred += (_, ex) => Console.WriteLine(ex.Message);
 player.Play();
 ```
 
+## Load from HTTP / HTTPS
+
+```csharp
+using Sonora.Audio.Sources;
+
+await player.LoadAsync(new HttpAudioSource(new Uri("https://example.com/track.mp3")));
+
+player.NetworkStatusChanged += (_, _) =>
+{
+    Console.WriteLine($"{player.NetworkTransportStatus} ({player.NetworkBytesBuffered} bytes)");
+};
+
+player.Play();
+
+// Finite file vs unknown-length / live:
+if (!player.HasKnownDuration)
+{
+    Console.WriteLine("Duration unknown — do not treat Duration == 0 as empty.");
+}
+```
+
+String paths stay file-only. Pass `HttpAudioSource` explicitly for URLs. Optional engine-wide defaults live on `AudioEngineOptions.HttpStreaming`.
+
+Seeking works only when the server supports verified byte ranges **and** the decoder can map time to a stream position. Non-seekable sources throw `NotSupportedException` from `Seek` / `SeekWithResult`. Transport failures raise `ErrorOccurred` with `NetworkAudioException` and never `PlaybackCompleted`.
+
 ## Read metadata without playback
 
 Metadata extraction does not create a player or initialize WASAPI.

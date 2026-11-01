@@ -5,10 +5,12 @@ using Sonora.Audio.Abstractions;
 namespace Sonora.Audio.Windows.Decoding;
 
 /// <summary>
-/// Sniffs local audio files and opens the appropriate <see cref="IAudioDecoder"/> backend.
+/// Sniffs local audio files and streams, then opens the appropriate <see cref="IAudioDecoder"/> backend.
 /// </summary>
 internal static class DecoderSelector
 {
+    private const int SniffBufferSize = 8192;
+
     // ASF header object GUID: 75B22630-668E-11CF-A6D9-00AA0062CE6C
     private static ReadOnlySpan<byte> AsfHeaderGuid =>
     [
@@ -29,25 +31,7 @@ internal static class DecoderSelector
         try
         {
             var kind = Sniff(filePath);
-            return kind switch
-            {
-                AudioContainerKind.Wave => WaveStreamAudioDecoder.OpenWave(filePath),
-                AudioContainerKind.Aiff => WaveStreamAudioDecoder.OpenAiff(filePath),
-                AudioContainerKind.OggVorbis => WaveStreamAudioDecoder.FromWaveStream(
-                    new VorbisWaveReader(filePath),
-                    sourcePath: null,
-                    isMediaFoundation: false),
-                AudioContainerKind.OggOpus => OpusOggAudioDecoder.Open(filePath),
-                AudioContainerKind.Flac
-                    or AudioContainerKind.MpegAudio
-                    or AudioContainerKind.Mpeg4
-                    or AudioContainerKind.AdtsAac
-                    or AudioContainerKind.Asf
-                    or AudioContainerKind.WebM
-                    => WaveStreamAudioDecoder.OpenMediaFoundation(filePath),
-                _ => throw new UnsupportedFormatException(
-                    $"The audio format of '{filePath}' is not supported."),
-            };
+            return OpenKind(kind, filePath);
         }
         catch (Exception ex) when (ex is not AudioException and not FileNotFoundException and not OperationCanceledException)
         {
@@ -55,17 +39,173 @@ internal static class DecoderSelector
         }
     }
 
+    /// <summary>
+    /// Opens a decoder for an audio byte stream. The returned decoder owns <paramref name="stream"/>.
+    /// </summary>
+    /// <param name="stream">Readable audio bytes. Prefer seekable streams for MF formats and seeking.</param>
+    /// <param name="originName">Optional file name or URI used for diagnostics and MF origin hints.</param>
+    /// <param name="contentTypeHint">Optional MIME type used when magic-byte sniffing is inconclusive.</param>
+    public static IAudioDecoder Open(Stream stream, string? originName = null, string? contentTypeHint = null)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        if (!stream.CanRead)
+        {
+            throw new ArgumentException("Stream must be readable.", nameof(stream));
+        }
+
+        var describe = string.IsNullOrWhiteSpace(originName) ? "stream" : originName;
+        PeekBufferStream? peek = null;
+        Stream openStream = stream;
+        try
+        {
+            AudioContainerKind kind;
+            if (stream.CanSeek)
+            {
+                var start = stream.Position;
+                kind = Sniff(stream);
+                stream.Position = start;
+            }
+            else
+            {
+                peek = PeekBufferStream.Create(stream, SniffBufferSize, leaveOpen: false);
+                openStream = peek;
+                kind = SniffHeader(peek.PrefetchSpan, peek);
+                peek.RewindToStart();
+            }
+
+            if (kind == AudioContainerKind.Unknown)
+            {
+                kind = GuessFromContentType(contentTypeHint)
+                    ?? GuessFromOriginName(originName)
+                    ?? AudioContainerKind.Unknown;
+            }
+
+            return OpenKind(kind, openStream, describe, contentTypeHint);
+        }
+        catch (Exception ex) when (ex is not AudioException and not OperationCanceledException and not NotSupportedException)
+        {
+            peek?.Dispose();
+            if (peek is null)
+            {
+                stream.Dispose();
+            }
+
+            throw MapOpenException(describe, ex);
+        }
+        catch
+        {
+            peek?.Dispose();
+            if (peek is null)
+            {
+                // Ownership transfers only on success; dispose the caller's stream on failure.
+                stream.Dispose();
+            }
+
+            throw;
+        }
+    }
+
     public static AudioContainerKind Sniff(string filePath)
     {
         using var stream = File.OpenRead(filePath);
-        Span<byte> header = stackalloc byte[64];
-        var read = stream.Read(header);
+        return Sniff(stream);
+    }
+
+    /// <summary>
+    /// Sniffs container kind from a stream. When seekable, position is restored.
+    /// Non-seekable streams should be wrapped with <see cref="PeekBufferStream"/> first.
+    /// </summary>
+    public static AudioContainerKind Sniff(Stream stream)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+
+        if (stream is PeekBufferStream peek)
+        {
+            return SniffHeader(peek.PrefetchSpan, peek);
+        }
+
+        if (!stream.CanSeek)
+        {
+            Span<byte> header = stackalloc byte[64];
+            var read = stream.Read(header);
+            return SniffHeader(header[..read], sourceForOgg: null);
+        }
+
+        var start = stream.Position;
+        try
+        {
+            Span<byte> header = stackalloc byte[64];
+            var read = stream.Read(header);
+            if (read < 12)
+            {
+                return AudioContainerKind.Unknown;
+            }
+
+            return SniffHeader(header[..read], stream);
+        }
+        finally
+        {
+            stream.Position = start;
+        }
+    }
+
+    private static IAudioDecoder OpenKind(AudioContainerKind kind, string filePath)
+        => kind switch
+        {
+            AudioContainerKind.Wave => WaveStreamAudioDecoder.OpenWave(filePath),
+            AudioContainerKind.Aiff => WaveStreamAudioDecoder.OpenAiff(filePath),
+            AudioContainerKind.OggVorbis => WaveStreamAudioDecoder.FromWaveStream(
+                new VorbisWaveReader(filePath),
+                sourcePath: filePath,
+                isMediaFoundation: false,
+                hasKnownDuration: true),
+            AudioContainerKind.OggOpus => OpusOggAudioDecoder.Open(filePath),
+            AudioContainerKind.Flac
+                or AudioContainerKind.MpegAudio
+                or AudioContainerKind.Mpeg4
+                or AudioContainerKind.AdtsAac
+                or AudioContainerKind.Asf
+                or AudioContainerKind.WebM
+                => WaveStreamAudioDecoder.OpenMediaFoundation(filePath),
+            _ => throw new UnsupportedFormatException(
+                $"The audio format of '{filePath}' is not supported."),
+        };
+
+    private static IAudioDecoder OpenKind(
+        AudioContainerKind kind,
+        Stream stream,
+        string originName,
+        string? contentTypeHint)
+        => kind switch
+        {
+            AudioContainerKind.Wave => WaveStreamAudioDecoder.OpenWave(stream),
+            AudioContainerKind.Aiff => WaveStreamAudioDecoder.OpenAiff(stream),
+            AudioContainerKind.OggVorbis => WaveStreamAudioDecoder.FromWaveStream(
+                new VorbisWaveReader(stream, closeOnDispose: false),
+                sourcePath: originName,
+                isMediaFoundation: false,
+                supportsExactByteSeek: false,
+                hasKnownDuration: null,
+                ownedByteStream: stream),
+            AudioContainerKind.OggOpus => OpusOggAudioDecoder.Open(stream, originName, leaveOpen: false),
+            AudioContainerKind.Flac
+                or AudioContainerKind.MpegAudio
+                or AudioContainerKind.Mpeg4
+                or AudioContainerKind.AdtsAac
+                or AudioContainerKind.Asf
+                or AudioContainerKind.WebM
+                => WaveStreamAudioDecoder.OpenMediaFoundation(stream, originName, contentTypeHint),
+            _ => throw new UnsupportedFormatException(
+                $"The audio format of '{originName}' is not supported."),
+        };
+
+    private static AudioContainerKind SniffHeader(ReadOnlySpan<byte> h, Stream? sourceForOgg)
+    {
+        var read = h.Length;
         if (read < 12)
         {
             return AudioContainerKind.Unknown;
         }
-
-        var h = header[..read];
 
         if (HasAscii(h, 0, "RIFF") && read >= 12 && HasAscii(h, 8, "WAVE"))
         {
@@ -95,7 +235,7 @@ internal static class DecoderSelector
 
         if (HasAscii(h, 0, "OggS"))
         {
-            return SniffOgg(stream, h);
+            return SniffOgg(sourceForOgg, h);
         }
 
         if (read >= 8 && HasAscii(h, 4, "ftyp"))
@@ -116,14 +256,42 @@ internal static class DecoderSelector
         return AudioContainerKind.Unknown;
     }
 
-    private static AudioContainerKind SniffOgg(Stream stream, ReadOnlySpan<byte> firstPage)
+    private static AudioContainerKind SniffOgg(Stream? stream, ReadOnlySpan<byte> firstPage)
     {
-        // Prefer scanning the first ~8 KiB for OpusHead / vorbis identification.
-        stream.Position = 0;
-        var buffer = new byte[Math.Min(8192, (int)Math.Max(stream.Length, firstPage.Length))];
-        var n = stream.Read(buffer);
-        var span = buffer.AsSpan(0, n);
+        if (stream is PeekBufferStream peek)
+        {
+            return ClassifyOggPayload(peek.PrefetchSpan);
+        }
 
+        if (stream is null || !stream.CanSeek)
+        {
+            return ClassifyOggPayload(firstPage);
+        }
+
+        // Prefer scanning the first ~8 KiB for OpusHead / vorbis identification.
+        // Caller already consumed firstPage.Length bytes from the stream.
+        var oggStart = stream.Position - firstPage.Length;
+        if (oggStart < 0)
+        {
+            oggStart = 0;
+        }
+
+        try
+        {
+            stream.Position = oggStart;
+            var available = (int)Math.Max(0, stream.Length - oggStart);
+            var buffer = new byte[Math.Min(SniffBufferSize, Math.Max(available, firstPage.Length))];
+            var n = stream.Read(buffer);
+            return ClassifyOggPayload(buffer.AsSpan(0, n));
+        }
+        finally
+        {
+            stream.Position = oggStart;
+        }
+    }
+
+    private static AudioContainerKind ClassifyOggPayload(ReadOnlySpan<byte> span)
+    {
         if (IndexOf(span, "OpusHead"u8) >= 0)
         {
             return AudioContainerKind.OggOpus;
@@ -135,6 +303,64 @@ internal static class DecoderSelector
         }
 
         return AudioContainerKind.Unknown;
+    }
+
+    private static AudioContainerKind? GuessFromContentType(string? contentType)
+    {
+        if (string.IsNullOrWhiteSpace(contentType))
+        {
+            return null;
+        }
+
+        var ct = contentType.Trim();
+        var semi = ct.IndexOf(';');
+        if (semi >= 0)
+        {
+            ct = ct[..semi].Trim();
+        }
+
+        return ct.ToLowerInvariant() switch
+        {
+            "audio/wav" or "audio/wave" or "audio/x-wav" => AudioContainerKind.Wave,
+            "audio/aiff" or "audio/x-aiff" => AudioContainerKind.Aiff,
+            "audio/flac" or "audio/x-flac" => AudioContainerKind.Flac,
+            "audio/mpeg" or "audio/mp3" => AudioContainerKind.MpegAudio,
+            "audio/mp4" or "audio/m4a" or "audio/aac" or "audio/x-m4a" => AudioContainerKind.Mpeg4,
+            "audio/webm" => AudioContainerKind.WebM,
+            "audio/x-ms-wma" or "video/x-ms-asf" => AudioContainerKind.Asf,
+            "audio/opus" => AudioContainerKind.OggOpus,
+            "audio/ogg" or "application/ogg" => null, // may be Vorbis or Opus — require sniff
+            _ => null,
+        };
+    }
+
+    private static AudioContainerKind? GuessFromOriginName(string? originName)
+    {
+        if (string.IsNullOrWhiteSpace(originName))
+        {
+            return null;
+        }
+
+        var path = originName;
+        if (Uri.TryCreate(originName, UriKind.Absolute, out var uri))
+        {
+            path = uri.AbsolutePath;
+        }
+
+        var ext = Path.GetExtension(path);
+        return ext.ToLowerInvariant() switch
+        {
+            ".wav" => AudioContainerKind.Wave,
+            ".aiff" or ".aif" or ".aifc" => AudioContainerKind.Aiff,
+            ".flac" => AudioContainerKind.Flac,
+            ".mp3" => AudioContainerKind.MpegAudio,
+            ".m4a" or ".mp4" or ".aac" => AudioContainerKind.Mpeg4,
+            ".wma" or ".asf" => AudioContainerKind.Asf,
+            ".webm" => AudioContainerKind.WebM,
+            ".opus" => AudioContainerKind.OggOpus,
+            ".ogg" or ".oga" => null,
+            _ => null,
+        };
     }
 
     private static bool IsAdtsAac(ReadOnlySpan<byte> header)
@@ -218,6 +444,6 @@ internal static class DecoderSelector
             return new UnsupportedFormatException($"The audio format of '{filePath}' is not supported.", ex);
         }
 
-        return new InvalidAudioException($"The audio file '{filePath}' could not be opened.", ex);
+        return new InvalidAudioException($"The audio source '{filePath}' could not be opened.", ex);
     }
 }

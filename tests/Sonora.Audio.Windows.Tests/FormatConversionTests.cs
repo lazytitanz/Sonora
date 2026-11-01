@@ -66,6 +66,7 @@ public sealed class FormatConversionTests
 
         public AudioFormat Format { get; }
         public TimeSpan Duration { get; }
+        public bool HasKnownDuration => true;
         public bool CanSeek => true;
 
         public int Read(Span<float> destination)

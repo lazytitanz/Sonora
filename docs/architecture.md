@@ -20,10 +20,12 @@ Metadata (`IAudioMetadataReader` / `AudioMetadataReader`) lives in `Sonora.Audio
 
 ## Playback pipeline
 
-1. `AudioPlayer.LoadAsync` opens an `IAudioDecoder` (may perform disk/codec I/O).
-2. A **decode pump** (background worker) reads float32 PCM, runs optional `IAudioProcessor`s and volume, and writes into a **bounded ring buffer**.
-3. WASAPI / `IAudioOutput` callbacks pull only from the ring via `IPcmSampleSource` — **no decoding or file I/O on the audio callback**.
-4. Underruns fill silence and raise an edge-triggered `Underrun` event.
+1. `AudioPlayer.LoadAsync` opens an `IAudioDecoder` from a file path or `AudioSource` (may perform disk/network/codec I/O).
+2. HTTP sources use a bounded byte transport in `Sonora.Audio` (`HttpRandomAccessStream` for verified ranges, `HttpContentByteStream` for forward-only). Network stalls block the **decode worker** only and never return `0` (EOF) until the body completes.
+3. A **decode pump** (background worker) reads float32 PCM, runs optional `IAudioProcessor`s and volume, and writes into a **bounded ring buffer**.
+4. WASAPI / `IAudioOutput` callbacks pull only from the ring via `IPcmSampleSource` — **no decoding, file, or HTTP I/O on the audio callback**.
+5. Underruns fill silence and raise an edge-triggered `Underrun` event; audible `Position` freezes during underrun silence and network buffering so device clocks do not invent timeline progress.
+6. `NetworkTransportStatus` is independent of `PlaybackState` (Playing/Paused intent is preserved while buffering/reconnecting).
 
 ## Concurrency
 
@@ -65,9 +67,15 @@ Accuracy limits are documented in the README.
 | Opus seek | Page-granular `SeekTo` + preroll discard; `Unknown` accuracy |
 
 ```text
-LoadAsync → WindowsAudioDecoderFactory → DecoderSelector (sniff)
+LoadAsync(AudioSource)
+  → WindowsAudioDecoderFactory
+      File → DecoderSelector (path sniff)
+      HTTP → HttpRandomAccessStream (206) or HttpContentByteStream (forward-only)
+           → DecoderSelector (stream sniff)
   → Wave / AIFF / MF / Vorbis / Opus → IAudioDecoder → decode pump
 ```
+
+HTTP resource identity uses strong ETags with `If-Range` when available. Weak or missing validators are documented as less safe; Sonora refuses to stitch bytes across changed lengths/ETags.
 
 ## Output devices and modes (0.5.0 / 0.6.0)
 

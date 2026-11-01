@@ -10,7 +10,7 @@
 
 [![.NET 10](https://img.shields.io/badge/.NET-10-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/download)
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
-[![Version](https://img.shields.io/badge/version-0.8.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.9.0-blue)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 [Why Sonora?](#why-sonora) · [Quick start](#quick-start) · [Formats](#supported-audio-formats) · [DSP](#dsp-effects) · [Architecture](#how-it-works) · [Build](#build-and-test)
@@ -42,6 +42,7 @@ It is built for apps like [EMP](https://github.com/lazytitanz/EMP) but stays com
 - **Dual position tracking** — `Position` (audible estimate) and `BufferedPosition` (decode frontier)
 - **Live DSP** — EQ/preamp changes apply on the output path without waiting for the PCM buffer to drain
 - **Metadata** — read tags and optional embedded artwork without creating a player or opening WASAPI
+- **HTTP streaming** — play `http`/`https` URLs with bounded buffering, cancellation, and honest seek reporting
 - **MIT licensed** — packages prepared for NuGet (`Sonora.Audio`, `Sonora.Audio.Windows`)
 
 > [!NOTE]
@@ -67,7 +68,21 @@ player.Play();
 Console.WriteLine(player.Position);          // estimated audible position
 Console.WriteLine(player.BufferedPosition);  // decode/buffer frontier
 Console.WriteLine(player.Duration);
+Console.WriteLine(player.HasKnownDuration);  // false for live/unknown-length sources
 ```
+
+### HTTP / HTTPS
+
+```csharp
+using Sonora.Audio.Sources;
+
+await player.LoadAsync(new HttpAudioSource(new Uri("https://example.com/audio.mp3")));
+player.NetworkStatusChanged += (_, _) =>
+    Console.WriteLine($"{player.NetworkTransportStatus} buf={player.NetworkBytesBuffered}");
+player.Play();
+```
+
+String `LoadAsync(path)` remains **file-only** — URLs must use `HttpAudioSource` explicitly.
 
 ### Metadata (independent of playback)
 
@@ -95,7 +110,7 @@ Metadata uses managed [ATL.NET](https://github.com/Zeugma440/atldotnet) (`z440.a
 
 | API | Behavior |
 | --- | --- |
-| `LoadAsync` | Opens a file; releases the previous source |
+| `LoadAsync` | Opens a file or `AudioSource` (file / HTTP); releases the previous source |
 | `Play` | Starts or resumes |
 | `Pause` | Preserves position |
 | `Stop` | Stops and resets to the beginning (does not raise completion) |
@@ -360,7 +375,9 @@ dotnet add package Sonora.Audio.Windows
 - Exclusive mode is not bit-perfect when DSP, volume, or format conversion are active
 - Device / mode switches are not sample-accurate; old-endpoint padding is skipped and a short gap may be heard
 - Follow-default uses notification-driven rebinds (Multimedia role), not OS stream-routing-as-correctness
-- No network streaming or online metadata lookup
+- No HLS/DASH, podcast feeds, or online metadata lookup
+- HTTP seeking requires verified byte-range support; MF formats need a seekable body (forward-only MF is not claimed)
+- Applications accepting arbitrary URLs should apply SSRF / egress controls
 - Metadata does not invent titles from file names; ATL `UseFileNameWhenNoTitle` is disabled once on first Sonora metadata use
 - ATL may report ALAC as lossy; WebM Opus may omit sample rate / channels; artwork write/edit is out of scope
 - Gapless joins are continuous PCM hard-cuts; encoder delay/padding trimming for lossy codecs is not applied

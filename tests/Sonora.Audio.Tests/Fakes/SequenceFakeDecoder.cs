@@ -22,6 +22,7 @@ internal sealed class SequenceFakeDecoder : IAudioDecoder
 
     public AudioFormat Format { get; }
     public TimeSpan Duration { get; }
+    public bool HasKnownDuration => true;
     public bool CanSeek => true;
 
     /// <summary>Current interleaved sample read cursor.</summary>

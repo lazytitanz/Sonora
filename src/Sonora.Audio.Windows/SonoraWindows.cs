@@ -30,11 +30,12 @@ public static class SonoraWindows
                 Processors = options.Processors,
                 EffectFactory = options.EffectFactory ?? new WindowsAudioEffectFactory(),
                 FormatConverter = options.FormatConverter ?? new WindowsAudioFormatConverter(),
+                HttpStreaming = options.HttpStreaming,
             };
         }
 
         return new AudioEngine(
-            new WindowsAudioDecoderFactory(),
+            new WindowsAudioDecoderFactory(options.HttpStreaming),
             new WindowsAudioOutputFactory(),
             options,
             new WindowsAudioOutputDevices());

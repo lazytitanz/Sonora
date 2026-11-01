@@ -58,6 +58,7 @@ public sealed class UnderrunTests
 
         public AudioFormat Format { get; }
         public TimeSpan Duration { get; }
+        public bool HasKnownDuration => true;
         public bool CanSeek { get; }
 
         public int Read(Span<float> destination)

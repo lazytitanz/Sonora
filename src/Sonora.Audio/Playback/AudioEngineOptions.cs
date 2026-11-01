@@ -1,4 +1,5 @@
 using Sonora.Audio.DSP;
+using Sonora.Audio.Network;
 
 namespace Sonora.Audio.Playback;
 
@@ -36,4 +37,9 @@ public sealed class AudioEngineOptions
     /// <c>SonoraWindows.CreateEngine()</c> supplies a WDL-backed converter.
     /// </summary>
     public IAudioFormatConverter? FormatConverter { get; init; }
+
+    /// <summary>
+    /// HTTP/HTTPS streaming defaults. Ordinary local-file playback ignores these settings.
+    /// </summary>
+    public HttpStreamingOptions HttpStreaming { get; init; } = HttpStreamingOptions.Default;
 }

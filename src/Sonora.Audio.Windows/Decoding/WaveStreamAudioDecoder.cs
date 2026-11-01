@@ -19,6 +19,8 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
     private static readonly TimeSpan LateLandAnchorSkew = TimeSpan.FromMilliseconds(100);
 
     private readonly string? _sourcePath;
+    private readonly Func<WaveStream>? _streamFactory;
+    private readonly Stream? _ownedByteStream;
     private readonly bool _isMediaFoundation;
     private readonly bool _supportsExactByteSeek;
     private WaveStream _stream;
@@ -27,35 +29,149 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
     private bool _disposed;
     private bool _reachedEnd;
 
-    private WaveStreamAudioDecoder(WaveStream stream, string? sourcePath, bool isMediaFoundation, bool supportsExactByteSeek)
+    private WaveStreamAudioDecoder(
+        WaveStream stream,
+        string? sourcePath,
+        bool isMediaFoundation,
+        bool supportsExactByteSeek,
+        bool hasKnownDuration,
+        Func<WaveStream>? streamFactory = null,
+        Stream? ownedByteStream = null)
     {
         _stream = stream;
         _sourcePath = sourcePath;
         _isMediaFoundation = isMediaFoundation;
         _supportsExactByteSeek = supportsExactByteSeek;
+        _streamFactory = streamFactory;
+        _ownedByteStream = ownedByteStream;
         _samples = stream.ToSampleProvider();
         var wf = _samples.WaveFormat;
         Format = AudioFormat.CreateFloat32(wf.SampleRate, wf.Channels);
-        Duration = stream.TotalTime;
+        Duration = TryGetTotalTime(stream);
+        HasKnownDuration = hasKnownDuration;
         CanSeek = stream.CanSeek;
         _conversionScratch = new float[Math.Max(1024, wf.Channels * 256)];
     }
 
+    private static TimeSpan TryGetTotalTime(WaveStream stream)
+    {
+        try
+        {
+            return stream.TotalTime;
+        }
+        catch (NotSupportedException)
+        {
+            return TimeSpan.Zero;
+        }
+    }
+
     public AudioFormat Format { get; }
     public TimeSpan Duration { get; private set; }
+    public bool HasKnownDuration { get; }
     public bool CanSeek { get; }
 
     public static WaveStreamAudioDecoder OpenWave(string filePath)
-        => new(new WaveFileReader(filePath), sourcePath: null, isMediaFoundation: false, supportsExactByteSeek: true);
+        => new(
+            new WaveFileReader(filePath),
+            sourcePath: null,
+            isMediaFoundation: false,
+            supportsExactByteSeek: true,
+            hasKnownDuration: true);
+
+    public static WaveStreamAudioDecoder OpenWave(Stream stream)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        var reader = new WaveFileReader(stream);
+        return new(
+            reader,
+            sourcePath: null,
+            isMediaFoundation: false,
+            supportsExactByteSeek: stream.CanSeek,
+            hasKnownDuration: DetermineDurationKnown(reader, isFileOpen: false),
+            ownedByteStream: stream);
+    }
 
     public static WaveStreamAudioDecoder OpenAiff(string filePath)
-        => new(new AiffFileReader(filePath), sourcePath: null, isMediaFoundation: false, supportsExactByteSeek: true);
+        => new(
+            new AiffFileReader(filePath),
+            sourcePath: null,
+            isMediaFoundation: false,
+            supportsExactByteSeek: true,
+            hasKnownDuration: true);
+
+    public static WaveStreamAudioDecoder OpenAiff(Stream stream)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        var reader = new AiffFileReader(stream);
+        return new(
+            reader,
+            sourcePath: null,
+            isMediaFoundation: false,
+            supportsExactByteSeek: stream.CanSeek,
+            hasKnownDuration: DetermineDurationKnown(reader, isFileOpen: false),
+            ownedByteStream: stream);
+    }
 
     public static WaveStreamAudioDecoder OpenMediaFoundation(string filePath)
-        => new(CreateMediaFoundationReader(filePath), filePath, isMediaFoundation: true, supportsExactByteSeek: false);
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+        return new(
+            CreateMediaFoundationReader(filePath),
+            filePath,
+            isMediaFoundation: true,
+            supportsExactByteSeek: false,
+            hasKnownDuration: true,
+            streamFactory: () => CreateMediaFoundationReader(filePath));
+    }
 
-    public static WaveStreamAudioDecoder FromWaveStream(WaveStream stream, string? sourcePath, bool isMediaFoundation, bool supportsExactByteSeek = false)
-        => new(stream, sourcePath, isMediaFoundation, supportsExactByteSeek);
+    public static WaveStreamAudioDecoder OpenMediaFoundation(
+        Stream stream,
+        string? originName = null,
+        string? contentType = null)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        if (!stream.CanSeek)
+        {
+            throw new NotSupportedException(
+                "Media Foundation stream decoding requires a seekable byte stream (for example HTTP with Range support).");
+        }
+
+        Func<WaveStream> factory = () =>
+        {
+            stream.Position = 0;
+            return CreateStreamMediaFoundationReader(stream, originName, contentType);
+        };
+
+        var reader = factory();
+        return new(
+            reader,
+            sourcePath: originName,
+            isMediaFoundation: true,
+            supportsExactByteSeek: false,
+            hasKnownDuration: DetermineDurationKnown(reader, isFileOpen: false),
+            streamFactory: factory,
+            ownedByteStream: stream);
+    }
+
+    public static WaveStreamAudioDecoder FromWaveStream(
+        WaveStream stream,
+        string? sourcePath,
+        bool isMediaFoundation,
+        bool supportsExactByteSeek = false,
+        bool? hasKnownDuration = null,
+        Func<WaveStream>? streamFactory = null,
+        Stream? ownedByteStream = null)
+        => new(
+            stream,
+            sourcePath,
+            isMediaFoundation,
+            supportsExactByteSeek,
+            hasKnownDuration ?? DetermineDurationKnown(
+                stream,
+                // File-path opens do not pass an owned byte stream; stream opens do.
+                isFileOpen: ownedByteStream is null),
+            streamFactory,
+            ownedByteStream);
 
     public int Read(Span<float> destination)
     {
@@ -123,6 +239,7 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
 
         _disposed = true;
         _stream.Dispose();
+        _ownedByteStream?.Dispose();
     }
 
     private AudioSeekResult SeekExactPcm(long requestedFrames, TimeSpan requested)
@@ -197,7 +314,7 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
         }
 
         var frames = Format.TimeToFrames(position);
-        if (Duration > TimeSpan.Zero)
+        if (HasKnownDuration && Duration > TimeSpan.Zero)
         {
             var maxFrames = Format.TimeToFrames(Duration);
             frames = AudioFormat.ClampFrameIndex(frames, maxFrames);
@@ -343,12 +460,12 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
 
     private void RecreateMediaFoundationReader()
     {
-        if (!_isMediaFoundation || string.IsNullOrWhiteSpace(_sourcePath))
+        if (!_isMediaFoundation || _streamFactory is null)
         {
-            throw new DecoderException("Cannot recreate a non-Media-Foundation decoder.");
+            throw new DecoderException("Cannot recreate Media Foundation reader without a stream factory.");
         }
 
-        var replacement = CreateMediaFoundationReader(_sourcePath);
+        var replacement = _streamFactory();
         var old = _stream;
         _stream = replacement;
         _samples = replacement.ToSampleProvider();
@@ -357,16 +474,61 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
             Duration = replacement.TotalTime;
         }
 
+        // Dispose the WaveStream only — owned byte streams are retained for recreate.
         old.Dispose();
         _reachedEnd = false;
     }
 
+    private static bool DetermineDurationKnown(WaveStream stream, bool isFileOpen)
+    {
+        if (isFileOpen)
+        {
+            return true;
+        }
+
+        try
+        {
+            if (stream.TotalTime > TimeSpan.Zero)
+            {
+                return true;
+            }
+        }
+        catch (NotSupportedException)
+        {
+            return false;
+        }
+
+        if (!stream.CanSeek)
+        {
+            return false;
+        }
+
+        try
+        {
+            _ = stream.Length;
+            return true;
+        }
+        catch (NotSupportedException)
+        {
+            return false;
+        }
+    }
+
     private static MediaFoundationReader CreateMediaFoundationReader(string filePath)
-        => new(filePath, new MediaFoundationReader.MediaFoundationReaderSettings
+        => new(filePath, CreateMediaFoundationSettings());
+
+    private static StreamMediaFoundationReader CreateStreamMediaFoundationReader(
+        Stream stream,
+        string? originName,
+        string? contentType)
+        => new(stream, CreateMediaFoundationSettings(), contentType, originName);
+
+    private static MediaFoundationReader.MediaFoundationReaderSettings CreateMediaFoundationSettings()
+        => new()
         {
             RepositionInRead = false,
             RequestFloatOutput = true,
-        });
+        };
 
     private static bool IsInvalidState(Exception ex)
     {

@@ -126,3 +126,22 @@ public sealed class AudioDeviceException : AudioException
     {
     }
 }
+
+/// <summary>
+/// Thrown when HTTP/HTTPS audio transport fails (connect, range validation, reconnect exhaustion, etc.).
+/// Messages must not include credentials, authorization headers, or signed URL query parameters.
+/// </summary>
+public sealed class NetworkAudioException : AudioException
+{
+    /// <inheritdoc cref="AudioException(string)"/>
+    public NetworkAudioException(string message)
+        : base(message)
+    {
+    }
+
+    /// <inheritdoc cref="AudioException(string, Exception)"/>
+    public NetworkAudioException(string message, Exception innerException)
+        : base(message, innerException)
+    {
+    }
+}

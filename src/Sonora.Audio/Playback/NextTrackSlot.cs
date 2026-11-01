@@ -1,4 +1,5 @@
 using Sonora.Audio.Formats;
+using Sonora.Audio.Sources;
 
 namespace Sonora.Audio.Playback;
 
@@ -11,6 +12,7 @@ internal sealed class NextTrackSlot
     private int _generation;
     private NextTrackState _state = NextTrackState.None;
     private string? _path;
+    private AudioSource? _source;
     private TrackDecodePipeline? _pipeline;
     private Exception? _failure;
 
@@ -36,6 +38,17 @@ internal sealed class NextTrackSlot
         }
     }
 
+    public AudioSource? Source
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _source;
+            }
+        }
+    }
+
     public TrackDecodePipeline? ReadyPipeline
     {
         get
@@ -47,9 +60,9 @@ internal sealed class NextTrackSlot
         }
     }
 
-    public int BeginLoad(string path)
+    public int BeginLoad(AudioSource source)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        ArgumentNullException.ThrowIfNull(source);
         int generation;
         TrackDecodePipeline? old;
         lock (_sync)
@@ -58,7 +71,8 @@ internal sealed class NextTrackSlot
             generation = _generation;
             old = _pipeline;
             _pipeline = null;
-            _path = path;
+            _source = source;
+            _path = source.Identifier;
             _failure = null;
             _state = NextTrackState.Loading;
         }
@@ -125,6 +139,7 @@ internal sealed class NextTrackSlot
             path = _path ?? pipeline.Path;
             _pipeline = null;
             _path = null;
+            _source = null;
             _state = NextTrackState.None;
             _failure = null;
             _generation++; // invalidate in-flight loads
@@ -141,6 +156,7 @@ internal sealed class NextTrackSlot
             old = _pipeline;
             _pipeline = null;
             _path = null;
+            _source = null;
             _failure = null;
             _state = NextTrackState.None;
         }
@@ -149,8 +165,9 @@ internal sealed class NextTrackSlot
     }
 
     /// <summary>
-    /// Disposes a ready/loading pipeline but keeps <see cref="Path"/> and sets <see cref="NextTrackState.Failed"/>
-    /// so callers can observe invalidation and retry preload after a session-format change.
+    /// Disposes a ready/loading pipeline but keeps <see cref="Path"/> / <see cref="Source"/> and sets
+    /// <see cref="NextTrackState.Failed"/> so callers can observe invalidation and retry preload after a
+    /// session-format change.
     /// </summary>
     public void InvalidateKeepPath(Exception error)
     {
@@ -173,22 +190,22 @@ internal sealed class NextTrackSlot
         old?.Dispose();
     }
 
-    /// <summary>Retains path and moves a ready/failed slot back to loading for an in-place rebuild.</summary>
-    public bool TryBeginRebuild(out int generation, out string path)
+    /// <summary>Retains source/path and moves a ready/failed slot back to loading for an in-place rebuild.</summary>
+    public bool TryBeginRebuild(out int generation, out AudioSource source)
     {
         TrackDecodePipeline? old;
         lock (_sync)
         {
-            if (_path is null || _state is NextTrackState.None)
+            if (_source is null || _state is NextTrackState.None)
             {
                 generation = 0;
-                path = null!;
+                source = null!;
                 return false;
             }
 
             _generation++;
             generation = _generation;
-            path = _path;
+            source = _source;
             old = _pipeline;
             _pipeline = null;
             _failure = null;

@@ -1,4 +1,5 @@
 using Sonora.Audio.Abstractions;
+using Sonora.Audio.Sources;
 
 namespace Sonora.Audio.Tests.Fakes;
 
@@ -22,5 +23,11 @@ internal sealed class FakeAudioDecoderFactory : IAudioDecoderFactory
     {
         RequestedPaths.Add(filePath);
         return _factory(filePath, cancellationToken);
+    }
+
+    public Task<IAudioDecoder> CreateAsync(AudioSource source, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        return CreateAsync(source.Identifier, cancellationToken);
     }
 }

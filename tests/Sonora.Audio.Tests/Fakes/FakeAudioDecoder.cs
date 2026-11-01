@@ -57,6 +57,7 @@ internal sealed class FakeAudioDecoder : IAudioDecoder
 
     public AudioFormat Format { get; }
     public TimeSpan Duration { get; }
+    public bool HasKnownDuration { get; init; } = true;
     public bool CanSeek { get; }
 
     public int Read(Span<float> destination)

@@ -3,9 +3,11 @@ using Sonora.Audio.Devices;
 using Sonora.Audio.Diagnostics;
 using Sonora.Audio.DSP;
 using Sonora.Audio.Formats;
+using Sonora.Audio.Network;
 using Sonora.Audio.Output;
 using Sonora.Audio.Playback;
 using Sonora.Audio.Seeking;
+using Sonora.Audio.Sources;
 
 namespace Sonora.Audio;
 
@@ -38,6 +40,8 @@ public sealed class AudioPlayer : IDisposable
     private bool _completionRaised;
     private long _underrunCount;
     private int _underrunLatched;
+    private int _positionFrozen;
+    private TimeSpan _frozenAudiblePosition;
     /// <summary>
     /// When 0, end-of-stream notifications from the output device are ignored.
     /// Cleared before explicit <see cref="Stop"/> / teardown so NAudio/WASAPI Stopped
@@ -52,6 +56,12 @@ public sealed class AudioPlayer : IDisposable
     private CancellationTokenSource? _outputSwitchCts;
     private AudioFormat _sessionFormat;
     private string? _sourcePath;
+    private AudioSource? _currentSource;
+    private bool _hasKnownDuration;
+
+    private INetworkTransportInfo? _networkInfo;
+    private volatile NetworkTransportStatus _networkStatus = NetworkTransportStatus.Idle;
+    private int _networkBytesBuffered;
 
     private string? _preferredOutputDeviceId;
     private string? _activeOutputDeviceId;
@@ -120,6 +130,12 @@ public sealed class AudioPlayer : IDisposable
     public event EventHandler? Underrun;
 
     /// <summary>
+    /// Raised when <see cref="NetworkTransportStatus"/> or <see cref="NetworkBytesBuffered"/> changes
+    /// for a network-backed source. Delivered from the HTTP producer thread, never the WASAPI callback.
+    /// </summary>
+    public event EventHandler? NetworkStatusChanged;
+
+    /// <summary>
     /// Raised when the preferred or active output endpoint, device status, or recovery intent changes.
     /// Never raised on the WASAPI callback or native device-notification thread.
     /// </summary>
@@ -137,8 +153,14 @@ public sealed class AudioPlayer : IDisposable
     /// <summary>Whether a source is loaded.</summary>
     public bool HasSource => Volatile.Read(ref _hasSource);
 
-    /// <summary>Path of the logically active track (updates at the output-consumption handoff).</summary>
+    /// <summary>
+    /// Identifier of the logically active track (filesystem path or absolute URI).
+    /// Updates at the output-consumption handoff.
+    /// </summary>
     public string? SourcePath => Volatile.Read(ref _sourcePath);
+
+    /// <summary>Typed source of the logically active track, when loaded.</summary>
+    public AudioSource? CurrentSource => _currentSource;
 
     /// <summary>Path of the pending next track when loading or ready; otherwise <see langword="null"/>.</summary>
     public string? NextTrackPath => _next.Path;
@@ -148,6 +170,18 @@ public sealed class AudioPlayer : IDisposable
 
     /// <summary>Active track duration when known (updates at the consumption handoff).</summary>
     public TimeSpan Duration => _duration;
+
+    /// <summary>
+    /// Whether <see cref="Duration"/> is authoritative for the active track.
+    /// Network streams without Content-Length / media headers may report <see langword="false"/>.
+    /// </summary>
+    public bool HasKnownDuration => _hasKnownDuration;
+
+    /// <summary>Network transport status for the active source, or <see cref="NetworkTransportStatus.Idle"/>.</summary>
+    public NetworkTransportStatus NetworkTransportStatus => _networkStatus;
+
+    /// <summary>Bytes currently buffered by the network transport, when applicable.</summary>
+    public int NetworkBytesBuffered => Volatile.Read(ref _networkBytesBuffered);
 
     /// <summary>
     /// Application-preferred output endpoint id. <see langword="null"/> means follow the system default
@@ -163,7 +197,7 @@ public sealed class AudioPlayer : IDisposable
 
     /// <summary>
     /// Whether playback should resume when output becomes available after device loss.
-    /// Cleared by <see cref="Stop"/>, <see cref="LoadAsync"/>, and <see cref="Dispose"/>.
+    /// Cleared by <see cref="Stop"/>, <see cref="LoadAsync(AudioSource, CancellationToken)"/>, and <see cref="Dispose"/>.
     /// </summary>
     public OutputRecoveryIntent OutputRecoveryIntent => _outputRecoveryIntent;
 
@@ -255,7 +289,7 @@ public sealed class AudioPlayer : IDisposable
     /// DSP configuration, and preloaded next track are preserved when possible.
     /// </summary>
     /// <exception cref="OperationCanceledException">
-    /// The switch was superseded by <see cref="Stop"/>, <see cref="LoadAsync"/>, <see cref="Dispose"/>,
+    /// The switch was superseded by <see cref="Stop"/>, <see cref="LoadAsync(AudioSource, CancellationToken)"/>, <see cref="Dispose"/>,
     /// another <see cref="SetOutputDeviceAsync"/>, or <paramref name="cancellationToken"/>.
     /// </exception>
     public async Task SetOutputDeviceAsync(string? deviceId, CancellationToken cancellationToken = default)
@@ -518,9 +552,16 @@ public sealed class AudioPlayer : IDisposable
     /// Loads an audio file, releasing any previously loaded source and clearing any preloaded next track.
     /// Locks the session output format to this track for subsequent gapless joins.
     /// </summary>
-    public async Task LoadAsync(string filePath, CancellationToken cancellationToken = default)
+    public Task LoadAsync(string filePath, CancellationToken cancellationToken = default) =>
+        LoadAsync(FileAudioSource.Create(filePath), cancellationToken);
+
+    /// <summary>
+    /// Loads an audio source, releasing any previously loaded source and clearing any preloaded next track.
+    /// Locks the session output format to this track for subsequent gapless joins.
+    /// </summary>
+    public async Task LoadAsync(AudioSource source, CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+        ArgumentNullException.ThrowIfNull(source);
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -546,7 +587,7 @@ public sealed class AudioPlayer : IDisposable
         IAudioDecoder decoder;
         try
         {
-            decoder = await _decoderFactory.CreateAsync(filePath, cancellationToken).ConfigureAwait(false);
+            decoder = await _decoderFactory.CreateAsync(source, cancellationToken).ConfigureAwait(false);
         }
         catch
         {
@@ -566,6 +607,9 @@ public sealed class AudioPlayer : IDisposable
             throw;
         }
 
+        // Capture before any format conversion wraps the decoder (initial load typically does not wrap).
+        var networkInfo = decoder as INetworkTransportInfo;
+
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         string? preferred;
         string? effectiveId;
@@ -582,7 +626,7 @@ public sealed class AudioPlayer : IDisposable
 
             try
             {
-                PrepareSessionPipelines_NoLock(filePath, decoder);
+                PrepareSessionPipelines_NoLock(source, decoder, networkInfo);
             }
             catch
             {
@@ -727,9 +771,17 @@ public sealed class AudioPlayer : IDisposable
     /// Replaces any previous preload. Failures set <see cref="NextTrackState.Failed"/> and do not stop the current track.
     /// Decoded PCM is converted to the session format and buffered with a bounded ring.
     /// </summary>
-    public async Task PreloadNextAsync(string filePath, CancellationToken cancellationToken = default)
+    public Task PreloadNextAsync(string filePath, CancellationToken cancellationToken = default) =>
+        PreloadNextAsync(FileAudioSource.Create(filePath), cancellationToken);
+
+    /// <summary>
+    /// Preloads exactly one upcoming track without interrupting current playback.
+    /// Replaces any previous preload. Failures set <see cref="NextTrackState.Failed"/> and do not stop the current track.
+    /// Decoded PCM is converted to the session format and buffered with a bounded ring.
+    /// </summary>
+    public async Task PreloadNextAsync(AudioSource source, CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+        ArgumentNullException.ThrowIfNull(source);
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         int preloadGeneration;
@@ -744,7 +796,7 @@ public sealed class AudioPlayer : IDisposable
             }
 
             sessionFormat = _sessionFormat;
-            preloadGeneration = _next.BeginLoad(filePath);
+            preloadGeneration = _next.BeginLoad(source);
         }
         finally
         {
@@ -756,16 +808,18 @@ public sealed class AudioPlayer : IDisposable
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            opened = await _decoderFactory.CreateAsync(filePath, cancellationToken).ConfigureAwait(false);
+            opened = await _decoderFactory.CreateAsync(source, cancellationToken).ConfigureAwait(false);
             if (!_next.IsCurrentGeneration(preloadGeneration))
             {
                 opened.Dispose();
                 return;
             }
 
+            // Capture before Convert may wrap (ChannelMixing / WDL).
+            var networkInfo = opened as INetworkTransportInfo;
             var converted = _formatConverter.Convert(opened, sessionFormat);
             opened = null; // ownership transferred to converted (or same instance)
-            pipeline = TrackDecodePipeline.Create(filePath, converted, _options);
+            pipeline = TrackDecodePipeline.Create(source, converted, _options, networkInfo);
             pipeline.StartPump(
                 _options.Processors,
                 () => Volatile.Read(ref _volume),
@@ -972,7 +1026,7 @@ public sealed class AudioPlayer : IDisposable
             throw new NotSupportedException("The current audio source does not support seeking.");
         }
 
-        if (position > _duration && _duration > TimeSpan.Zero)
+        if (_hasKnownDuration && position > _duration && _duration > TimeSpan.Zero)
         {
             position = _duration;
         }
@@ -1015,7 +1069,7 @@ public sealed class AudioPlayer : IDisposable
                 }
 
                 var duration = active.Duration > TimeSpan.Zero ? active.Duration : _duration;
-                if (position > duration && duration > TimeSpan.Zero)
+                if (_hasKnownDuration && position > duration && duration > TimeSpan.Zero)
                 {
                     position = duration;
                 }
@@ -1128,53 +1182,39 @@ public sealed class AudioPlayer : IDisposable
         }
     }
 
-    private void PrepareSessionPipelines_NoLock(string path, IAudioDecoder decoder)
+    private void PrepareSessionPipelines_NoLock(
+        AudioSource source,
+        IAudioDecoder decoder,
+        INetworkTransportInfo? networkInfo = null)
     {
         _sessionFormat = decoder.Format;
-        Volatile.Write(ref _sourcePath, path);
+        _currentSource = source;
+        Volatile.Write(ref _sourcePath, source.Identifier);
         _duration = decoder.Duration;
+        _hasKnownDuration = decoder.HasKnownDuration;
         _timelineOriginSamples = 0;
         Interlocked.Exchange(ref _samplesDecoded, 0);
         Interlocked.Exchange(ref _samplesConsumed, 0);
         _completionRaised = false;
         Interlocked.Exchange(ref _underrunCount, 0);
         Interlocked.Exchange(ref _underrunLatched, 0);
+        Volatile.Write(ref _positionFrozen, 0);
         _logicalPositionAtAnchor = TimeSpan.Zero;
         _deviceClockAnchor = TimeSpan.Zero;
         _heldPosition = TimeSpan.Zero;
         _activeTrackGeneration++;
         _suppressTransitionIdsAtOrBelow = _transitionId;
 
-        _active = TrackDecodePipeline.Create(path, decoder, _options);
+        networkInfo ??= decoder as INetworkTransportInfo;
+        BindNetworkInfo_NoLock(networkInfo);
+
+        _active = TrackDecodePipeline.Create(source, decoder, _options, networkInfo);
 
         _effects.Configure(decoder.Format);
         _effects.ResetProcessingState();
         _effects.DisposeRetired();
 
-        _sampleSource = new TransitionSampleSource(
-            decoder.Format,
-            _effects,
-            onSamplesConsumed: n =>
-            {
-                Interlocked.Add(ref _samplesConsumed, n);
-                Interlocked.Exchange(ref _underrunLatched, 0);
-            },
-            onUnderrun: HandleUnderrunFromCallback,
-            isPlaying: () => _state == PlaybackState.Playing,
-            getActive: () =>
-            {
-                lock (_pipelineSync)
-                {
-                    return _active;
-                }
-            },
-            tryPromoteNext: TryPromoteNextFromCallback,
-            hasPendingNext: () =>
-            {
-                var s = _next.State;
-                return s is NextTrackState.Ready or NextTrackState.Loading;
-            },
-            scheduleTransitioned: ScheduleTrackTransitioned);
+        _sampleSource = CreateTransitionSampleSource_NoLock(decoder.Format);
     }
 
     private IAudioOutput? DetachOutput_NoLock()
@@ -1381,6 +1421,8 @@ public sealed class AudioPlayer : IDisposable
         var previousDuration = TimeSpan.Zero;
         string? nextPath = null;
         TrackDecodePipeline? nextPipeline = null;
+        INetworkTransportInfo? previousNetwork = null;
+        INetworkTransportInfo? nextNetwork = null;
         var transitionId = 0;
         try
         {
@@ -1393,17 +1435,35 @@ public sealed class AudioPlayer : IDisposable
             previousPath = previous?.Path;
             previousDuration = previous?.Duration ?? TimeSpan.Zero;
             _active = nextPipeline;
+            _currentSource = nextPipeline.Source;
             Volatile.Write(ref _sourcePath, nextPath);
             _duration = nextPipeline.Duration;
+            _hasKnownDuration = nextPipeline.Decoder.HasKnownDuration;
             _timelineOriginSamples = 0;
             Interlocked.Exchange(ref _samplesDecoded, 0);
             Interlocked.Exchange(ref _samplesConsumed, 0);
             Interlocked.Exchange(ref _underrunLatched, 0);
+            Volatile.Write(ref _positionFrozen, 0);
 
             // Rebase logical timeline to the start of B using the continuous device clock.
             _logicalPositionAtAnchor = TimeSpan.Zero;
             _deviceClockAnchor = _output?.TryGetRenderedPosition() ?? TimeSpan.Zero;
             _heldPosition = TimeSpan.Zero;
+
+            // Swap network probe under lock; subscribe/unsubscribe off the audio callback below.
+            previousNetwork = _networkInfo;
+            nextNetwork = nextPipeline.NetworkInfo ?? nextPipeline.Decoder as INetworkTransportInfo;
+            _networkInfo = nextNetwork;
+            if (nextNetwork is not null)
+            {
+                _networkStatus = nextNetwork.TransportStatus;
+                Volatile.Write(ref _networkBytesBuffered, nextNetwork.NetworkBytesBuffered);
+            }
+            else
+            {
+                _networkStatus = NetworkTransportStatus.Idle;
+                Volatile.Write(ref _networkBytesBuffered, 0);
+            }
 
             transitionId = Interlocked.Increment(ref _transitionId);
         }
@@ -1414,10 +1474,31 @@ public sealed class AudioPlayer : IDisposable
 
         var args = new TrackTransitionedEventArgs(previousPath, nextPath, previousDuration, transitionId);
         var toDispose = previous;
+        var oldNetwork = previousNetwork;
+        var newNetwork = nextNetwork;
         _ = Task.Run(() =>
         {
             try
             {
+                if (oldNetwork is not null)
+                {
+                    oldNetwork.TransportChanged -= OnNetworkTransportChanged;
+                }
+
+                if (newNetwork is not null)
+                {
+                    newNetwork.TransportChanged += OnNetworkTransportChanged;
+                }
+
+                try
+                {
+                    NetworkStatusChanged?.Invoke(this, EventArgs.Empty);
+                }
+                catch
+                {
+                    // ignored
+                }
+
                 toDispose?.Dispose();
             }
             catch
@@ -1520,9 +1601,13 @@ public sealed class AudioPlayer : IDisposable
         _effects.DisposeRetired();
 
         _hasSource = false;
+        _currentSource = null;
         Volatile.Write(ref _sourcePath, null);
         _duration = TimeSpan.Zero;
+        _hasKnownDuration = false;
         _heldPosition = TimeSpan.Zero;
+        Volatile.Write(ref _positionFrozen, 0);
+        UnbindNetworkInfo_NoLock(setIdle: true);
         await Task.CompletedTask.ConfigureAwait(false);
     }
 
@@ -1987,6 +2072,16 @@ public sealed class AudioPlayer : IDisposable
             return;
         }
 
+        // Freeze to sample-based estimate — device clocks advance on silence and would drift.
+        var active = _active;
+        if (active is not null && Volatile.Read(ref _positionFrozen) == 0)
+        {
+            var consumed = _timelineOriginSamples + Interlocked.Read(ref _samplesConsumed);
+            _frozenAudiblePosition = ClampToDuration(
+                active.Format.SamplesToTime(Math.Max(0, consumed)));
+            Volatile.Write(ref _positionFrozen, 1);
+        }
+
         Interlocked.Increment(ref _underrunCount);
         try
         {
@@ -1998,11 +2093,39 @@ public sealed class AudioPlayer : IDisposable
         }
     }
 
+    private void OnSamplesConsumedFromCallback(int n)
+    {
+        Interlocked.Add(ref _samplesConsumed, n);
+        if (Interlocked.Exchange(ref _positionFrozen, 0) == 1)
+        {
+            // Rebase device-clock path to the frozen audible position; samplesConsumed did not
+            // advance during silence, so the sample-based path stays consistent after unfreeze.
+            _logicalPositionAtAnchor = _frozenAudiblePosition;
+            _deviceClockAnchor = _output?.TryGetRenderedPosition() ?? TimeSpan.Zero;
+        }
+
+        Interlocked.Exchange(ref _underrunLatched, 0);
+    }
+
     private TimeSpan EstimateAudiblePosition()
     {
         if (_active is null)
         {
             return TimeSpan.Zero;
+        }
+
+        if (Volatile.Read(ref _positionFrozen) == 1)
+        {
+            return _frozenAudiblePosition;
+        }
+
+        // Network stalls: device clocks keep advancing on silence — use samplesConsumed instead.
+        var netStatus = _networkStatus;
+        if (_state == PlaybackState.Playing
+            && netStatus is NetworkTransportStatus.Buffering or NetworkTransportStatus.Reconnecting)
+        {
+            var stallConsumed = _timelineOriginSamples + Interlocked.Read(ref _samplesConsumed);
+            return ClampToDuration(_active.Format.SamplesToTime(Math.Max(0, stallConsumed)));
         }
 
         var rendered = _output?.TryGetRenderedPosition();
@@ -2044,12 +2167,88 @@ public sealed class AudioPlayer : IDisposable
             return TimeSpan.Zero;
         }
 
-        if (_duration > TimeSpan.Zero && value > _duration)
+        if (_hasKnownDuration && _duration > TimeSpan.Zero && value > _duration)
         {
             return _duration;
         }
 
         return value;
+    }
+
+    private TransitionSampleSource CreateTransitionSampleSource_NoLock(AudioFormat format) =>
+        new(
+            format,
+            _effects,
+            onSamplesConsumed: OnSamplesConsumedFromCallback,
+            onUnderrun: HandleUnderrunFromCallback,
+            isPlaying: () => _state == PlaybackState.Playing,
+            getActive: () =>
+            {
+                lock (_pipelineSync)
+                {
+                    return _active;
+                }
+            },
+            tryPromoteNext: TryPromoteNextFromCallback,
+            hasPendingNext: () =>
+            {
+                var s = _next.State;
+                return s is NextTrackState.Ready or NextTrackState.Loading;
+            },
+            scheduleTransitioned: ScheduleTrackTransitioned);
+
+    private void BindNetworkInfo_NoLock(INetworkTransportInfo? info)
+    {
+        UnbindNetworkInfo_NoLock(setIdle: info is null);
+        if (info is null)
+        {
+            return;
+        }
+
+        _networkInfo = info;
+        info.TransportChanged += OnNetworkTransportChanged;
+        MirrorNetworkStatusFromInfo(info);
+    }
+
+    private void UnbindNetworkInfo_NoLock(bool setIdle)
+    {
+        var info = _networkInfo;
+        if (info is not null)
+        {
+            info.TransportChanged -= OnNetworkTransportChanged;
+            _networkInfo = null;
+        }
+
+        if (setIdle)
+        {
+            _networkStatus = NetworkTransportStatus.Idle;
+            Volatile.Write(ref _networkBytesBuffered, 0);
+        }
+    }
+
+    private void MirrorNetworkStatusFromInfo(INetworkTransportInfo info)
+    {
+        _networkStatus = info.TransportStatus;
+        Volatile.Write(ref _networkBytesBuffered, info.NetworkBytesBuffered);
+    }
+
+    private void OnNetworkTransportChanged(object? sender, EventArgs e)
+    {
+        var info = _networkInfo;
+        if (info is null || (sender is not null && !ReferenceEquals(sender, info)))
+        {
+            return;
+        }
+
+        MirrorNetworkStatusFromInfo(info);
+        try
+        {
+            NetworkStatusChanged?.Invoke(this, EventArgs.Empty);
+        }
+        catch
+        {
+            // ignored
+        }
     }
 
     private void SetState_NoLock(PlaybackState state)
@@ -2589,14 +2788,11 @@ public sealed class AudioPlayer : IDisposable
         int switchGeneration,
         CancellationToken switchToken)
     {
-        string? nextPath = null;
-        if (_next.State is NextTrackState.Ready or NextTrackState.Loading or NextTrackState.Failed)
-        {
-            nextPath = _next.Path;
-        }
+        var hasNext = _next.State is NextTrackState.Ready or NextTrackState.Loading or NextTrackState.Failed
+            && _next.Source is not null;
 
         await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
-        string? activePath;
+        AudioSource activeSource;
         try
         {
             ThrowIfSwitchSuperseded(switchGeneration, switchToken);
@@ -2605,19 +2801,22 @@ public sealed class AudioPlayer : IDisposable
                 throw CreateSupersededException();
             }
 
-            activePath = _sourcePath ?? _active.Path;
+            activeSource = _currentSource
+                ?? _active.Source
+                ?? FileAudioSource.Create(_sourcePath ?? _active.Path);
             _heldPosition = heldPosition;
 
             // Tear down active pipeline but keep session flags for rebuild.
+            UnbindNetworkInfo_NoLock(setIdle: true);
             _active.StopPump();
             _sampleSource = null;
             var oldActive = _active;
             _active = null;
             oldActive.Dispose();
 
-            if (nextPath is not null)
+            if (hasNext)
             {
-                // Path retained; pipeline disposed — explicit Failed until rebuilt.
+                // Source retained; pipeline disposed — explicit Failed until rebuilt.
                 _next.InvalidateKeepPath(
                     new AudioOutputException(
                         "Next track must be rebuilt for the new session output format.",
@@ -2637,10 +2836,21 @@ public sealed class AudioPlayer : IDisposable
         try
         {
             ThrowIfSwitchSuperseded(switchGeneration, switchToken);
-            opened = await _decoderFactory.CreateAsync(activePath!, switchToken).ConfigureAwait(false);
+            opened = await _decoderFactory.CreateAsync(activeSource, switchToken).ConfigureAwait(false);
+            var networkInfo = opened as INetworkTransportInfo;
             var converted = _formatConverter.Convert(opened, requiredFormat);
             opened = null;
-            pipeline = TrackDecodePipeline.Create(activePath!, converted, _options);
+            pipeline = TrackDecodePipeline.Create(activeSource, converted, _options, networkInfo);
+
+            if (activeSource is HttpAudioSource
+                && !pipeline.Decoder.CanSeek
+                && heldPosition > TimeSpan.Zero)
+            {
+                throw new AudioOutputException(
+                    "Cannot rebuild a non-seekable HTTP stream at a non-zero position; seamless continuity is impossible.",
+                    AudioOutputFailureKind.UnsupportedFormat);
+            }
+
             var rebuildOrigin = heldPosition;
             if (heldPosition > TimeSpan.Zero && pipeline.Decoder.CanSeek)
             {
@@ -2653,15 +2863,20 @@ public sealed class AudioPlayer : IDisposable
             {
                 ThrowIfSwitchSuperseded(switchGeneration, switchToken);
                 _sessionFormat = requiredFormat;
-                Volatile.Write(ref _sourcePath, activePath);
+                _currentSource = activeSource;
+                Volatile.Write(ref _sourcePath, activeSource.Identifier);
                 _duration = pipeline.Duration;
+                _hasKnownDuration = pipeline.Decoder.HasKnownDuration;
                 _timelineOriginSamples = requiredFormat.TimeToSamples(rebuildOrigin);
                 Interlocked.Exchange(ref _samplesDecoded, 0);
                 Interlocked.Exchange(ref _samplesConsumed, 0);
                 _completionRaised = false;
                 Interlocked.Exchange(ref _underrunLatched, 0);
+                Volatile.Write(ref _positionFrozen, 0);
                 _activeTrackGeneration++;
                 _suppressTransitionIdsAtOrBelow = _transitionId;
+
+                BindNetworkInfo_NoLock(networkInfo);
 
                 _active = pipeline;
                 pipeline = null;
@@ -2670,33 +2885,10 @@ public sealed class AudioPlayer : IDisposable
                 _effects.ResetProcessingState();
                 _effects.DisposeRetired();
 
-                _sampleSource = new TransitionSampleSource(
-                    requiredFormat,
-                    _effects,
-                    onSamplesConsumed: n =>
-                    {
-                        Interlocked.Add(ref _samplesConsumed, n);
-                        Interlocked.Exchange(ref _underrunLatched, 0);
-                    },
-                    onUnderrun: HandleUnderrunFromCallback,
-                    isPlaying: () => _state == PlaybackState.Playing,
-                    getActive: () =>
-                    {
-                        lock (_pipelineSync)
-                        {
-                            return _active;
-                        }
-                    },
-                    tryPromoteNext: TryPromoteNextFromCallback,
-                    hasPendingNext: () =>
-                    {
-                        var s = _next.State;
-                        return s is NextTrackState.Ready or NextTrackState.Loading;
-                    },
-                    scheduleTransitioned: ScheduleTrackTransitioned);
+                _sampleSource = CreateTransitionSampleSource_NoLock(requiredFormat);
 
-                _heldPosition = heldPosition;
-                RebasePositionClock_NoLock(heldPosition);
+                _heldPosition = rebuildOrigin;
+                RebasePositionClock_NoLock(rebuildOrigin);
             }
             finally
             {
@@ -2710,18 +2902,18 @@ public sealed class AudioPlayer : IDisposable
             throw;
         }
 
-        // Rebuild next track when path is known.
-        if (nextPath is not null
-            && _next.TryBeginRebuild(out var nextGeneration, out var rebuildPath))
+        // Rebuild next track when source is known.
+        if (hasNext && _next.TryBeginRebuild(out var nextGeneration, out var rebuildSource))
         {
             IAudioDecoder? nextOpened = null;
             TrackDecodePipeline? nextPipeline = null;
             try
             {
-                nextOpened = await _decoderFactory.CreateAsync(rebuildPath, switchToken).ConfigureAwait(false);
+                nextOpened = await _decoderFactory.CreateAsync(rebuildSource, switchToken).ConfigureAwait(false);
+                var nextNetwork = nextOpened as INetworkTransportInfo;
                 var nextConverted = _formatConverter.Convert(nextOpened, requiredFormat);
                 nextOpened = null;
-                nextPipeline = TrackDecodePipeline.Create(rebuildPath, nextConverted, _options);
+                nextPipeline = TrackDecodePipeline.Create(rebuildSource, nextConverted, _options, nextNetwork);
                 nextPipeline.StartPump(
                     _options.Processors,
                     () => Volatile.Read(ref _volume),

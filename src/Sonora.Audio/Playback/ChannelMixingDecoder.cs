@@ -37,6 +37,7 @@ internal sealed class ChannelMixingDecoder : IAudioDecoder
 
     public AudioFormat Format => _target;
     public TimeSpan Duration => _inner.Duration;
+    public bool HasKnownDuration => _inner.HasKnownDuration;
     public bool CanSeek => _inner.CanSeek;
 
     public int Read(Span<float> destination)
