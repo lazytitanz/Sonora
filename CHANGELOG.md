@@ -2,6 +2,34 @@
 
 All notable changes to Sonora will be documented in this file.
 
+## 0.6.0 — 2026-11-01
+
+### Added
+
+- Optional WASAPI **exclusive-mode** output via `AudioPlayer.ConfigureOutputAsync(AudioOutputConfiguration)`
+- Platform-neutral `AudioOutputMode`, `ExclusiveModeFallback`, `ExclusiveFallbackReason`, and `AudioOutputFailureKind`
+- Requested vs effective mode inspection (`OutputConfiguration`, `EffectiveOutputMode`, `OutputFallbackReason`)
+- `OutputConfigurationChanged` event (raised off the command gate)
+- Non-destructive exclusive format probing before rebind (`IAudioOutputFactory.ProbeOutputFormatAsync`)
+- Configurable shared-mode fallback on recoverable exclusive failures (device busy, exclusive restricted, unsupported format, Init failure)
+- Distinction between device contention (`DeviceBusy`) and exclusive-access policy (`ExclusiveModeRestricted`) when Windows HRESULTs permit
+- Session-format rebuild when exclusive negotiation requires a different rate/channels; next-track path preserved with rebuild or explicit `NextTrackState.Failed`
+- Windows exclusive path: `WasapiPlayerBuilder.WithExclusiveMode`, latency as a requested target (default 50 ms), buffer-alignment Init retries
+- Core output-mode tests and Windows HRESULT mapping tests
+
+### Changed
+
+- `IAudioOutputFactory` adds `CreateOutputAsync(AudioOutputCreateRequest, …)` and format probing; existing deviceId overload remains shared-mode
+- Strict exclusive failure leaves the player `Unavailable` but preserves track, position intent, DSP, and next-track selection for retry without reload
+- Shared fallback never starts until a partially initialized exclusive output is quiesced and disposed
+
+### Notes
+
+- Shared mode remains the default; exclusive must be requested explicitly.
+- Exclusive mode does **not** imply bit-perfect delivery (DSP, volume, resampling, and format conversion may alter samples).
+- Mode and device switches may briefly interrupt audible playback; v0.5.0 Shutdown/generation guarantees are preserved.
+- Gapless session locking is unchanged across next-track joins; format renegotiation occurs only on output rebind.
+
 ## 0.5.0 — 2026-11-01
 
 ### Added

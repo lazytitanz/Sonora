@@ -1,4 +1,5 @@
 using Sonora.Audio.Formats;
+using Sonora.Audio.Output;
 using Sonora.Audio.Windows;
 
 namespace Sonora.Audio.Windows.Tests;
@@ -122,6 +123,44 @@ public sealed class WindowsPlaybackTests
         player.Play();
         await Task.Delay(450);
         player.Stop();
+    }
+
+    [Fact]
+    [Trait("Category", "Hardware")]
+    public async Task Hardware_ExclusiveMode_ConfigureAndReturnToShared()
+    {
+        if (!ShouldRunHardwareTests())
+        {
+            return;
+        }
+
+        var path = FixtureHelper.EnsureToneWav(TimeSpan.FromMilliseconds(300));
+        using var engine = SonoraWindows.CreateEngine();
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync(path);
+
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration
+        {
+            Mode = AudioOutputMode.Exclusive,
+            ExclusiveFallback = ExclusiveModeFallback.Shared,
+        });
+
+        Assert.True(
+            player.EffectiveOutputMode is AudioOutputMode.Exclusive or AudioOutputMode.Shared,
+            "Exclusive should succeed or fall back to shared on this host.");
+
+        player.Volume = 0.05f;
+        player.Play();
+        await Task.Delay(150);
+        player.Pause();
+
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration
+        {
+            Mode = AudioOutputMode.Shared,
+        });
+
+        Assert.Equal(AudioOutputMode.Shared, player.EffectiveOutputMode);
+        Assert.Equal(PlaybackState.Paused, player.State);
     }
 
     private static bool ShouldRunHardwareTests()

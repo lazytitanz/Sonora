@@ -45,7 +45,7 @@ Accuracy limits are documented in the README.
 | Item | Choice |
 |---|---|
 | Package | NAudio **3.3.0** (`net9.0+`) |
-| Output | `WasapiPlayer` / `WasapiPlayerBuilder` shared mode |
+| Output | `WasapiPlayer` / `WasapiPlayerBuilder` shared (default) or exclusive |
 | Selection | Internal magic-byte / container sniff → backend (`DecoderSelector`) |
 | WAV | `WaveFileReader` |
 | AIFF | `AiffFileReader` |
@@ -59,35 +59,39 @@ LoadAsync → WindowsAudioDecoderFactory → DecoderSelector (sniff)
   → Wave / AIFF / MF / Vorbis / Opus → IAudioDecoder → decode pump
 ```
 
-## Output devices (0.5.0)
+## Output devices and modes (0.5.0 / 0.6.0)
 
 ```text
 IAudioOutputDevices (Windows: MMDeviceEnumerator + notification client)
         │
         ▼
-AudioPlayer.SetOutputDeviceAsync / recovery
-        │ output-only rebind
+AudioPlayer.SetOutputDeviceAsync / ConfigureOutputAsync / recovery
+        │ probe (exclusive, non-destructive) → detach → Shutdown → create → Init
         ▼
-IAudioOutputFactory.CreateOutputAsync(deviceId?)
+IAudioOutputFactory.CreateOutputAsync(AudioOutputCreateRequest)
         │
         ▼
-WasapiAudioOutput (WithDevice, Multimedia default when following)
+WasapiAudioOutput (shared WithSharedMode or exclusive WithExclusiveMode)
 ```
 
 | Concern | Behavior |
 |---|---|
 | Default role | Windows **Multimedia** render endpoint |
-| Follow default | Notification-driven rebind when the Multimedia default id changes |
+| Default mode | **Shared**; exclusive only via `ConfigureOutputAsync` |
+| Follow default | Notification-driven rebind when the Multimedia default id changes (not OS stream routing) |
 | Explicit select | `WithDevice(id)`; ignore unrelated default changes |
 | Preferred lost | Fall back to Multimedia default; keep preferred id; no auto-restore |
+| Exclusive probe | Format capability query without attaching a second PCM consumer |
+| Exclusive fallback | Optional shared after recoverable failure; only after exclusive quiesce/dispose |
+| Strict exclusive fail | `Unavailable` + preserve track / position intent / DSP / next for retry |
 | Recovery intent | Separate from `PlaybackState`; cleared by `Stop` / `LoadAsync` / `Dispose` |
 | Rebind | Detach under gate → `Shutdown` join off-gate → attach with generation check |
 | Shutdown | Old output must not read `TransitionSampleSource` after successful `Shutdown`; failure → Unavailable, no replacement |
 | Status | `Switching` while detached mid-rebind; independent of `PlaybackState` |
 | Superseded | Concurrent Stop/Load/Dispose/newer switch cancels in-flight switch (`OperationCanceledException`) |
-| Clock / PCM | Ring preserved; old endpoint padding skipped (~`CurrentLatency`); brief gap expected |
+| Clock / PCM | Ring preserved when format unchanged; old endpoint padding skipped (~`CurrentLatency`); brief gap expected |
 | Sync | Switch generation + CTS; create runs **off** the command gate; stale outputs disposed |
-| Events | Marshaled off native IMM / WASAPI threads |
+| Events | Device and configuration events off native IMM / WASAPI threads and off `_gate` for mode changes |
 
 ## Gapless (0.4.0)
 

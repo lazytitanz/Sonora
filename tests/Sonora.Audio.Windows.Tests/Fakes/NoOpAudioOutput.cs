@@ -1,5 +1,6 @@
 using Sonora.Audio.Abstractions;
 using Sonora.Audio.Formats;
+using Sonora.Audio.Output;
 
 namespace Sonora.Audio.Windows.Tests.Fakes;
 
@@ -62,9 +63,23 @@ internal sealed class NoOpAudioOutputFactory : IAudioOutputFactory
 {
     public Task<IAudioOutput> CreateOutputAsync(
         string? deviceId = null,
+        CancellationToken cancellationToken = default) =>
+        CreateOutputAsync(AudioOutputCreateRequest.Shared(deviceId), cancellationToken);
+
+    public Task<IAudioOutput> CreateOutputAsync(
+        AudioOutputCreateRequest request,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult<IAudioOutput>(new NoOpAudioOutput(deviceId));
+        return Task.FromResult<IAudioOutput>(new NoOpAudioOutput(request.DeviceId));
+    }
+
+    public Task<AudioOutputFormatProbeResult> ProbeOutputFormatAsync(
+        AudioOutputCreateRequest request,
+        AudioFormat preferredSessionFormat,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(new AudioOutputFormatProbeResult(true, preferredSessionFormat));
     }
 }

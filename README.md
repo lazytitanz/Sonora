@@ -10,7 +10,7 @@
 
 [![.NET 10](https://img.shields.io/badge/.NET-10-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/download)
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
-[![Version](https://img.shields.io/badge/version-0.5.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.6.0-blue)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 [Why Sonora?](#why-sonora) · [Quick start](#quick-start) · [Formats](#supported-audio-formats) · [DSP](#dsp-effects) · [Architecture](#how-it-works) · [Build](#build-and-test)
@@ -21,7 +21,7 @@
 
 ## Why Sonora?
 
-Sonora is a standalone audio engine for .NET applications. The Windows backend uses [NAudio](https://github.com/naudio/NAudio) with WASAPI shared-mode output, while Sonora owns playback state, bounded PCM buffering, decoding off the audio callback, and a per-player DSP rack.
+Sonora is a standalone audio engine for .NET applications. The Windows backend uses [NAudio](https://github.com/naudio/NAudio) with WASAPI shared-mode output by default (optional exclusive mode), while Sonora owns playback state, bounded PCM buffering, decoding off the audio callback, and a per-player DSP rack.
 
 It is built for apps like [EMP](https://github.com/lazytitanz/EMP) but stays completely application-agnostic — no UI, playlists, or library scanning.
 
@@ -79,7 +79,7 @@ Console.WriteLine(player.Duration);
 | `Seek` | Seeks when the decoder supports it |
 | `Volume` | Linear gain in `[0, 1]` |
 
-**Events:** `StateChanged`, `PlaybackCompleted`, `TrackTransitioned`, `OutputDeviceChanged`, `ErrorOccurred`, `Underrun`. Raised on worker threads (not marshaled to a UI sync context). `TrackTransitioned` is never raised on the WASAPI callback and may fire after the next track’s samples have already entered the output pipeline.
+**Events:** `StateChanged`, `PlaybackCompleted`, `TrackTransitioned`, `OutputDeviceChanged`, `OutputConfigurationChanged`, `ErrorOccurred`, `Underrun`. Raised on worker threads (not marshaled to a UI sync context). `TrackTransitioned` is never raised on the WASAPI callback and may fire after the next track’s samples have already entered the output pipeline.
 
 ### Output devices
 
@@ -116,6 +116,36 @@ engine.OutputDevices.DefaultDeviceChanged += (_, e) =>
 | Switch | Reinitializes WASAPI; brief interruption expected; ring / DSP / next track preserved |
 | Preferred lost | Fall back to system default; preferred id kept; **no** auto-restore when it returns |
 | Recovery intent | Playing through device loss → resume when output returns; cleared by `Stop` / `LoadAsync` / `Dispose` |
+
+### Exclusive mode (optional)
+
+Shared mode is the default. Request exclusive WASAPI explicitly:
+
+```csharp
+using Sonora.Audio.Output;
+
+await player.ConfigureOutputAsync(new AudioOutputConfiguration
+{
+    Mode = AudioOutputMode.Exclusive,
+    ExclusiveFallback = ExclusiveModeFallback.Shared, // or None for strict
+});
+
+Console.WriteLine(player.EffectiveOutputMode);      // Exclusive, or Shared after fallback
+Console.WriteLine(player.OutputFallbackReason);
+
+// Return to shared
+await player.ConfigureOutputAsync(new AudioOutputConfiguration
+{
+    Mode = AudioOutputMode.Shared,
+});
+```
+
+| Behavior | Detail |
+| --- | --- |
+| Strict (`ExclusiveFallback.None`) | Never silently becomes shared; failure → `Unavailable` with track/position/DSP/next preserved for retry |
+| Shared fallback | Used only for recoverable exclusive failures after the exclusive instance is quiesced |
+| Format probe | Non-destructive; does not dual-consume the PCM session |
+| Bit-perfect | **Not** claimed — DSP, volume, and conversion may alter samples |
 
 ### Gapless playback
 
@@ -276,10 +306,11 @@ dotnet add package Sonora.Audio.Windows
 
 ## Current limitations
 
-- Windows only for output (WASAPI shared mode)
-- Device switches are not sample-accurate; old-endpoint padding is skipped and a short gap may be heard
+- Windows only for output (WASAPI shared by default; optional exclusive)
+- Exclusive mode is not bit-perfect when DSP, volume, or format conversion are active
+- Device / mode switches are not sample-accurate; old-endpoint padding is skipped and a short gap may be heard
 - Follow-default uses notification-driven rebinds (Multimedia role), not OS stream-routing-as-correctness
-- No exclusive-mode WASAPI, playlists, metadata, or network streaming
+- No metadata extraction or network streaming
 - Gapless joins are continuous PCM hard-cuts; encoder delay/padding trimming for lossy codecs is not applied
 - Audible track-change timing is not sample-accurate under shared-mode WASAPI
 - FLAC / Media Foundation seeking is reliable for playback but not guaranteed sample-accurate

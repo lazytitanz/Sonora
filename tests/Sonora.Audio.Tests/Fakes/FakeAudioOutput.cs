@@ -48,7 +48,7 @@ internal class FakeAudioOutput : IAudioOutput
     /// <summary>When set, <see cref="Shutdown"/> throws after attempting to stop the loop.</summary>
     public Func<Exception>? ShutdownFault { get; set; }
 
-    public void Initialize(IPcmSampleSource source)
+    public virtual void Initialize(IPcmSampleSource source)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         _source = source ?? throw new ArgumentNullException(nameof(source));

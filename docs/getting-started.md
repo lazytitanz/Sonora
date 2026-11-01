@@ -78,6 +78,31 @@ player.Seek(TimeSpan.FromMinutes(1));  // preserves a safe preloaded next track
 player.Stop();                         // resets to 00:00; clears next; does not raise PlaybackCompleted
 ```
 
+## Exclusive output (optional)
+
+Shared mode is the default. To request exclusive WASAPI:
+
+```csharp
+using Sonora.Audio.Output;
+
+await player.ConfigureOutputAsync(new AudioOutputConfiguration
+{
+    Mode = AudioOutputMode.Exclusive,
+    ExclusiveFallback = ExclusiveModeFallback.Shared,
+});
+
+// Inspect requested vs effective mode after configure / fallback
+Console.WriteLine(player.EffectiveOutputMode);
+Console.WriteLine(player.OutputFallbackReason);
+
+await player.ConfigureOutputAsync(new AudioOutputConfiguration
+{
+    Mode = AudioOutputMode.Shared,
+});
+```
+
+With `ExclusiveFallback.None`, a failed exclusive open leaves the player `Unavailable` but keeps the loaded track so you can retry without `LoadAsync`.
+
 ## Read timing information
 
 ```csharp

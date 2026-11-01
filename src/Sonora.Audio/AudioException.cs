@@ -1,3 +1,5 @@
+using Sonora.Audio.Output;
+
 namespace Sonora.Audio;
 
 /// <summary>
@@ -79,15 +81,32 @@ public sealed class AudioOutputException : AudioException
 {
     /// <inheritdoc cref="AudioException(string)"/>
     public AudioOutputException(string message)
-        : base(message)
+        : this(message, AudioOutputFailureKind.Unspecified)
     {
     }
 
     /// <inheritdoc cref="AudioException(string, Exception)"/>
     public AudioOutputException(string message, Exception innerException)
-        : base(message, innerException)
+        : this(message, AudioOutputFailureKind.Unspecified, innerException)
     {
     }
+
+    /// <summary>Creates an exception with a classified failure kind.</summary>
+    public AudioOutputException(string message, AudioOutputFailureKind failureKind)
+        : base(message)
+    {
+        FailureKind = failureKind;
+    }
+
+    /// <summary>Creates an exception with a classified failure kind and inner exception.</summary>
+    public AudioOutputException(string message, AudioOutputFailureKind failureKind, Exception innerException)
+        : base(message, innerException)
+    {
+        FailureKind = failureKind;
+    }
+
+    /// <summary>Classified cause for fallback and UI decisions.</summary>
+    public AudioOutputFailureKind FailureKind { get; }
 }
 
 /// <summary>

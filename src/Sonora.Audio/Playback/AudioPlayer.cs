@@ -3,6 +3,7 @@ using Sonora.Audio.Devices;
 using Sonora.Audio.Diagnostics;
 using Sonora.Audio.DSP;
 using Sonora.Audio.Formats;
+using Sonora.Audio.Output;
 using Sonora.Audio.Playback;
 
 namespace Sonora.Audio;
@@ -56,6 +57,10 @@ public sealed class AudioPlayer : IDisposable
     private volatile OutputDeviceStatus _outputDeviceStatus = OutputDeviceStatus.Available;
     private OutputRecoveryIntent _outputRecoveryIntent = OutputRecoveryIntent.None;
     private int _recoveryInFlight;
+
+    private AudioOutputConfiguration _outputConfiguration = AudioOutputConfiguration.Default;
+    private AudioOutputMode? _effectiveOutputMode;
+    private ExclusiveFallbackReason _outputFallbackReason = ExclusiveFallbackReason.None;
 
     private long _timelineOriginSamples;
     private long _samplesDecoded;
@@ -117,6 +122,12 @@ public sealed class AudioPlayer : IDisposable
     /// </summary>
     public event EventHandler<OutputDeviceChangedEventArgs>? OutputDeviceChanged;
 
+    /// <summary>
+    /// Raised when requested or effective output mode / fallback state changes.
+    /// Never raised on the WASAPI callback or while holding the player command gate.
+    /// </summary>
+    public event EventHandler<OutputConfigurationChangedEventArgs>? OutputConfigurationChanged;
+
     /// <summary>Current playback state.</summary>
     public PlaybackState State => _state;
 
@@ -152,6 +163,19 @@ public sealed class AudioPlayer : IDisposable
     /// Cleared by <see cref="Stop"/>, <see cref="LoadAsync"/>, and <see cref="Dispose"/>.
     /// </summary>
     public OutputRecoveryIntent OutputRecoveryIntent => _outputRecoveryIntent;
+
+    /// <summary>Application-requested output configuration (shared by default).</summary>
+    public AudioOutputConfiguration OutputConfiguration => _outputConfiguration;
+
+    /// <summary>
+    /// Mode of the currently attached output, or <see langword="null"/> when no output is attached.
+    /// </summary>
+    public AudioOutputMode? EffectiveOutputMode => _effectiveOutputMode;
+
+    /// <summary>
+    /// Why shared fallback is active, or the classified reason for the last exclusive failure.
+    /// </summary>
+    public ExclusiveFallbackReason OutputFallbackReason => _outputFallbackReason;
 
     /// <summary>
     /// Estimated audible playback position within the active track. Accounts for device rendered clock
@@ -348,89 +372,138 @@ public sealed class AudioPlayer : IDisposable
 
         ThrowIfSwitchSuperseded(switchGeneration, switchToken);
 
-        IAudioOutput? created = null;
+        await FinishOutputRebindAsync(
+            preferredDeviceId: deviceId,
+            effectiveDeviceId,
+            switchGeneration,
+            switchToken,
+            wasPlaying,
+            wasPaused,
+            heldPosition,
+            raiseConfigurationChanged: false).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Applies an output-mode configuration (shared/exclusive and fallback policy).
+    /// May briefly interrupt audible playback while rebinding the output device.
+    /// Preserves the current track, position intent, DSP, and next-track selection when possible.
+    /// </summary>
+    public async Task ConfigureOutputAsync(
+        AudioOutputConfiguration configuration,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var switchGeneration = 0;
+        var switchToken = CancellationToken.None;
+        TimeSpan heldPosition = TimeSpan.Zero;
+        var wasPlaying = false;
+        var wasPaused = false;
+        string? preferredDeviceId;
+        string? effectiveDeviceId = null;
+        IAudioOutput? oldOutput = null;
+        var modeUnchanged = false;
+        var noSourceConfigured = false;
         try
         {
-            created = await _outputFactory.CreateOutputAsync(effectiveDeviceId, switchToken).ConfigureAwait(false);
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            preferredDeviceId = _preferredOutputDeviceId;
+            var previous = _outputConfiguration;
+            modeUnchanged = previous.Mode == configuration.Mode
+                && previous.ExclusiveFallback == configuration.ExclusiveFallback
+                && previous.RequestedLatency == configuration.RequestedLatency
+                && _output is not null
+                && _effectiveOutputMode == configuration.Mode
+                && _outputFallbackReason == ExclusiveFallbackReason.None
+                && _outputDeviceStatus is OutputDeviceStatus.Available or OutputDeviceStatus.PreferredUnavailable;
+
+            _outputConfiguration = configuration;
+            if (modeUnchanged)
+            {
+                return;
+            }
+
+            effectiveDeviceId = ResolveEffectiveDeviceId_NoLock(preferredDeviceId);
+            BeginOutputSwitch_NoLock(cancellationToken, out switchGeneration, out switchToken);
+
+            if (!_hasSource)
+            {
+                _activeOutputDeviceId = null;
+                _effectiveOutputMode = null;
+                _outputFallbackReason = ExclusiveFallbackReason.None;
+                _outputDeviceStatus = OutputDeviceStatus.Available;
+                RaiseOutputDeviceChanged(OutputDeviceChangeReason.SelectionChanged);
+                noSourceConfigured = true;
+                return;
+            }
+
+            if (effectiveDeviceId is null && preferredDeviceId is not null)
+            {
+                throw new AudioDeviceException($"Output device '{preferredDeviceId}' is not available.");
+            }
+
+            wasPlaying = _state == PlaybackState.Playing;
+            wasPaused = _state == PlaybackState.Paused;
+            heldPosition = _state is PlaybackState.Playing
+                ? EstimateAudiblePosition()
+                : _heldPosition;
+
+            oldOutput = DetachOutput_NoLock();
+            _effectiveOutputMode = null;
+            _outputDeviceStatus = OutputDeviceStatus.Switching;
+            RaiseOutputDeviceChanged(OutputDeviceChangeReason.Switching);
         }
-        catch (OperationCanceledException)
+        finally
         {
-            ThrowIfSwitchSuperseded(switchGeneration, CancellationToken.None);
-            throw;
+            _gate.Release();
+        }
+
+        if (modeUnchanged || noSourceConfigured)
+        {
+            RaiseOutputConfigurationChanged();
+            return;
+        }
+
+        await Task.Yield();
+
+        try
+        {
+            ShutdownAndDispose(oldOutput);
         }
         catch (Exception ex)
         {
+            if (_disposed
+                || switchGeneration != Volatile.Read(ref _outputSwitchGeneration)
+                || switchToken.IsCancellationRequested)
+            {
+                throw _disposed
+                    ? new ObjectDisposedException(nameof(AudioPlayer))
+                    : CreateSupersededException();
+            }
+
             await FailSwitchAfterTeardownAsync(
                 switchGeneration,
                 wasPlaying,
                 wasPaused,
                 heldPosition,
-                ex is AudioException ? ex : new AudioOutputException("Failed to open the output device.", ex))
-                .ConfigureAwait(false);
+                ex).ConfigureAwait(false);
+            RaiseOutputConfigurationChanged();
             throw;
         }
 
-        await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
-        try
-        {
-            if (_disposed)
-            {
-                created.Dispose();
-                throw new ObjectDisposedException(nameof(AudioPlayer));
-            }
+        ThrowIfSwitchSuperseded(switchGeneration, switchToken);
 
-            if (switchGeneration != _outputSwitchGeneration)
-            {
-                created.Dispose();
-                throw CreateSupersededException();
-            }
-
-            if (!_hasSource || _sampleSource is null)
-            {
-                created.Dispose();
-                _outputDeviceStatus = OutputDeviceStatus.Unavailable;
-                RaiseOutputDeviceChanged(OutputDeviceChangeReason.Unavailable);
-                throw CreateSupersededException();
-            }
-
-            // Seek may have advanced the timeline while create was off-gate.
-            var attachPosition = _heldPosition != TimeSpan.Zero ? _heldPosition : heldPosition;
-
-            AttachOutput_NoLock(created, attachPosition);
-            created = null;
-
-            _outputDeviceStatus = deviceId is not null
-                && !string.Equals(_activeOutputDeviceId, deviceId, StringComparison.Ordinal)
-                    ? OutputDeviceStatus.PreferredUnavailable
-                    : OutputDeviceStatus.Available;
-
-            if (wasPlaying || _outputRecoveryIntent == OutputRecoveryIntent.ResumePlaying)
-            {
-                EnsureActivePumpRunning_NoLock();
-                _active?.Prime(_options.PrimeDuration);
-                _completionRaised = false;
-                Volatile.Write(ref _acceptEndOfStreamCompletion, 1);
-                SetState_NoLock(PlaybackState.Playing);
-                _output!.Play();
-                _outputRecoveryIntent = OutputRecoveryIntent.None;
-            }
-            else if (wasPaused || _outputRecoveryIntent == OutputRecoveryIntent.RemainPaused)
-            {
-                SetState_NoLock(PlaybackState.Paused);
-                _outputRecoveryIntent = OutputRecoveryIntent.None;
-            }
-            else
-            {
-                SetState_NoLock(PlaybackState.Stopped);
-            }
-
-            RaiseOutputDeviceChanged(OutputDeviceChangeReason.SelectionChanged);
-        }
-        finally
-        {
-            created?.Dispose();
-            _gate.Release();
-        }
+        await FinishOutputRebindAsync(
+            preferredDeviceId,
+            effectiveDeviceId,
+            switchGeneration,
+            switchToken,
+            wasPlaying,
+            wasPaused,
+            heldPosition,
+            raiseConfigurationChanged: true).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -522,7 +595,9 @@ public sealed class AudioPlayer : IDisposable
         IAudioOutput? created = null;
         try
         {
-            created = await _outputFactory.CreateOutputAsync(effectiveId, switchToken).ConfigureAwait(false);
+            created = await _outputFactory
+                .CreateOutputAsync(BuildCreateRequest(effectiveId, _outputConfiguration.Mode), switchToken)
+                .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -533,6 +608,7 @@ public sealed class AudioPlayer : IDisposable
                 {
                     await TearDownSession_NoLockAsync().ConfigureAwait(false);
                     _outputDeviceStatus = OutputDeviceStatus.Unavailable;
+                    _effectiveOutputMode = null;
                     SetState_NoLock(PlaybackState.Stopped);
                     RaiseOutputDeviceChanged(OutputDeviceChangeReason.Unavailable);
                 }
@@ -569,8 +645,44 @@ public sealed class AudioPlayer : IDisposable
                 return;
             }
 
-            AttachOutput_NoLock(created, TimeSpan.Zero);
-            created = null;
+            var loadMode = _outputConfiguration.Mode;
+            try
+            {
+                AttachOutput_NoLock(created, TimeSpan.Zero, loadMode);
+                created = null;
+            }
+            catch (Exception attachEx) when (
+                loadMode == AudioOutputMode.Exclusive
+                && _outputConfiguration.ExclusiveFallback == ExclusiveModeFallback.Shared
+                && OutputFailureHelpers.IsFallbackEligible(OutputFailureHelpers.KindOf(attachEx)))
+            {
+                ShutdownAndDispose(created);
+                created = null;
+                _outputFallbackReason = OutputFailureHelpers.ToFallbackReason(
+                    OutputFailureHelpers.KindOf(attachEx));
+                _gate.Release();
+                try
+                {
+                    created = await _outputFactory
+                        .CreateOutputAsync(BuildCreateRequest(effectiveId, AudioOutputMode.Shared), switchToken)
+                        .ConfigureAwait(false);
+                }
+                finally
+                {
+                    await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+
+                if (generation != _generation || switchGeneration != _outputSwitchGeneration || _sampleSource is null)
+                {
+                    created?.Dispose();
+                    return;
+                }
+
+                AttachOutput_NoLock(created!, TimeSpan.Zero, AudioOutputMode.Shared);
+                created = null;
+                loadMode = AudioOutputMode.Shared;
+            }
+
             _hasSource = true;
             EnsureActivePumpRunning_NoLock();
             _active!.Prime(_options.PrimeDuration);
@@ -587,12 +699,19 @@ public sealed class AudioPlayer : IDisposable
 
             SetState_NoLock(PlaybackState.Stopped);
             RaiseOutputDeviceChanged(OutputDeviceChangeReason.SelectionChanged);
+            if (loadMode != _outputConfiguration.Mode
+                || _outputConfiguration.Mode == AudioOutputMode.Exclusive)
+            {
+                // Raise after gate release.
+            }
         }
         finally
         {
             created?.Dispose();
             _gate.Release();
         }
+
+        RaiseOutputConfigurationChanged();
     }
 
     /// <summary>
@@ -976,6 +1095,7 @@ public sealed class AudioPlayer : IDisposable
         }
 
         _output = null;
+        _effectiveOutputMode = null;
         Volatile.Write(ref _activeOutputDeviceId, null);
         return output;
     }
@@ -1052,6 +1172,7 @@ public sealed class AudioPlayer : IDisposable
             }
 
             _activeOutputDeviceId = null;
+            _effectiveOutputMode = null;
             _outputDeviceStatus = OutputDeviceStatus.Unavailable;
             _heldPosition = heldPosition;
             if (wasPlaying)
@@ -1063,6 +1184,14 @@ public sealed class AudioPlayer : IDisposable
                 _outputRecoveryIntent = OutputRecoveryIntent.RemainPaused;
             }
 
+            var kind = OutputFailureHelpers.KindOf(error);
+            if (kind != AudioOutputFailureKind.Unspecified
+                && kind != AudioOutputFailureKind.ShutdownFailed)
+            {
+                _outputFallbackReason = OutputFailureHelpers.ToFallbackReason(kind);
+            }
+
+            // Keep _hasSource, DSP, next-track selection, and recovery intent so apps can retry.
             SetState_NoLock(PlaybackState.Stopped);
             RaiseError(error);
             RaiseOutputDeviceChanged(OutputDeviceChangeReason.Unavailable);
@@ -1073,7 +1202,7 @@ public sealed class AudioPlayer : IDisposable
         }
     }
 
-    private void AttachOutput_NoLock(IAudioOutput output, TimeSpan logicalPosition)
+    private void AttachOutput_NoLock(IAudioOutput output, TimeSpan logicalPosition, AudioOutputMode effectiveMode)
     {
         _effects.ResetProcessingState();
         _effects.DisposeRetired();
@@ -1083,6 +1212,7 @@ public sealed class AudioPlayer : IDisposable
         _output.Stopped += OnOutputStopped;
         _output.Initialize(_sampleSource!);
         Volatile.Write(ref _activeOutputDeviceId, output.EndpointId);
+        _effectiveOutputMode = effectiveMode;
         RebasePositionClock_NoLock(logicalPosition);
     }
 
@@ -1602,7 +1732,9 @@ public sealed class AudioPlayer : IDisposable
         IAudioOutput? created = null;
         try
         {
-            created = await _outputFactory.CreateOutputAsync(effectiveId, switchToken).ConfigureAwait(false);
+            created = await _outputFactory
+                .CreateOutputAsync(BuildCreateRequest(effectiveId, _outputConfiguration.Mode), switchToken)
+                .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -1615,6 +1747,7 @@ public sealed class AudioPlayer : IDisposable
                 }
 
                 _outputDeviceStatus = OutputDeviceStatus.Unavailable;
+                _effectiveOutputMode = null;
                 RaiseError(ex is AudioException ? ex : new AudioOutputException("Output recovery failed.", ex));
                 RaiseOutputDeviceChanged(OutputDeviceChangeReason.Unavailable);
             }
@@ -1635,7 +1768,7 @@ public sealed class AudioPlayer : IDisposable
                 return;
             }
 
-            AttachOutput_NoLock(created, heldPosition);
+            AttachOutput_NoLock(created, heldPosition, _outputConfiguration.Mode);
             created = null;
 
             if (preferred is not null
@@ -1842,6 +1975,632 @@ public sealed class AudioPlayer : IDisposable
         catch
         {
             // ignored
+        }
+    }
+
+    private void RaiseOutputConfigurationChanged()
+    {
+        var args = new OutputConfigurationChangedEventArgs(
+            _outputConfiguration,
+            _effectiveOutputMode,
+            _outputFallbackReason,
+            _output?.CurrentLatency);
+
+        try
+        {
+            OutputConfigurationChanged?.Invoke(this, args);
+        }
+        catch
+        {
+            // ignored
+        }
+    }
+
+    private AudioOutputCreateRequest BuildCreateRequest(string? effectiveDeviceId, AudioOutputMode mode) =>
+        new(
+            effectiveDeviceId,
+            mode,
+            _outputConfiguration.RequestedLatency,
+            _hasSource ? _sessionFormat : null);
+
+    private async Task FinishOutputRebindAsync(
+        string? preferredDeviceId,
+        string? effectiveDeviceId,
+        int switchGeneration,
+        CancellationToken switchToken,
+        bool wasPlaying,
+        bool wasPaused,
+        TimeSpan heldPosition,
+        bool raiseConfigurationChanged)
+    {
+        var config = _outputConfiguration;
+        var requestedMode = config.Mode;
+        var sessionFormat = _sessionFormat;
+        var useExclusive = requestedMode == AudioOutputMode.Exclusive;
+        ExclusiveFallbackReason pendingFallbackReason = ExclusiveFallbackReason.None;
+
+        if (useExclusive)
+        {
+            var probeRequest = BuildCreateRequest(effectiveDeviceId, AudioOutputMode.Exclusive);
+            AudioOutputFormatProbeResult probe;
+            try
+            {
+                probe = await _outputFactory
+                    .ProbeOutputFormatAsync(probeRequest, sessionFormat, switchToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                ThrowIfSwitchSuperseded(switchGeneration, CancellationToken.None);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                var wrapped = ex is AudioException
+                    ? ex
+                    : new AudioOutputException(
+                        "Exclusive format probe failed.",
+                        AudioOutputFailureKind.InitializationFailed,
+                        ex);
+                if (config.ExclusiveFallback == ExclusiveModeFallback.Shared
+                    && OutputFailureHelpers.IsFallbackEligible(OutputFailureHelpers.KindOf(wrapped)))
+                {
+                    useExclusive = false;
+                    pendingFallbackReason = OutputFailureHelpers.ToFallbackReason(
+                        OutputFailureHelpers.KindOf(wrapped));
+                }
+                else
+                {
+                    await FailSwitchAfterTeardownAsync(
+                        switchGeneration,
+                        wasPlaying,
+                        wasPaused,
+                        heldPosition,
+                        wrapped).ConfigureAwait(false);
+                    if (raiseConfigurationChanged)
+                    {
+                        RaiseOutputConfigurationChanged();
+                    }
+
+                    throw;
+                }
+
+                probe = default;
+            }
+
+            if (useExclusive)
+            {
+                if (!probe.Supported)
+                {
+                    if (config.ExclusiveFallback == ExclusiveModeFallback.Shared
+                        && OutputFailureHelpers.IsFallbackEligible(probe.FailureKind))
+                    {
+                        useExclusive = false;
+                        pendingFallbackReason = OutputFailureHelpers.ToFallbackReason(probe.FailureKind);
+                    }
+                    else
+                    {
+                        var fail = new AudioOutputException(
+                            "Exclusive output is not available for the preferred format.",
+                            probe.FailureKind == AudioOutputFailureKind.Unspecified
+                                ? AudioOutputFailureKind.UnsupportedFormat
+                                : probe.FailureKind);
+                        await FailSwitchAfterTeardownAsync(
+                            switchGeneration,
+                            wasPlaying,
+                            wasPaused,
+                            heldPosition,
+                            fail).ConfigureAwait(false);
+                        if (raiseConfigurationChanged)
+                        {
+                            RaiseOutputConfigurationChanged();
+                        }
+
+                        throw fail;
+                    }
+                }
+                else if (!SessionFormatEquals(sessionFormat, probe.RequiredSessionFormat))
+                {
+                    await RebuildSessionForOutputFormatAsync(
+                        probe.RequiredSessionFormat,
+                        heldPosition,
+                        switchGeneration,
+                        switchToken).ConfigureAwait(false);
+                    sessionFormat = probe.RequiredSessionFormat;
+                }
+            }
+        }
+
+        ThrowIfSwitchSuperseded(switchGeneration, switchToken);
+
+        var modeToCreate = useExclusive ? AudioOutputMode.Exclusive : AudioOutputMode.Shared;
+        IAudioOutput? created = null;
+        try
+        {
+            created = await _outputFactory
+                .CreateOutputAsync(BuildCreateRequest(effectiveDeviceId, modeToCreate), switchToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            ThrowIfSwitchSuperseded(switchGeneration, CancellationToken.None);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            var wrapped = ex is AudioException
+                ? ex
+                : new AudioOutputException("Failed to open the output device.", ex);
+
+            if (useExclusive
+                && config.ExclusiveFallback == ExclusiveModeFallback.Shared
+                && OutputFailureHelpers.IsFallbackEligible(OutputFailureHelpers.KindOf(wrapped)))
+            {
+                pendingFallbackReason = OutputFailureHelpers.ToFallbackReason(
+                    OutputFailureHelpers.KindOf(wrapped));
+                useExclusive = false;
+                modeToCreate = AudioOutputMode.Shared;
+                created = await _outputFactory
+                    .CreateOutputAsync(BuildCreateRequest(effectiveDeviceId, AudioOutputMode.Shared), switchToken)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                await FailSwitchAfterTeardownAsync(
+                    switchGeneration,
+                    wasPlaying,
+                    wasPaused,
+                    heldPosition,
+                    wrapped).ConfigureAwait(false);
+                if (raiseConfigurationChanged)
+                {
+                    RaiseOutputConfigurationChanged();
+                }
+
+                throw;
+            }
+        }
+
+        var attachPosition = heldPosition;
+        Exception? attachError = null;
+        await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            if (_disposed)
+            {
+                created.Dispose();
+                created = null;
+                throw new ObjectDisposedException(nameof(AudioPlayer));
+            }
+
+            if (switchGeneration != _outputSwitchGeneration)
+            {
+                created.Dispose();
+                created = null;
+                throw CreateSupersededException();
+            }
+
+            if (!_hasSource || _sampleSource is null)
+            {
+                created.Dispose();
+                created = null;
+                _outputDeviceStatus = OutputDeviceStatus.Unavailable;
+                RaiseOutputDeviceChanged(OutputDeviceChangeReason.Unavailable);
+                throw CreateSupersededException();
+            }
+
+            attachPosition = _heldPosition != TimeSpan.Zero ? _heldPosition : heldPosition;
+
+            try
+            {
+                AttachOutput_NoLock(created, attachPosition, modeToCreate);
+                created = null;
+            }
+            catch (Exception ex)
+            {
+                ShutdownAndDispose(created);
+                created = null;
+                attachError = ex is AudioException
+                    ? ex
+                    : new AudioOutputException("Failed to initialize the output device.", ex);
+            }
+        }
+        finally
+        {
+            created?.Dispose();
+            created = null;
+            _gate.Release();
+        }
+
+        if (attachError is not null)
+        {
+            if (modeToCreate == AudioOutputMode.Exclusive
+                && config.ExclusiveFallback == ExclusiveModeFallback.Shared
+                && OutputFailureHelpers.IsFallbackEligible(OutputFailureHelpers.KindOf(attachError)))
+            {
+                pendingFallbackReason = OutputFailureHelpers.ToFallbackReason(
+                    OutputFailureHelpers.KindOf(attachError));
+                ThrowIfSwitchSuperseded(switchGeneration, switchToken);
+                try
+                {
+                    created = await _outputFactory
+                        .CreateOutputAsync(
+                            BuildCreateRequest(effectiveDeviceId, AudioOutputMode.Shared),
+                            switchToken)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception fallbackEx)
+                {
+                    await FailSwitchAfterTeardownAsync(
+                        switchGeneration,
+                        wasPlaying,
+                        wasPaused,
+                        heldPosition,
+                        fallbackEx is AudioException
+                            ? fallbackEx
+                            : new AudioOutputException("Shared-mode fallback failed.", fallbackEx))
+                        .ConfigureAwait(false);
+                    if (raiseConfigurationChanged)
+                    {
+                        RaiseOutputConfigurationChanged();
+                    }
+
+                    throw;
+                }
+
+                await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+                try
+                {
+                    if (_disposed || switchGeneration != _outputSwitchGeneration || !_hasSource || _sampleSource is null)
+                    {
+                        created.Dispose();
+                        created = null;
+                        throw CreateSupersededException();
+                    }
+
+                    try
+                    {
+                        AttachOutput_NoLock(created, attachPosition, AudioOutputMode.Shared);
+                        created = null;
+                        modeToCreate = AudioOutputMode.Shared;
+                        attachError = null;
+                    }
+                    catch (Exception fallbackAttachEx)
+                    {
+                        ShutdownAndDispose(created);
+                        created = null;
+                        attachError = fallbackAttachEx is AudioException
+                            ? fallbackAttachEx
+                            : new AudioOutputException(
+                                "Shared-mode fallback initialize failed.",
+                                fallbackAttachEx);
+                    }
+
+                    if (attachError is null)
+                    {
+                        CompleteRebindTransport_NoLock(
+                            preferredDeviceId,
+                            wasPlaying,
+                            wasPaused,
+                            requestedMode,
+                            modeToCreate,
+                            pendingFallbackReason);
+                    }
+                    else
+                    {
+                        ApplyStrictOutputFailure_NoLock(wasPlaying, wasPaused, heldPosition, attachError);
+                    }
+                }
+                finally
+                {
+                    created?.Dispose();
+                    _gate.Release();
+                }
+
+                if (attachError is not null)
+                {
+                    if (raiseConfigurationChanged)
+                    {
+                        RaiseOutputConfigurationChanged();
+                    }
+
+                    throw attachError;
+                }
+            }
+            else
+            {
+                await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+                try
+                {
+                    if (switchGeneration == _outputSwitchGeneration && !_disposed)
+                    {
+                        ApplyStrictOutputFailure_NoLock(wasPlaying, wasPaused, heldPosition, attachError);
+                    }
+                }
+                finally
+                {
+                    _gate.Release();
+                }
+
+                if (raiseConfigurationChanged
+                    || requestedMode == AudioOutputMode.Exclusive)
+                {
+                    RaiseOutputConfigurationChanged();
+                }
+
+                throw attachError;
+            }
+        }
+        else
+        {
+            await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+            try
+            {
+                if (switchGeneration != _outputSwitchGeneration || _disposed || _output is null)
+                {
+                    throw CreateSupersededException();
+                }
+
+                CompleteRebindTransport_NoLock(
+                    preferredDeviceId,
+                    wasPlaying,
+                    wasPaused,
+                    requestedMode,
+                    modeToCreate,
+                    pendingFallbackReason);
+            }
+            finally
+            {
+                _gate.Release();
+            }
+        }
+
+        if (raiseConfigurationChanged
+            || requestedMode == AudioOutputMode.Exclusive
+            || pendingFallbackReason != ExclusiveFallbackReason.None)
+        {
+            RaiseOutputConfigurationChanged();
+        }
+    }
+
+    private void CompleteRebindTransport_NoLock(
+        string? preferredDeviceId,
+        bool wasPlaying,
+        bool wasPaused,
+        AudioOutputMode requestedMode,
+        AudioOutputMode modeToCreate,
+        ExclusiveFallbackReason pendingFallbackReason)
+    {
+        _outputFallbackReason = modeToCreate == AudioOutputMode.Shared
+            && requestedMode == AudioOutputMode.Exclusive
+                ? pendingFallbackReason
+                : ExclusiveFallbackReason.None;
+
+        _outputDeviceStatus = preferredDeviceId is not null
+            && !string.Equals(_activeOutputDeviceId, preferredDeviceId, StringComparison.Ordinal)
+                ? OutputDeviceStatus.PreferredUnavailable
+                : OutputDeviceStatus.Available;
+
+        if (wasPlaying || _outputRecoveryIntent == OutputRecoveryIntent.ResumePlaying)
+        {
+            EnsureActivePumpRunning_NoLock();
+            _active?.Prime(_options.PrimeDuration);
+            _completionRaised = false;
+            Volatile.Write(ref _acceptEndOfStreamCompletion, 1);
+            SetState_NoLock(PlaybackState.Playing);
+            _output!.Play();
+            _outputRecoveryIntent = OutputRecoveryIntent.None;
+        }
+        else if (wasPaused || _outputRecoveryIntent == OutputRecoveryIntent.RemainPaused)
+        {
+            SetState_NoLock(PlaybackState.Paused);
+            _outputRecoveryIntent = OutputRecoveryIntent.None;
+        }
+        else
+        {
+            SetState_NoLock(PlaybackState.Stopped);
+        }
+
+        RaiseOutputDeviceChanged(OutputDeviceChangeReason.SelectionChanged);
+    }
+
+    private void ApplyStrictOutputFailure_NoLock(
+        bool wasPlaying,
+        bool wasPaused,
+        TimeSpan heldPosition,
+        Exception error)
+    {
+        _activeOutputDeviceId = null;
+        _effectiveOutputMode = null;
+        _outputDeviceStatus = OutputDeviceStatus.Unavailable;
+        _heldPosition = heldPosition;
+        if (wasPlaying)
+        {
+            _outputRecoveryIntent = OutputRecoveryIntent.ResumePlaying;
+        }
+        else if (wasPaused)
+        {
+            _outputRecoveryIntent = OutputRecoveryIntent.RemainPaused;
+        }
+
+        var kind = OutputFailureHelpers.KindOf(error);
+        if (kind != AudioOutputFailureKind.Unspecified && kind != AudioOutputFailureKind.ShutdownFailed)
+        {
+            _outputFallbackReason = OutputFailureHelpers.ToFallbackReason(kind);
+        }
+
+        SetState_NoLock(PlaybackState.Stopped);
+        RaiseError(error);
+        RaiseOutputDeviceChanged(OutputDeviceChangeReason.Unavailable);
+    }
+
+    private static bool SessionFormatEquals(AudioFormat a, AudioFormat b) =>
+        a.SampleRate == b.SampleRate
+        && a.ChannelCount == b.ChannelCount
+        && a.SampleFormat == b.SampleFormat;
+
+    private async Task RebuildSessionForOutputFormatAsync(
+        AudioFormat requiredFormat,
+        TimeSpan heldPosition,
+        int switchGeneration,
+        CancellationToken switchToken)
+    {
+        string? nextPath = null;
+        if (_next.State is NextTrackState.Ready or NextTrackState.Loading or NextTrackState.Failed)
+        {
+            nextPath = _next.Path;
+        }
+
+        await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        string? activePath;
+        try
+        {
+            ThrowIfSwitchSuperseded(switchGeneration, switchToken);
+            if (!_hasSource || _active is null)
+            {
+                throw CreateSupersededException();
+            }
+
+            activePath = _sourcePath ?? _active.Path;
+            _heldPosition = heldPosition;
+
+            // Tear down active pipeline but keep session flags for rebuild.
+            _active.StopPump();
+            _sampleSource = null;
+            var oldActive = _active;
+            _active = null;
+            oldActive.Dispose();
+
+            if (nextPath is not null)
+            {
+                // Path retained; pipeline disposed — explicit Failed until rebuilt.
+                _next.InvalidateKeepPath(
+                    new AudioOutputException(
+                        "Next track must be rebuilt for the new session output format.",
+                        AudioOutputFailureKind.UnsupportedFormat));
+            }
+
+            _sessionFormat = requiredFormat;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+
+        // Rebuild active off-gate.
+        IAudioDecoder? opened = null;
+        TrackDecodePipeline? pipeline = null;
+        try
+        {
+            ThrowIfSwitchSuperseded(switchGeneration, switchToken);
+            opened = await _decoderFactory.CreateAsync(activePath!, switchToken).ConfigureAwait(false);
+            var converted = _formatConverter.Convert(opened, requiredFormat);
+            opened = null;
+            pipeline = TrackDecodePipeline.Create(activePath!, converted, _options);
+            if (heldPosition > TimeSpan.Zero && pipeline.Decoder.CanSeek)
+            {
+                pipeline.Decoder.Seek(heldPosition);
+            }
+
+            await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+            try
+            {
+                ThrowIfSwitchSuperseded(switchGeneration, switchToken);
+                _sessionFormat = requiredFormat;
+                Volatile.Write(ref _sourcePath, activePath);
+                _duration = pipeline.Duration;
+                _timelineOriginSamples = requiredFormat.TimeToSamples(heldPosition);
+                Interlocked.Exchange(ref _samplesDecoded, 0);
+                Interlocked.Exchange(ref _samplesConsumed, 0);
+                _completionRaised = false;
+                Interlocked.Exchange(ref _underrunLatched, 0);
+                _activeTrackGeneration++;
+                _suppressTransitionIdsAtOrBelow = _transitionId;
+
+                _active = pipeline;
+                pipeline = null;
+
+                _effects.Configure(requiredFormat);
+                _effects.ResetProcessingState();
+                _effects.DisposeRetired();
+
+                _sampleSource = new TransitionSampleSource(
+                    requiredFormat,
+                    _effects,
+                    onSamplesConsumed: n =>
+                    {
+                        Interlocked.Add(ref _samplesConsumed, n);
+                        Interlocked.Exchange(ref _underrunLatched, 0);
+                    },
+                    onUnderrun: HandleUnderrunFromCallback,
+                    isPlaying: () => _state == PlaybackState.Playing,
+                    getActive: () =>
+                    {
+                        lock (_pipelineSync)
+                        {
+                            return _active;
+                        }
+                    },
+                    tryPromoteNext: TryPromoteNextFromCallback,
+                    hasPendingNext: () =>
+                    {
+                        var s = _next.State;
+                        return s is NextTrackState.Ready or NextTrackState.Loading;
+                    },
+                    scheduleTransitioned: ScheduleTrackTransitioned);
+
+                _heldPosition = heldPosition;
+                RebasePositionClock_NoLock(heldPosition);
+            }
+            finally
+            {
+                _gate.Release();
+            }
+        }
+        catch
+        {
+            pipeline?.Dispose();
+            opened?.Dispose();
+            throw;
+        }
+
+        // Rebuild next track when path is known.
+        if (nextPath is not null
+            && _next.TryBeginRebuild(out var nextGeneration, out var rebuildPath))
+        {
+            IAudioDecoder? nextOpened = null;
+            TrackDecodePipeline? nextPipeline = null;
+            try
+            {
+                nextOpened = await _decoderFactory.CreateAsync(rebuildPath, switchToken).ConfigureAwait(false);
+                var nextConverted = _formatConverter.Convert(nextOpened, requiredFormat);
+                nextOpened = null;
+                nextPipeline = TrackDecodePipeline.Create(rebuildPath, nextConverted, _options);
+                nextPipeline.StartPump(
+                    _options.Processors,
+                    () => Volatile.Read(ref _volume),
+                    onSamplesWritten: _ => { },
+                    onError: ex =>
+                    {
+                        if (_next.TryCompleteFailed(nextGeneration, ex))
+                        {
+                            RaiseError(ex);
+                        }
+                    });
+                nextPipeline.Prime(_options.PrimeDuration);
+                if (!_next.TryCompleteReady(nextGeneration, nextPipeline))
+                {
+                    return;
+                }
+
+                nextPipeline = null;
+            }
+            catch (Exception ex)
+            {
+                nextPipeline?.Dispose();
+                nextOpened?.Dispose();
+                _next.TryCompleteFailed(nextGeneration, ex);
+            }
         }
     }
 }

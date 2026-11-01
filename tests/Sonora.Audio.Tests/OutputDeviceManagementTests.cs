@@ -60,7 +60,7 @@ public class OutputDeviceManagementTests
         Assert.Equal("b", player.PreferredOutputDeviceId);
         Assert.Equal("b", player.ActiveOutputDeviceId);
         Assert.Equal(OutputDeviceStatus.Available, player.OutputDeviceStatus);
-        Assert.Contains(outputs.Created, c => c.DeviceId == "b");
+        Assert.Contains(outputs.Created, c => c.Request.DeviceId == "b");
     }
 
     [Fact]

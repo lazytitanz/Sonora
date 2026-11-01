@@ -148,6 +148,57 @@ internal sealed class NextTrackSlot
         old?.Dispose();
     }
 
+    /// <summary>
+    /// Disposes a ready/loading pipeline but keeps <see cref="Path"/> and sets <see cref="NextTrackState.Failed"/>
+    /// so callers can observe invalidation and retry preload after a session-format change.
+    /// </summary>
+    public void InvalidateKeepPath(Exception error)
+    {
+        ArgumentNullException.ThrowIfNull(error);
+        TrackDecodePipeline? old;
+        lock (_sync)
+        {
+            if (_state is NextTrackState.None || string.IsNullOrEmpty(_path))
+            {
+                return;
+            }
+
+            _generation++;
+            old = _pipeline;
+            _pipeline = null;
+            _failure = error;
+            _state = NextTrackState.Failed;
+        }
+
+        old?.Dispose();
+    }
+
+    /// <summary>Retains path and moves a ready/failed slot back to loading for an in-place rebuild.</summary>
+    public bool TryBeginRebuild(out int generation, out string path)
+    {
+        TrackDecodePipeline? old;
+        lock (_sync)
+        {
+            if (_path is null || _state is NextTrackState.None)
+            {
+                generation = 0;
+                path = null!;
+                return false;
+            }
+
+            _generation++;
+            generation = _generation;
+            path = _path;
+            old = _pipeline;
+            _pipeline = null;
+            _failure = null;
+            _state = NextTrackState.Loading;
+        }
+
+        old?.Dispose();
+        return true;
+    }
+
     public bool IsCurrentGeneration(int generation)
     {
         lock (_sync)
