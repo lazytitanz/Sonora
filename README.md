@@ -10,10 +10,10 @@
 
 [![.NET 10](https://img.shields.io/badge/.NET-10-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/download)
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
-[![Version](https://img.shields.io/badge/version-0.9.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.0.0--rc.1-blue)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-[Why Sonora?](#why-sonora) · [Quick start](#quick-start) · [Formats](#supported-audio-formats) · [DSP](#dsp-effects) · [Architecture](#how-it-works) · [Build](#build-and-test)
+[Why Sonora?](#why-sonora) · [Quick start](#quick-start) · [Formats](#supported-audio-formats) · [DSP](#dsp-effects) · [Architecture](#how-it-works) · [Build](#build-and-test) · [Docs](#documentation)
 
 </div>
 
@@ -46,7 +46,7 @@ It is built for apps like [EMP](https://github.com/lazytitanz/EMP) but stays com
 - **MIT licensed** — packages prepared for NuGet (`Sonora.Audio`, `Sonora.Audio.Windows`)
 
 > [!NOTE]
-> Packages are not published to NuGet.org automatically during early development. Reference the projects or pack locally (see [Build and test](#build-and-test)).
+> Current package version is **`1.0.0-rc.1`**. Packages are not published to NuGet.org automatically. Reference the projects or pack locally (see [Build and test](#build-and-test)). Promoting RC → `1.0.0` requires the [production checklist](docs/production-checklist.md).
 
 ---
 
@@ -291,29 +291,30 @@ using var engine = SonoraWindows.CreateEngine();
 using var player = engine.CreatePlayer();
 await player.LoadAsync(@"C:\music\song.flac");
 
+// Recommended order: Preamp → Equalizer → Limiter
+player.Effects.AddPreamp(-3f);   // dB; distinct from player.Volume
+
 var eq = player.Effects.AddEqualizer(); // default six-band
 eq.SetBandGain(0, 3f);
 eq.SetBandGain(5, -2f);
 eq.ApplyPreset(EqualizerPresets.BassBoost);
 
-player.Effects.AddPreamp(-3f);   // dB; distinct from player.Volume
-player.Effects.AddLimiter();    // optional clipping protection
-
+player.Effects.AddLimiter();    // sample-peak; default LookaheadMs=5
 player.Play();
 ```
 
 | Effect | Notes |
 | --- | --- |
-| **Equalizer** | Configurable bands (default 6); peaking / low-shelf / high-shelf; presets in `EqualizerPresets` |
 | **Preamp** | Gain in dB; distinct from `player.Volume` |
-| **Limiter** | Conservative peak limiting; zero lookahead by default |
+| **Equalizer** | Configurable bands (default 6); peaking / low-shelf / high-shelf; presets in `EqualizerPresets` |
+| **Limiter** | Sample-peak ceiling; default `LookaheadMs=5` guaranteeing; see [docs/limiter.md](docs/limiter.md) |
 
-Settings persist across track changes; filter state resets on seek/stop/load. Structural chain edits use immutable snapshots; parameter updates apply on the audio thread at block boundaries.
+Recommended rack order: **Preamp → EQ → Limiter**. Settings persist across track changes; filter state resets on seek/stop/load (not on gapless joins). Structural chain edits use immutable snapshots; parameter updates apply on the audio thread at block boundaries.
 
 <details>
 <summary>Limiter limitations</summary>
 
-Zero-lookahead limiting is not a true look-ahead brick-wall or true-peak limiter. Extreme EQ boosts can still sound compressed or briefly over. Prefer sensible preamp/EQ gains rather than relying on the limiter alone.
+Default look-ahead guarantees the sample-peak ceiling for abrupt steps in Sonora’s tests. Explicit `LookaheadMs=0` minimizes latency (still ≥1 sample delay on Windows) but is not true-peak safe. Prefer sensible preamp/EQ gains rather than relying on the limiter alone.
 
 </details>
 
@@ -336,15 +337,32 @@ More detail: [docs/architecture.md](docs/architecture.md) · [docs/getting-start
 
 ---
 
+## Documentation
+
+| Doc | Topic |
+| --- | --- |
+| [docs/getting-started.md](docs/getting-started.md) | Consumer quick start |
+| [docs/architecture.md](docs/architecture.md) | Pipeline and layering |
+| [docs/versioning.md](docs/versioning.md) | SemVer, RC process, 0.9 API freeze |
+| [docs/codec-portability.md](docs/codec-portability.md) | Format / HTTP / platform matrix |
+| [docs/limiter.md](docs/limiter.md) | Sample-peak limiter contract |
+| [docs/hardware-testing.md](docs/hardware-testing.md) | Opt-in WASAPI tests |
+| [docs/production-checklist.md](docs/production-checklist.md) | Gates for `rc.1` → `1.0.0` |
+| [docs/performance-baseline.md](docs/performance-baseline.md) | Measurement template |
+| [SECURITY.md](SECURITY.md) | Reporting, SSRF responsibility |
+| [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) | ATL, Ude, NAudio, NVorbis, Concentus |
+
+---
+
 ## Project structure
 
 ```text
 Sonora/
 ├── src/Sonora.Audio              # Platform-independent core
 ├── src/Sonora.Audio.Windows      # NAudio / WASAPI backend
-├── tests/                        # Unit and Windows tests
+├── tests/                        # Unit, Windows, and package-consumer tests
 ├── samples/Sonora.ConsolePlayer  # Interactive demo
-└── docs/                         # Architecture and getting started
+└── docs/                         # Architecture, versioning, portability, limiter
 ```
 
 ---
@@ -353,12 +371,12 @@ Sonora/
 
 ```bash
 dotnet build Sonora.slnx -c Release
-dotnet test Sonora.slnx -c Release --filter "Category!=Hardware"
+dotnet test Sonora.slnx -c Release --filter "Category!=Hardware&Category!=Soak"
 dotnet pack src/Sonora.Audio/Sonora.Audio.csproj -c Release
 dotnet pack src/Sonora.Audio.Windows/Sonora.Audio.Windows.csproj -c Release
 ```
 
-Hardware-dependent tests run only when `SONORA_RUN_HARDWARE_TESTS=1`.
+Hardware-dependent tests run only when `SONORA_RUN_HARDWARE_TESTS=1` (see [docs/hardware-testing.md](docs/hardware-testing.md)).
 
 ### Installation (local packages)
 
@@ -384,8 +402,9 @@ dotnet add package Sonora.Audio.Windows
 - Audible track-change timing is not sample-accurate under shared-mode WASAPI
 - FLAC / Media Foundation seeking is reliable for playback; sample-accurate (`Exact`) seeking is not claimed for MF-backed formats
 - Bare Ogg Opus uses managed Concentus (not MF); WebM Opus depends on host Media Foundation codecs
-- WASAPI playback integration tests are tagged `Hardware` (skipped in default CI)
-- Zero-lookahead limiting can allow brief overs under extreme boosts
+- WASAPI playback integration tests are tagged `Hardware` (skipped in default CI; require `SONORA_RUN_HARDWARE_TESTS=1`)
+- Explicit `LookaheadMs=0` limiting can allow brief overs; default LA=5 is the guaranteeing setting
+- Performance baselines are not yet measured (`docs/performance-baseline.md`)
 
 ## Roadmap
 

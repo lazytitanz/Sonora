@@ -2,6 +2,36 @@
 
 All notable changes to Sonora will be documented in this file.
 
+## 1.0.0-rc.1 — 2026-11-01
+
+### Added
+
+- Public API snapshot tests and baselines for `Sonora.Audio` / `Sonora.Audio.Windows` (v1.0 RC freeze surface)
+- Package-consumer smoke project (`tests/Sonora.PackageConsumer`) restoring packed nupkgs from a local feed
+- Docs: versioning, codec portability, hardware testing, limiter contract, production checklist, performance baseline template
+- `SECURITY.md` and `THIRD-PARTY-NOTICES.md`
+- SourceLink (`Microsoft.SourceLink.GitHub`), NuGet audit props, CI upload of `*.snupkg`
+- Hardware test gate (`SONORA_RUN_HARDWARE_TESTS=1`) shared helper; Soak category placeholder excluded from CI
+
+### Changed
+
+- Package version set to **`1.0.0-rc.1`** (not yet `1.0.0`)
+- Limiter default `LookaheadMs = 5` guaranteeing sample-peak ceiling; documented contract (LA=0 measured ≥1 sample delay, not true-peak)
+- Recommended DSP order **Preamp → EQ → Limiter**
+- CI: `fetch-depth: 0`, test filter `Category!=Hardware&Category!=Soak`, vulnerability listing, package-consumer smoke
+
+### Fixed
+
+- `AudioPlayer` / `AudioEngine` disposal: detach session under the command gate, complete output shutdown and decode-pump stop **off-gate** (eliminates sync-over-async wait while holding `_gate`); additive `IAsyncDisposable`
+- Engine unregisters players on dispose (avoids double-dispose list growth)
+- Limiter sanitizes non-finite PCM samples; default look-ahead raised to 5 ms after measurement (explicit `LookaheadMs=0` still available)
+
+### Notes
+
+- SemVer applies for the 1.0 line; see `docs/versioning.md`. API freeze from 0.9 with additive `DisposeAsync`.
+- Do not promote to `1.0.0` without `docs/production-checklist.md`.
+- Known residual risks: Windows-only playback backend; MF seek Exact not claimed; HTTP SSRF is an application responsibility; exclusive mode not bit-perfect; performance baselines not yet measured; hardware suite must be opted in and actually run before claiming pass.
+
 ## 0.9.0 — 2026-11-01
 
 ### Added

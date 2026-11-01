@@ -16,8 +16,22 @@ namespace Sonora.Audio;
 /// Events are raised on worker threads and are not marshaled to a UI synchronization context.
 /// Re-entering playback commands from event handlers is unsupported and may deadlock.
 /// </summary>
-public sealed class AudioPlayer : IDisposable
+/// <remarks>
+/// <para>
+/// Prefer <see cref="DisposeAsync"/> when disposing from an asynchronous context. Synchronous
+/// <see cref="Dispose"/> detaches the session under the command gate and completes teardown
+/// (output shutdown, decode-pump stop) only after releasing the gate so completion cannot deadlock
+/// against output/network workers that need the gate.
+/// </para>
+/// <para>
+/// <see cref="PlaybackState.Buffering"/> is used only while <see cref="LoadAsync(AudioSource, CancellationToken)"/>
+/// prepares a new session. Network stalls use <see cref="NetworkTransportStatus.Buffering"/> and do not
+/// change <see cref="State"/> to Buffering.
+/// </para>
+/// </remarks>
+public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 {
+    private readonly Action? _onDisposed;
     private readonly IAudioDecoderFactory _decoderFactory;
     private readonly IAudioOutputFactory _outputFactory;
     private readonly IAudioOutputDevices _outputDevices;
@@ -89,6 +103,17 @@ public sealed class AudioPlayer : IDisposable
         IAudioOutputFactory outputFactory,
         AudioEngineOptions? options = null,
         IAudioOutputDevices? outputDevices = null)
+        : this(decoderFactory, outputFactory, options, outputDevices, onDisposed: null)
+    {
+    }
+
+    /// <summary>Creates a player with an optional disposal callback used by <see cref="AudioEngine"/> ownership tracking.</summary>
+    internal AudioPlayer(
+        IAudioDecoderFactory decoderFactory,
+        IAudioOutputFactory outputFactory,
+        AudioEngineOptions? options,
+        IAudioOutputDevices? outputDevices,
+        Action? onDisposed)
     {
         _decoderFactory = decoderFactory ?? throw new ArgumentNullException(nameof(decoderFactory));
         _outputFactory = outputFactory ?? throw new ArgumentNullException(nameof(outputFactory));
@@ -96,6 +121,7 @@ public sealed class AudioPlayer : IDisposable
         _formatConverter = _options.FormatConverter ?? new PassthroughFormatConverter();
         _effects = new AudioEffectRack(_options.EffectFactory);
         _outputDevices = outputDevices ?? NullAudioOutputDevices.Instance;
+        _onDisposed = onDisposed;
         _outputDevices.DevicesChanged += OnDevicesChanged;
         _outputDevices.DefaultDeviceChanged += OnDefaultDeviceChanged;
     }
@@ -566,22 +592,26 @@ public sealed class AudioPlayer : IDisposable
 
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         var generation = 0;
+        SessionTeardownBag? priorSession = null;
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             generation = ++_generation;
             CancelOutputSwitch_NoLock();
             _outputRecoveryIntent = OutputRecoveryIntent.None;
-            _next.Clear();
             SetState_NoLock(PlaybackState.Buffering);
 
-            await TearDownSession_NoLockAsync().ConfigureAwait(false);
-
+            priorSession = BeginTearDownSession_NoLock(takeNext: true);
             _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         }
         finally
         {
             _gate.Release();
+        }
+
+        if (priorSession is not null)
+        {
+            await CompleteTeardownAsync(priorSession).ConfigureAwait(false);
         }
 
         IAudioDecoder decoder;
@@ -653,12 +683,13 @@ public sealed class AudioPlayer : IDisposable
         }
         catch (Exception ex)
         {
+            SessionTeardownBag? failedOpenTeardown = null;
             await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
             try
             {
                 if (generation == _generation && !_disposed)
                 {
-                    await TearDownSession_NoLockAsync().ConfigureAwait(false);
+                    failedOpenTeardown = BeginTearDownSession_NoLock(takeNext: true);
                     _outputDeviceStatus = OutputDeviceStatus.Unavailable;
                     _effectiveOutputMode = null;
                     SetState_NoLock(PlaybackState.Stopped);
@@ -668,6 +699,11 @@ public sealed class AudioPlayer : IDisposable
             finally
             {
                 _gate.Release();
+            }
+
+            if (failedOpenTeardown is not null)
+            {
+                await CompleteTeardownAsync(failedOpenTeardown).ConfigureAwait(false);
             }
 
             if (ex is OperationCanceledException)
@@ -1149,6 +1185,11 @@ public sealed class AudioPlayer : IDisposable
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// Detaches session resources under the command gate, then completes output shutdown and pump stop
+    /// after releasing the gate. May still block off-gate while waiting for output quiescence or the
+    /// decode worker. Prefer <see cref="DisposeAsync"/> from asynchronous code.
+    /// </remarks>
     public void Dispose()
     {
         if (_disposed)
@@ -1156,6 +1197,8 @@ public sealed class AudioPlayer : IDisposable
             return;
         }
 
+        SessionTeardownBag? bag = null;
+        var shouldDisposeGate = false;
         _gate.Wait();
         try
         {
@@ -1164,21 +1207,101 @@ public sealed class AudioPlayer : IDisposable
                 return;
             }
 
-            _disposed = true;
-            _generation++;
-            CancelOutputSwitch_NoLock();
-            _outputRecoveryIntent = OutputRecoveryIntent.None;
-            _outputDevices.DevicesChanged -= OnDevicesChanged;
-            _outputDevices.DefaultDeviceChanged -= OnDefaultDeviceChanged;
-            _next.Clear();
-            TearDownSession_NoLockAsync().GetAwaiter().GetResult();
-            _effects.Dispose();
-            SetState_NoLock(PlaybackState.Stopped);
+            bag = BeginDispose_NoLock();
+            shouldDisposeGate = true;
         }
         finally
         {
             _gate.Release();
-            _gate.Dispose();
+        }
+
+        try
+        {
+            if (bag is not null)
+            {
+                CompleteTeardown(bag);
+            }
+        }
+        finally
+        {
+            NotifyDisposed();
+            if (shouldDisposeGate)
+            {
+                _gate.Dispose();
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Same detach-under-gate / complete-off-gate contract as <see cref="Dispose"/>, but awaits
+    /// decode-pump stop asynchronously.
+    /// </remarks>
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        SessionTeardownBag? bag = null;
+        var shouldDisposeGate = false;
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            bag = BeginDispose_NoLock();
+            shouldDisposeGate = true;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+
+        try
+        {
+            if (bag is not null)
+            {
+                await CompleteTeardownAsync(bag).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            NotifyDisposed();
+            if (shouldDisposeGate)
+            {
+                _gate.Dispose();
+            }
+        }
+    }
+
+    private SessionTeardownBag BeginDispose_NoLock()
+    {
+        _disposed = true;
+        _generation++;
+        CancelOutputSwitch_NoLock();
+        _outputRecoveryIntent = OutputRecoveryIntent.None;
+        _outputDevices.DevicesChanged -= OnDevicesChanged;
+        _outputDevices.DefaultDeviceChanged -= OnDefaultDeviceChanged;
+        var bag = BeginTearDownSession_NoLock(takeNext: true);
+        _effects.Dispose();
+        SetState_NoLock(PlaybackState.Stopped);
+        return bag;
+    }
+
+    private void NotifyDisposed()
+    {
+        try
+        {
+            _onDisposed?.Invoke();
+        }
+        catch
+        {
+            // ignored — ownership bookkeeping must not throw from Dispose
         }
     }
 
@@ -1235,15 +1358,9 @@ public sealed class AudioPlayer : IDisposable
             // ignored
         }
 
-        try
-        {
-            output.Pause();
-        }
-        catch
-        {
-            // ignored
-        }
-
+        // Do not Pause/Stop/Join under the command gate — Fake/WASAPI Pause joins the pull
+        // loop and can deadlock with callback work that needs the gate. Quiescence is
+        // ShutdownAndDispose after the gate is released (see BeginTearDownSession docs).
         _output = null;
         _effectiveOutputMode = null;
         Volatile.Write(ref _activeOutputDeviceId, null);
@@ -1557,7 +1674,12 @@ public sealed class AudioPlayer : IDisposable
             onError: ex => RaiseError(ex));
     }
 
-    private async Task TearDownSession_NoLockAsync()
+    /// <summary>
+    /// Detaches session resources under the command gate without waiting for output quiescence or pump stop.
+    /// Callers must complete teardown with <see cref="CompleteTeardown"/> / <see cref="CompleteTeardownAsync"/>
+    /// after releasing the gate.
+    /// </summary>
+    private SessionTeardownBag BeginTearDownSession_NoLock(bool takeNext)
     {
         Volatile.Write(ref _acceptEndOfStreamCompletion, 0);
 
@@ -1570,32 +1692,16 @@ public sealed class AudioPlayer : IDisposable
             // ignored
         }
 
-        var oldOutput = DetachOutput_NoLock();
-        // Best-effort during session teardown (Load/Dispose). Switch paths use ShutdownAndDispose off-gate.
-        try
+        var bag = new SessionTeardownBag
         {
-            ShutdownAndDispose(oldOutput);
-        }
-        catch
-        {
-            try
-            {
-                oldOutput?.Dispose();
-            }
-            catch
-            {
-                // ignored
-            }
-        }
+            Output = DetachOutput_NoLock(),
+            Active = _active,
+            SessionCts = _sessionCts,
+            Next = takeNext ? _next.TakeAndClear() : null,
+        };
 
-        _active?.StopPump();
-
-        _sampleSource = null;
-
-        _active?.Dispose();
         _active = null;
-
-        _sessionCts?.Dispose();
+        _sampleSource = null;
         _sessionCts = null;
 
         _effects.DisposeRetired();
@@ -1608,7 +1714,117 @@ public sealed class AudioPlayer : IDisposable
         _heldPosition = TimeSpan.Zero;
         Volatile.Write(ref _positionFrozen, 0);
         UnbindNetworkInfo_NoLock(setIdle: true);
-        await Task.CompletedTask.ConfigureAwait(false);
+        return bag;
+    }
+
+    /// <summary>
+    /// Completes teardown off the command gate. Guarantees the detached output is shut down before dispose
+    /// so a failed shutdown cannot leave a second active PCM consumer.
+    /// </summary>
+    private static void CompleteTeardown(SessionTeardownBag bag)
+    {
+        try
+        {
+            ShutdownAndDispose(bag.Output);
+        }
+        catch
+        {
+            try
+            {
+                bag.Output?.Dispose();
+            }
+            catch
+            {
+                // ignored — best-effort during Load/Dispose
+            }
+        }
+        finally
+        {
+            bag.Output = null;
+        }
+
+        try
+        {
+            bag.Active?.StopPump();
+        }
+        finally
+        {
+            bag.Active?.Dispose();
+            bag.Active = null;
+        }
+
+        try
+        {
+            bag.Next?.StopPump();
+        }
+        finally
+        {
+            bag.Next?.Dispose();
+            bag.Next = null;
+        }
+
+        bag.SessionCts?.Dispose();
+        bag.SessionCts = null;
+    }
+
+    private static async Task CompleteTeardownAsync(SessionTeardownBag bag)
+    {
+        try
+        {
+            ShutdownAndDispose(bag.Output);
+        }
+        catch
+        {
+            try
+            {
+                bag.Output?.Dispose();
+            }
+            catch
+            {
+                // ignored
+            }
+        }
+        finally
+        {
+            bag.Output = null;
+        }
+
+        try
+        {
+            if (bag.Active is not null)
+            {
+                await bag.Active.StopPumpAsync().ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            bag.Active?.Dispose();
+            bag.Active = null;
+        }
+
+        try
+        {
+            if (bag.Next is not null)
+            {
+                await bag.Next.StopPumpAsync().ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            bag.Next?.Dispose();
+            bag.Next = null;
+        }
+
+        bag.SessionCts?.Dispose();
+        bag.SessionCts = null;
+    }
+
+    private sealed class SessionTeardownBag
+    {
+        public IAudioOutput? Output;
+        public TrackDecodePipeline? Active;
+        public TrackDecodePipeline? Next;
+        public CancellationTokenSource? SessionCts;
     }
 
     private void StopTransport_NoLock(bool resetToStart, bool raiseCompletion)

@@ -1,0 +1,29 @@
+# Assembly: Sonora.Audio.Windows
+# v1.0 RC public API baseline for Sonora.Audio.Windows
+
+public sealed class Sonora.Audio.Windows.DSP.WindowsAudioEffectFactory
+  Sonora.Audio.DSP.IEqualizerEffect CreateEqualizer(Sonora.Audio.DSP.EqualizerOptions options)
+  Sonora.Audio.DSP.ILimiterEffect CreateLimiter(Sonora.Audio.DSP.LimiterOptions options)
+  Sonora.Audio.DSP.IPreampEffect CreatePreamp(System.Single gainDb)
+
+public sealed class Sonora.Audio.Windows.Decoding.WindowsAudioDecoderFactory
+  System.Threading.Tasks.Task`1[[Sonora.Audio.Abstractions.IAudioDecoder, Sonora.Audio, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]] CreateAsync(System.String filePath, System.Threading.CancellationToken cancellationToken)
+  System.Threading.Tasks.Task`1[[Sonora.Audio.Abstractions.IAudioDecoder, Sonora.Audio, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]] CreateAsync(Sonora.Audio.Sources.AudioSource source, System.Threading.CancellationToken cancellationToken)
+
+public sealed class Sonora.Audio.Windows.Decoding.WindowsAudioFormatConverter
+  Sonora.Audio.Abstractions.IAudioDecoder Convert(Sonora.Audio.Abstractions.IAudioDecoder source, Sonora.Audio.Formats.AudioFormat targetFormat)
+
+public sealed class Sonora.Audio.Windows.Devices.WindowsAudioOutputDevices
+  System.Void Dispose()
+  Sonora.Audio.Devices.AudioOutputDevice GetDefaultDevice()
+  System.Collections.Generic.IReadOnlyList`1[[Sonora.Audio.Devices.AudioOutputDevice, Sonora.Audio, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]] GetDevices()
+  System.Boolean TryGetDevice(System.String deviceId, Sonora.Audio.Devices.AudioOutputDevice& device)
+
+public sealed class Sonora.Audio.Windows.Output.WindowsAudioOutputFactory
+  System.Threading.Tasks.Task`1[[Sonora.Audio.Abstractions.IAudioOutput, Sonora.Audio, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]] CreateOutputAsync(System.String deviceId, System.Threading.CancellationToken cancellationToken)
+  System.Threading.Tasks.Task`1[[Sonora.Audio.Abstractions.IAudioOutput, Sonora.Audio, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]] CreateOutputAsync(Sonora.Audio.Output.AudioOutputCreateRequest request, System.Threading.CancellationToken cancellationToken)
+  System.Threading.Tasks.Task`1[[Sonora.Audio.Output.AudioOutputFormatProbeResult, Sonora.Audio, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]] ProbeOutputFormatAsync(Sonora.Audio.Output.AudioOutputCreateRequest request, Sonora.Audio.Formats.AudioFormat preferredSessionFormat, System.Threading.CancellationToken cancellationToken)
+
+public static class Sonora.Audio.Windows.SonoraWindows
+  Sonora.Audio.AudioEngine CreateEngine(Sonora.Audio.Playback.AudioEngineOptions options)
+  Sonora.Audio.Metadata.IAudioMetadataReader CreateMetadataReader()

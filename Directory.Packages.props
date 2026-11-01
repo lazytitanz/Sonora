@@ -3,6 +3,8 @@
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
   </PropertyGroup>
   <ItemGroup>
+    <!-- Build / packaging -->
+    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.403" />
     <!-- Audio -->
     <PackageVersion Include="NAudio" Version="3.3.0" />
     <PackageVersion Include="NAudio.Vorbis" Version="3.0.0" />

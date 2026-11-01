@@ -1,0 +1,579 @@
+# Assembly: Sonora.Audio
+# Generated for Sonora public API snapshot tests
+
+public sealed class Sonora.Audio.Abstractions.AudioOutputStoppedEventArgs
+  .ctor(System.Boolean reachedEndOfStream, System.Exception exception)
+  System.Exception Exception { get }
+  System.Boolean ReachedEndOfStream { get }
+
+public interface Sonora.Audio.Abstractions.IAudioDecoder
+  System.Boolean CanSeek { get }
+  System.TimeSpan Duration { get }
+  Sonora.Audio.Formats.AudioFormat Format { get }
+  System.Boolean HasKnownDuration { get }
+  System.Int32 Read(System.Span<System.Single> destination)
+  Sonora.Audio.Seeking.AudioSeekResult Seek(System.TimeSpan position)
+
+public interface Sonora.Audio.Abstractions.IAudioDecoderFactory
+  System.Threading.Tasks.Task<Sonora.Audio.Abstractions.IAudioDecoder> CreateAsync(Sonora.Audio.Sources.AudioSource source, System.Threading.CancellationToken cancellationToken)
+  System.Threading.Tasks.Task<Sonora.Audio.Abstractions.IAudioDecoder> CreateAsync(System.String filePath, System.Threading.CancellationToken cancellationToken)
+
+public interface Sonora.Audio.Abstractions.IAudioOutput
+  System.TimeSpan AverageLatency { get }
+  System.TimeSpan CurrentLatency { get }
+  System.String EndpointId { get }
+  System.Nullable<Sonora.Audio.Formats.AudioFormat> Format { get }
+  event System.EventHandler<Sonora.Audio.Abstractions.AudioOutputStoppedEventArgs> Stopped
+  System.Void Initialize(Sonora.Audio.Abstractions.IPcmSampleSource source)
+  System.Void Pause()
+  System.Void Play()
+  System.Void Shutdown()
+  System.Void Stop()
+  System.Nullable<System.TimeSpan> TryGetRenderedPosition()
+
+public interface Sonora.Audio.Abstractions.IAudioOutputFactory
+  System.Threading.Tasks.Task<Sonora.Audio.Abstractions.IAudioOutput> CreateOutputAsync(Sonora.Audio.Output.AudioOutputCreateRequest request, System.Threading.CancellationToken cancellationToken)
+  System.Threading.Tasks.Task<Sonora.Audio.Abstractions.IAudioOutput> CreateOutputAsync(System.String deviceId, System.Threading.CancellationToken cancellationToken)
+  System.Threading.Tasks.Task<Sonora.Audio.Output.AudioOutputFormatProbeResult> ProbeOutputFormatAsync(Sonora.Audio.Output.AudioOutputCreateRequest request, Sonora.Audio.Formats.AudioFormat preferredSessionFormat, System.Threading.CancellationToken cancellationToken)
+
+public interface Sonora.Audio.Abstractions.IPcmSampleSource
+  Sonora.Audio.Formats.AudioFormat Format { get }
+  System.Boolean IsEndOfStream { get }
+  System.Int32 Read(System.Span<System.Single> destination)
+
+public sealed class Sonora.Audio.AudioDeviceException
+  .ctor(System.String message)
+  .ctor(System.String message, System.Exception innerException)
+
+public sealed class Sonora.Audio.AudioEngine
+  .ctor(Sonora.Audio.Abstractions.IAudioDecoderFactory decoderFactory, Sonora.Audio.Abstractions.IAudioOutputFactory outputFactory, Sonora.Audio.Playback.AudioEngineOptions options, Sonora.Audio.Devices.IAudioOutputDevices outputDevices)
+  Sonora.Audio.Playback.AudioEngineOptions Options { get }
+  Sonora.Audio.Devices.IAudioOutputDevices OutputDevices { get }
+  Sonora.Audio.AudioPlayer CreatePlayer()
+  System.Void Dispose()
+  System.Threading.Tasks.ValueTask DisposeAsync()
+
+public class Sonora.Audio.AudioException
+  .ctor(System.String message)
+  .ctor(System.String message, System.Exception innerException)
+
+public sealed class Sonora.Audio.AudioOutputException
+  .ctor(System.String message)
+  .ctor(System.String message, Sonora.Audio.Output.AudioOutputFailureKind failureKind)
+  .ctor(System.String message, Sonora.Audio.Output.AudioOutputFailureKind failureKind, System.Exception innerException)
+  .ctor(System.String message, System.Exception innerException)
+  Sonora.Audio.Output.AudioOutputFailureKind FailureKind { get }
+
+public sealed class Sonora.Audio.AudioPlayer
+  .ctor(Sonora.Audio.Abstractions.IAudioDecoderFactory decoderFactory, Sonora.Audio.Abstractions.IAudioOutputFactory outputFactory, Sonora.Audio.Playback.AudioEngineOptions options, Sonora.Audio.Devices.IAudioOutputDevices outputDevices)
+  System.String ActiveOutputDeviceId { get }
+  System.TimeSpan BufferedPosition { get }
+  Sonora.Audio.Sources.AudioSource CurrentSource { get }
+  System.TimeSpan Duration { get }
+  System.Nullable<Sonora.Audio.Output.AudioOutputMode> EffectiveOutputMode { get }
+  Sonora.Audio.DSP.IAudioEffectRack Effects { get }
+  System.Boolean HasKnownDuration { get }
+  System.Boolean HasSource { get }
+  System.Int32 NetworkBytesBuffered { get }
+  Sonora.Audio.Network.NetworkTransportStatus NetworkTransportStatus { get }
+  System.String NextTrackPath { get }
+  Sonora.Audio.Formats.NextTrackState NextTrackState { get }
+  Sonora.Audio.Output.AudioOutputConfiguration OutputConfiguration { get }
+  Sonora.Audio.Devices.OutputDeviceStatus OutputDeviceStatus { get }
+  Sonora.Audio.Output.ExclusiveFallbackReason OutputFallbackReason { get }
+  Sonora.Audio.Devices.OutputRecoveryIntent OutputRecoveryIntent { get }
+  System.TimeSpan Position { get }
+  System.String PreferredOutputDeviceId { get }
+  System.String SourcePath { get }
+  Sonora.Audio.Formats.PlaybackState State { get }
+  System.Single Volume { get; set }
+  event System.EventHandler<System.Exception> ErrorOccurred
+  event System.EventHandler NetworkStatusChanged
+  event System.EventHandler<Sonora.Audio.Output.OutputConfigurationChangedEventArgs> OutputConfigurationChanged
+  event System.EventHandler<Sonora.Audio.Devices.OutputDeviceChangedEventArgs> OutputDeviceChanged
+  event System.EventHandler PlaybackCompleted
+  event System.EventHandler StateChanged
+  event System.EventHandler<Sonora.Audio.Playback.TrackTransitionedEventArgs> TrackTransitioned
+  event System.EventHandler Underrun
+  System.Void ClearNext()
+  System.Threading.Tasks.Task ConfigureOutputAsync(Sonora.Audio.Output.AudioOutputConfiguration configuration, System.Threading.CancellationToken cancellationToken)
+  System.Void Dispose()
+  System.Threading.Tasks.ValueTask DisposeAsync()
+  Sonora.Audio.Diagnostics.PlaybackDiagnostics GetDiagnostics()
+  System.Threading.Tasks.Task LoadAsync(Sonora.Audio.Sources.AudioSource source, System.Threading.CancellationToken cancellationToken)
+  System.Threading.Tasks.Task LoadAsync(System.String filePath, System.Threading.CancellationToken cancellationToken)
+  System.Void Pause()
+  System.Void Play()
+  System.Threading.Tasks.Task PreloadNextAsync(Sonora.Audio.Sources.AudioSource source, System.Threading.CancellationToken cancellationToken)
+  System.Threading.Tasks.Task PreloadNextAsync(System.String filePath, System.Threading.CancellationToken cancellationToken)
+  System.Void Seek(System.TimeSpan position)
+  Sonora.Audio.Seeking.AudioSeekResult SeekWithResult(System.TimeSpan position)
+  System.Threading.Tasks.Task SetOutputDeviceAsync(System.String deviceId, System.Threading.CancellationToken cancellationToken)
+  System.Void Stop()
+
+public sealed class Sonora.Audio.DSP.EqualizerBandConfig
+  .ctor(Sonora.Audio.DSP.EqualizerBandType type, System.Single frequencyHz, System.Single gainDb, System.Single q, System.Boolean enabled)
+  System.Boolean Enabled { get }
+  System.Single FrequencyHz { get }
+  System.Single GainDb { get }
+  System.Single Q { get }
+  Sonora.Audio.DSP.EqualizerBandType Type { get }
+  Sonora.Audio.DSP.EqualizerBandConfig HighShelf(System.Single frequencyHz, System.Single gainDb, System.Single q)
+  Sonora.Audio.DSP.EqualizerBandConfig LowShelf(System.Single frequencyHz, System.Single gainDb, System.Single q)
+  Sonora.Audio.DSP.EqualizerBandConfig Peaking(System.Single frequencyHz, System.Single gainDb, System.Single q)
+
+public enum Sonora.Audio.DSP.EqualizerBandType
+  HighShelf = 2
+  LowShelf = 1
+  Peaking = 0
+
+public sealed class Sonora.Audio.DSP.EqualizerOptions
+  .ctor(System.Collections.Generic.IReadOnlyList<Sonora.Audio.DSP.EqualizerBandConfig> bands)
+  System.Collections.Generic.IReadOnlyList<Sonora.Audio.DSP.EqualizerBandConfig> Bands { get }
+  Sonora.Audio.DSP.EqualizerOptions CreateSixBand()
+
+public sealed class Sonora.Audio.DSP.EqualizerPreset
+  .ctor(System.String name, System.Collections.Generic.IReadOnlyList<Sonora.Audio.DSP.EqualizerBandConfig> bands, System.Nullable<System.Single> preampGainDb)
+  System.Collections.Generic.IReadOnlyList<Sonora.Audio.DSP.EqualizerBandConfig> Bands { get }
+  System.String Name { get }
+  System.Nullable<System.Single> PreampGainDb { get }
+
+public static class Sonora.Audio.DSP.EqualizerPresets
+  System.Collections.Generic.IReadOnlyList<Sonora.Audio.DSP.EqualizerPreset> All { get }
+  Sonora.Audio.DSP.EqualizerPreset BassBoost { get }
+  Sonora.Audio.DSP.EqualizerPreset Flat { get }
+  Sonora.Audio.DSP.EqualizerPreset TrebleBoost { get }
+  Sonora.Audio.DSP.EqualizerPreset Vocal { get }
+
+public interface Sonora.Audio.DSP.IAudioEffect
+  System.Boolean Enabled { get; set }
+  System.String Name { get }
+
+public interface Sonora.Audio.DSP.IAudioEffectFactory
+  Sonora.Audio.DSP.IEqualizerEffect CreateEqualizer(Sonora.Audio.DSP.EqualizerOptions options)
+  Sonora.Audio.DSP.ILimiterEffect CreateLimiter(Sonora.Audio.DSP.LimiterOptions options)
+  Sonora.Audio.DSP.IPreampEffect CreatePreamp(System.Single gainDb)
+
+public interface Sonora.Audio.DSP.IAudioEffectRack
+  System.Boolean Bypass { get; set }
+  System.Collections.Generic.IReadOnlyList<Sonora.Audio.DSP.IAudioEffect> Items { get }
+  Sonora.Audio.DSP.IEqualizerEffect AddEqualizer(Sonora.Audio.DSP.EqualizerOptions options)
+  Sonora.Audio.DSP.ILimiterEffect AddLimiter(Sonora.Audio.DSP.LimiterOptions options)
+  Sonora.Audio.DSP.IPreampEffect AddPreamp(System.Single gainDb)
+  System.Void Clear()
+  System.Void Move(System.Int32 fromIndex, System.Int32 toIndex)
+  System.Boolean Remove(Sonora.Audio.DSP.IAudioEffect effect)
+
+public interface Sonora.Audio.DSP.IAudioProcessor
+  System.Void Process(System.Span<System.Single> buffer, Sonora.Audio.Formats.AudioFormat& format)
+
+public interface Sonora.Audio.DSP.IEqualizerEffect
+  System.Int32 BandCount { get }
+  System.Void ApplyPreset(Sonora.Audio.DSP.EqualizerPreset preset)
+  System.Boolean GetBandEnabled(System.Int32 bandIndex)
+  System.Single GetBandFrequency(System.Int32 bandIndex)
+  System.Single GetBandGain(System.Int32 bandIndex)
+  System.Void SetBandEnabled(System.Int32 bandIndex, System.Boolean enabled)
+  System.Void SetBandGain(System.Int32 bandIndex, System.Single gainDb)
+
+public interface Sonora.Audio.DSP.ILimiterEffect
+  System.Single CeilingDb { get; set }
+  System.Single ReleaseMs { get; set }
+
+public interface Sonora.Audio.DSP.IPreampEffect
+  System.Single GainDb { get; set }
+
+public sealed class Sonora.Audio.DSP.LimiterOptions
+  .ctor(System.Single ceilingDb, System.Single releaseMs, System.Single lookaheadMs)
+  System.Single CeilingDb { get }
+  System.Single LookaheadMs { get }
+  System.Single ReleaseMs { get }
+
+public sealed class Sonora.Audio.DecoderException
+  .ctor(System.String message)
+  .ctor(System.String message, System.Exception innerException)
+
+public enum Sonora.Audio.Devices.AudioDeviceState
+  Active = 0
+  Disabled = 1
+  NotPresent = 3
+  Unknown = 4
+  Unplugged = 2
+
+public sealed class Sonora.Audio.Devices.AudioOutputDevice
+  .ctor(System.String id, System.String name, System.Boolean isDefault, Sonora.Audio.Devices.AudioDeviceState state)
+  System.String Id { get }
+  System.Boolean IsDefault { get }
+  System.String Name { get }
+  Sonora.Audio.Devices.AudioDeviceState State { get }
+
+public sealed class Sonora.Audio.Devices.DefaultOutputDeviceChangedEventArgs
+  .ctor(System.String previousDeviceId, System.String newDeviceId)
+  System.String NewDeviceId { get }
+  System.String PreviousDeviceId { get }
+
+public interface Sonora.Audio.Devices.IAudioOutputDevices
+  event System.EventHandler<Sonora.Audio.Devices.DefaultOutputDeviceChangedEventArgs> DefaultDeviceChanged
+  event System.EventHandler DevicesChanged
+  Sonora.Audio.Devices.AudioOutputDevice GetDefaultDevice()
+  System.Collections.Generic.IReadOnlyList<Sonora.Audio.Devices.AudioOutputDevice> GetDevices()
+  System.Boolean TryGetDevice(System.String deviceId, Sonora.Audio.Devices.AudioOutputDevice& device)
+
+public sealed class Sonora.Audio.Devices.NullAudioOutputDevices
+  .ctor()
+  Sonora.Audio.Devices.NullAudioOutputDevices Instance { get }
+  event System.EventHandler<Sonora.Audio.Devices.DefaultOutputDeviceChangedEventArgs> DefaultDeviceChanged
+  event System.EventHandler DevicesChanged
+  System.Void Dispose()
+  Sonora.Audio.Devices.AudioOutputDevice GetDefaultDevice()
+  System.Collections.Generic.IReadOnlyList<Sonora.Audio.Devices.AudioOutputDevice> GetDevices()
+  System.Boolean TryGetDevice(System.String deviceId, Sonora.Audio.Devices.AudioOutputDevice& device)
+
+public enum Sonora.Audio.Devices.OutputDeviceChangeReason
+  DeviceLostFallback = 2
+  Recovered = 3
+  SelectionChanged = 0
+  Superseded = 6
+  Switching = 5
+  SystemDefaultChanged = 1
+  Unavailable = 4
+
+public sealed class Sonora.Audio.Devices.OutputDeviceChangedEventArgs
+  .ctor(System.String preferredDeviceId, System.String activeDeviceId, Sonora.Audio.Devices.OutputDeviceStatus status, Sonora.Audio.Devices.OutputRecoveryIntent recoveryIntent, Sonora.Audio.Devices.OutputDeviceChangeReason reason)
+  System.String ActiveDeviceId { get }
+  System.String PreferredDeviceId { get }
+  Sonora.Audio.Devices.OutputDeviceChangeReason Reason { get }
+  Sonora.Audio.Devices.OutputRecoveryIntent RecoveryIntent { get }
+  Sonora.Audio.Devices.OutputDeviceStatus Status { get }
+
+public enum Sonora.Audio.Devices.OutputDeviceStatus
+  Available = 0
+  PreferredUnavailable = 1
+  Switching = 3
+  Unavailable = 2
+
+public enum Sonora.Audio.Devices.OutputRecoveryIntent
+  None = 0
+  RemainPaused = 2
+  ResumePlaying = 1
+
+public sealed class Sonora.Audio.Diagnostics.PlaybackDiagnostics
+  .ctor()
+  System.Int32 BufferCapacitySamples { get; set }
+  System.Int32 BufferedSamples { get; set }
+  System.Int64 UnderrunCount { get; set }
+
+public struct Sonora.Audio.Formats.AudioFormat
+  .ctor(System.Int32 SampleRate, System.Int32 ChannelCount, Sonora.Audio.Formats.SampleFormat SampleFormat)
+  System.Int32 ChannelCount { get; set }
+  Sonora.Audio.Formats.SampleFormat SampleFormat { get; set }
+  System.Int32 SampleRate { get; set }
+  System.Int32 SamplesPerSecond { get }
+  System.Int64 ClampFrameIndex(System.Int64 frameIndex, System.Int64 maxFrames)
+  Sonora.Audio.Formats.AudioFormat CreateFloat32(System.Int32 sampleRate, System.Int32 channelCount)
+  System.Void Deconstruct(System.Int32& SampleRate, System.Int32& ChannelCount, Sonora.Audio.Formats.SampleFormat& SampleFormat)
+  System.Boolean Equals(Sonora.Audio.Formats.AudioFormat other)
+  System.Boolean Equals(System.Object obj)
+  System.TimeSpan FramesToTime(System.Int64 frames)
+  System.Int32 GetHashCode()
+  System.TimeSpan SamplesToTime(System.Int64 interleavedSamples)
+  System.Int64 TimeToFrames(System.TimeSpan time)
+  System.Int64 TimeToSamples(System.TimeSpan time)
+  System.String ToString()
+
+public enum Sonora.Audio.Formats.NextTrackState
+  Failed = 3
+  Loading = 1
+  None = 0
+  Ready = 2
+
+public enum Sonora.Audio.Formats.PlaybackState
+  Buffering = 3
+  Paused = 2
+  Playing = 1
+  Stopped = 0
+
+public enum Sonora.Audio.Formats.SampleFormat
+  Float32 = 0
+
+public sealed class Sonora.Audio.InvalidAudioException
+  .ctor(System.String message)
+  .ctor(System.String message, System.Exception innerException)
+
+public sealed class Sonora.Audio.Metadata.AudioArtwork
+  .ctor(System.String MimeType, System.String Description, Sonora.Audio.Metadata.AudioArtworkKind Kind, System.ReadOnlyMemory<System.Byte> Data)
+  System.ReadOnlyMemory<System.Byte> Data { get; set }
+  System.String Description { get; set }
+  Sonora.Audio.Metadata.AudioArtworkKind Kind { get; set }
+  System.String MimeType { get; set }
+  Sonora.Audio.Metadata.AudioArtwork <Clone>$()
+  System.Void Deconstruct(System.String& MimeType, System.String& Description, Sonora.Audio.Metadata.AudioArtworkKind& Kind, System.ReadOnlyMemory<System.Byte>& Data)
+  System.Boolean Equals(Sonora.Audio.Metadata.AudioArtwork other)
+  System.Boolean Equals(System.Object obj)
+  System.Int32 GetHashCode()
+  System.String ToString()
+
+public enum Sonora.Audio.Metadata.AudioArtworkKind
+  Artist = 3
+  BackCover = 2
+  FrontCover = 1
+  Leaflet = 4
+  Media = 5
+  Other = 0
+
+public sealed class Sonora.Audio.Metadata.AudioMetadataReadOptions
+  .ctor()
+  System.Boolean IncludeArtwork { get; set }
+  System.Int32 MaxArtworkBytes { get; set }
+  System.Int32 MaxArtworkCount { get; set }
+
+public sealed class Sonora.Audio.Metadata.AudioMetadataReader
+  .ctor()
+  Sonora.Audio.Metadata.AudioTrackMetadata Read(System.String filePath, Sonora.Audio.Metadata.AudioMetadataReadOptions options)
+  System.Collections.Generic.IReadOnlyList<Sonora.Audio.Metadata.AudioArtwork> ReadArtwork(System.String filePath, Sonora.Audio.Metadata.AudioMetadataReadOptions options)
+
+public sealed class Sonora.Audio.Metadata.AudioMusicBrainzIds
+  .ctor(System.String TrackId, System.String ReleaseId, System.String ArtistId, System.String ReleaseGroupId)
+  System.String ArtistId { get; set }
+  System.String ReleaseGroupId { get; set }
+  System.String ReleaseId { get; set }
+  System.String TrackId { get; set }
+  Sonora.Audio.Metadata.AudioMusicBrainzIds <Clone>$()
+  System.Void Deconstruct(System.String& TrackId, System.String& ReleaseId, System.String& ArtistId, System.String& ReleaseGroupId)
+  System.Boolean Equals(Sonora.Audio.Metadata.AudioMusicBrainzIds other)
+  System.Boolean Equals(System.Object obj)
+  System.Int32 GetHashCode()
+  System.String ToString()
+
+public sealed class Sonora.Audio.Metadata.AudioReplayGain
+  .ctor(System.Nullable<System.Double> TrackGainDb, System.Nullable<System.Double> TrackPeak, System.Nullable<System.Double> AlbumGainDb, System.Nullable<System.Double> AlbumPeak)
+  System.Nullable<System.Double> AlbumGainDb { get; set }
+  System.Nullable<System.Double> AlbumPeak { get; set }
+  System.Nullable<System.Double> TrackGainDb { get; set }
+  System.Nullable<System.Double> TrackPeak { get; set }
+  Sonora.Audio.Metadata.AudioReplayGain <Clone>$()
+  System.Void Deconstruct(System.Nullable<System.Double>& TrackGainDb, System.Nullable<System.Double>& TrackPeak, System.Nullable<System.Double>& AlbumGainDb, System.Nullable<System.Double>& AlbumPeak)
+  System.Boolean Equals(Sonora.Audio.Metadata.AudioReplayGain other)
+  System.Boolean Equals(System.Object obj)
+  System.Int32 GetHashCode()
+  System.String ToString()
+
+public sealed class Sonora.Audio.Metadata.AudioTrackMetadata
+  .ctor()
+  System.Collections.Generic.IReadOnlyDictionary<System.String, System.String> AdditionalTags { get; set }
+  System.String Album { get; set }
+  System.Collections.Generic.IReadOnlyList<System.String> AlbumArtists { get; set }
+  System.Collections.Generic.IReadOnlyList<System.String> Artists { get; set }
+  System.Collections.Generic.IReadOnlyList<Sonora.Audio.Metadata.AudioArtwork> Artwork { get; set }
+  System.Nullable<System.Double> BeatsPerMinute { get; set }
+  System.Nullable<System.Int64> Bitrate { get; set }
+  System.Nullable<System.Int32> ChannelCount { get; set }
+  System.String Comment { get; set }
+  System.String Composer { get; set }
+  System.String Copyright { get; set }
+  System.Nullable<System.Int32> DiscCount { get; set }
+  System.Nullable<System.Int32> DiscNumber { get; set }
+  System.Nullable<System.TimeSpan> Duration { get; set }
+  System.String Encoder { get; set }
+  System.String Genre { get; set }
+  System.Collections.Generic.IReadOnlyList<System.String> Genres { get; set }
+  System.Nullable<System.Boolean> IsCompilation { get; set }
+  System.Nullable<System.Boolean> IsLossless { get; set }
+  System.String Lyrics { get; set }
+  Sonora.Audio.Metadata.AudioMusicBrainzIds MusicBrainz { get; set }
+  System.Nullable<System.DateOnly> OriginalReleaseDate { get; set }
+  System.String Publisher { get; set }
+  Sonora.Audio.Metadata.AudioReplayGain ReplayGain { get; set }
+  System.Nullable<System.Int32> SampleRate { get; set }
+  System.String Title { get; set }
+  System.Nullable<System.Int32> TrackCount { get; set }
+  System.Nullable<System.Int32> TrackNumber { get; set }
+  System.Nullable<System.Int32> Year { get; set }
+  Sonora.Audio.Metadata.AudioTrackMetadata <Clone>$()
+  System.Boolean Equals(Sonora.Audio.Metadata.AudioTrackMetadata other)
+  System.Boolean Equals(System.Object obj)
+  System.Int32 GetHashCode()
+  System.String ToString()
+
+public interface Sonora.Audio.Metadata.IAudioMetadataReader
+  Sonora.Audio.Metadata.AudioTrackMetadata Read(System.String filePath, Sonora.Audio.Metadata.AudioMetadataReadOptions options)
+  System.Collections.Generic.IReadOnlyList<Sonora.Audio.Metadata.AudioArtwork> ReadArtwork(System.String filePath, Sonora.Audio.Metadata.AudioMetadataReadOptions options)
+
+public sealed class Sonora.Audio.Network.HttpStreamingOptions
+  .ctor()
+  System.TimeSpan ConnectTimeout { get; set }
+  Sonora.Audio.Network.HttpStreamingOptions Default { get }
+  System.Net.Http.HttpClient HttpClient { get; set }
+  System.Int32 InitialBufferBytes { get; set }
+  System.Int32 MaxNetworkBufferBytes { get; set }
+  System.Int32 MaxReconnectAttempts { get; set }
+  System.Int32 MaxRedirects { get; set }
+  System.Int32 MaxResponseHeadersLength { get; set }
+  System.TimeSpan ReadIdleTimeout { get; set }
+  System.Int32 RebufferThresholdBytes { get; set }
+  System.TimeSpan RetryBaseDelay { get; set }
+  System.TimeSpan RetryMaxDelay { get; set }
+  Sonora.Audio.Network.HttpStreamingOptions Validate()
+
+public interface Sonora.Audio.Network.INetworkTransportInfo
+  System.Int32 NetworkBytesBuffered { get }
+  Sonora.Audio.Network.NetworkTransportStatus TransportStatus { get }
+  event System.EventHandler TransportChanged
+
+public enum Sonora.Audio.Network.NetworkTransportStatus
+  Buffering = 2
+  Connecting = 1
+  Ended = 5
+  Failed = 6
+  Idle = 0
+  Ready = 3
+  Reconnecting = 4
+
+public sealed class Sonora.Audio.NetworkAudioException
+  .ctor(System.String message)
+  .ctor(System.String message, System.Exception innerException)
+
+public sealed class Sonora.Audio.Output.AudioOutputConfiguration
+  .ctor()
+  Sonora.Audio.Output.AudioOutputConfiguration Default { get }
+  Sonora.Audio.Output.ExclusiveModeFallback ExclusiveFallback { get; set }
+  Sonora.Audio.Output.AudioOutputMode Mode { get; set }
+  System.Nullable<System.TimeSpan> RequestedLatency { get; set }
+
+public struct Sonora.Audio.Output.AudioOutputCreateRequest
+  .ctor(System.String DeviceId, Sonora.Audio.Output.AudioOutputMode Mode, System.Nullable<System.TimeSpan> RequestedLatency, System.Nullable<Sonora.Audio.Formats.AudioFormat> PreferredFormat)
+  System.String DeviceId { get; set }
+  Sonora.Audio.Output.AudioOutputMode Mode { get; set }
+  System.Nullable<Sonora.Audio.Formats.AudioFormat> PreferredFormat { get; set }
+  System.Nullable<System.TimeSpan> RequestedLatency { get; set }
+  System.Void Deconstruct(System.String& DeviceId, Sonora.Audio.Output.AudioOutputMode& Mode, System.Nullable<System.TimeSpan>& RequestedLatency, System.Nullable<Sonora.Audio.Formats.AudioFormat>& PreferredFormat)
+  System.Boolean Equals(Sonora.Audio.Output.AudioOutputCreateRequest other)
+  System.Boolean Equals(System.Object obj)
+  System.Int32 GetHashCode()
+  Sonora.Audio.Output.AudioOutputCreateRequest Shared(System.String deviceId, System.Nullable<System.TimeSpan> requestedLatency)
+  System.String ToString()
+
+public enum Sonora.Audio.Output.AudioOutputFailureKind
+  DeviceBusy = 1
+  DeviceUnavailable = 4
+  ExclusiveModeRestricted = 2
+  InitializationFailed = 5
+  ShutdownFailed = 6
+  Unspecified = 0
+  UnsupportedFormat = 3
+
+public struct Sonora.Audio.Output.AudioOutputFormatProbeResult
+  .ctor(System.Boolean Supported, Sonora.Audio.Formats.AudioFormat RequiredSessionFormat, Sonora.Audio.Output.AudioOutputFailureKind FailureKind)
+  Sonora.Audio.Output.AudioOutputFailureKind FailureKind { get; set }
+  Sonora.Audio.Formats.AudioFormat RequiredSessionFormat { get; set }
+  System.Boolean Supported { get; set }
+  System.Void Deconstruct(System.Boolean& Supported, Sonora.Audio.Formats.AudioFormat& RequiredSessionFormat, Sonora.Audio.Output.AudioOutputFailureKind& FailureKind)
+  System.Boolean Equals(Sonora.Audio.Output.AudioOutputFormatProbeResult other)
+  System.Boolean Equals(System.Object obj)
+  System.Int32 GetHashCode()
+  System.String ToString()
+
+public enum Sonora.Audio.Output.AudioOutputMode
+  Exclusive = 1
+  Shared = 0
+
+public enum Sonora.Audio.Output.ExclusiveFallbackReason
+  DeviceBusy = 1
+  ExclusiveModeRestricted = 2
+  InitializationFailed = 4
+  None = 0
+  UnsupportedFormat = 3
+
+public enum Sonora.Audio.Output.ExclusiveModeFallback
+  None = 0
+  Shared = 1
+
+public sealed class Sonora.Audio.Output.OutputConfigurationChangedEventArgs
+  .ctor(Sonora.Audio.Output.AudioOutputConfiguration requested, System.Nullable<Sonora.Audio.Output.AudioOutputMode> effectiveMode, Sonora.Audio.Output.ExclusiveFallbackReason fallbackReason, System.Nullable<System.TimeSpan> effectiveLatency)
+  System.Nullable<System.TimeSpan> EffectiveLatency { get }
+  System.Nullable<Sonora.Audio.Output.AudioOutputMode> EffectiveMode { get }
+  Sonora.Audio.Output.ExclusiveFallbackReason FallbackReason { get }
+  Sonora.Audio.Output.AudioOutputConfiguration Requested { get }
+
+public sealed class Sonora.Audio.Playback.AudioEngineOptions
+  .ctor()
+  System.TimeSpan BufferDuration { get; set }
+  Sonora.Audio.DSP.IAudioEffectFactory EffectFactory { get; set }
+  Sonora.Audio.Playback.IAudioFormatConverter FormatConverter { get; set }
+  Sonora.Audio.Network.HttpStreamingOptions HttpStreaming { get; set }
+  System.TimeSpan PrimeDuration { get; set }
+  System.Collections.Generic.IReadOnlyList<Sonora.Audio.DSP.IAudioProcessor> Processors { get; set }
+
+public interface Sonora.Audio.Playback.IAudioFormatConverter
+  Sonora.Audio.Abstractions.IAudioDecoder Convert(Sonora.Audio.Abstractions.IAudioDecoder source, Sonora.Audio.Formats.AudioFormat targetFormat)
+
+public sealed class Sonora.Audio.Playback.PassthroughFormatConverter
+  .ctor()
+  Sonora.Audio.Abstractions.IAudioDecoder Convert(Sonora.Audio.Abstractions.IAudioDecoder source, Sonora.Audio.Formats.AudioFormat targetFormat)
+
+public sealed class Sonora.Audio.Playback.TrackTransitionedEventArgs
+  .ctor(System.String previousPath, System.String nextPath, System.TimeSpan previousDuration, System.Int32 transitionId)
+  System.String NextPath { get }
+  System.TimeSpan PreviousDuration { get }
+  System.String PreviousPath { get }
+  System.Int32 TransitionId { get }
+
+public enum Sonora.Audio.Seeking.AudioSeekAccuracy
+  Approximate = 1
+  Exact = 0
+  Unknown = 2
+
+public sealed class Sonora.Audio.Seeking.AudioSeekResult
+  .ctor(System.TimeSpan RequestedPosition, System.Nullable<System.TimeSpan> ActualPosition, Sonora.Audio.Seeking.AudioSeekAccuracy Accuracy)
+  Sonora.Audio.Seeking.AudioSeekAccuracy Accuracy { get; set }
+  System.Nullable<System.TimeSpan> ActualPosition { get; set }
+  System.TimeSpan RequestedPosition { get; set }
+  Sonora.Audio.Seeking.AudioSeekResult <Clone>$()
+  Sonora.Audio.Seeking.AudioSeekResult Approximate(System.TimeSpan requestedPosition, System.TimeSpan actualPosition)
+  System.Void Deconstruct(System.TimeSpan& RequestedPosition, System.Nullable<System.TimeSpan>& ActualPosition, Sonora.Audio.Seeking.AudioSeekAccuracy& Accuracy)
+  Sonora.Audio.Seeking.AudioSeekResult EnsureInvariants()
+  System.Boolean Equals(Sonora.Audio.Seeking.AudioSeekResult other)
+  System.Boolean Equals(System.Object obj)
+  Sonora.Audio.Seeking.AudioSeekResult Exact(System.TimeSpan requestedPosition, System.TimeSpan actualPosition)
+  System.Int32 GetHashCode()
+  System.String ToString()
+  Sonora.Audio.Seeking.AudioSeekResult Unknown(System.TimeSpan requestedPosition)
+
+public abstract class Sonora.Audio.Sources.AudioSource
+  System.String Identifier { get }
+  Sonora.Audio.Sources.AudioSource <Clone>$()
+  System.Boolean Equals(Sonora.Audio.Sources.AudioSource other)
+  System.Boolean Equals(System.Object obj)
+  System.Int32 GetHashCode()
+  System.String ToString()
+
+public sealed class Sonora.Audio.Sources.FileAudioSource
+  .ctor(System.String Path)
+  System.String Identifier { get }
+  System.String Path { get; set }
+  Sonora.Audio.Sources.FileAudioSource <Clone>$()
+  Sonora.Audio.Sources.FileAudioSource Create(System.String path)
+  System.Void Deconstruct(System.String& Path)
+  System.Boolean Equals(Sonora.Audio.Sources.AudioSource other)
+  System.Boolean Equals(Sonora.Audio.Sources.FileAudioSource other)
+  System.Boolean Equals(System.Object obj)
+  System.Int32 GetHashCode()
+  System.String ToString()
+
+public sealed class Sonora.Audio.Sources.HttpAudioSource
+  .ctor(System.Uri Uri)
+  System.String Identifier { get }
+  System.Uri Uri { get; set }
+  Sonora.Audio.Sources.HttpAudioSource <Clone>$()
+  Sonora.Audio.Sources.HttpAudioSource Create(System.String uriString)
+  Sonora.Audio.Sources.HttpAudioSource Create(System.Uri uri)
+  System.Void Deconstruct(System.Uri& Uri)
+  System.Boolean Equals(Sonora.Audio.Sources.AudioSource other)
+  System.Boolean Equals(Sonora.Audio.Sources.HttpAudioSource other)
+  System.Boolean Equals(System.Object obj)
+  System.Int32 GetHashCode()
+  System.String ToString()
+
+public sealed class Sonora.Audio.UnsupportedFormatException
+  .ctor(System.String message)
+  .ctor(System.String message, System.Exception innerException)

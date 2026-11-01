@@ -7,7 +7,12 @@ namespace Sonora.Audio;
 /// <summary>
 /// Owns shared engine services and creates <see cref="AudioPlayer"/> instances.
 /// </summary>
-public sealed class AudioEngine : IDisposable
+/// <remarks>
+/// Players created via <see cref="CreatePlayer"/> are tracked until disposed. Disposing a player
+/// unregisters it from the engine; disposing the engine disposes any remaining players.
+/// Prefer <see cref="DisposeAsync"/> when disposing from an asynchronous context.
+/// </remarks>
+public sealed class AudioEngine : IDisposable, IAsyncDisposable
 {
     private readonly IAudioDecoderFactory _decoderFactory;
     private readonly IAudioOutputFactory _outputFactory;
@@ -56,7 +61,13 @@ public sealed class AudioEngine : IDisposable
     public AudioPlayer CreatePlayer()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        var player = new AudioPlayer(_decoderFactory, _outputFactory, _options, _outputDevices);
+        AudioPlayer? player = null;
+        player = new AudioPlayer(
+            _decoderFactory,
+            _outputFactory,
+            _options,
+            _outputDevices,
+            onDisposed: () => Unregister(player!));
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -95,6 +106,46 @@ public sealed class AudioEngine : IDisposable
         if (_ownsOutputDevices)
         {
             _outputDevices.Dispose();
+        }
+    }
+
+    /// <inheritdoc />
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        AudioPlayer[] players;
+        lock (_sync)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            players = _players.ToArray();
+            _players.Clear();
+        }
+
+        foreach (var player in players)
+        {
+            await player.DisposeAsync().ConfigureAwait(false);
+        }
+
+        if (_ownsOutputDevices)
+        {
+            _outputDevices.Dispose();
+        }
+    }
+
+    private void Unregister(AudioPlayer player)
+    {
+        lock (_sync)
+        {
+            _players.Remove(player);
         }
     }
 }

@@ -177,15 +177,17 @@ Keys: Space play/pause, S stop, arrows seek, +/- volume, Q quit.
 ```csharp
 using Sonora.Audio.DSP;
 
+// Recommended order: Preamp → Equalizer → Limiter
+player.Effects.AddPreamp(-2f);   // dB; separate from player.Volume
+
 var eq = player.Effects.AddEqualizer(); // six-band default
 eq.SetBandGain(1, 4f);
 eq.ApplyPreset(EqualizerPresets.BassBoost);
 
-player.Effects.AddPreamp(-2f);   // dB; separate from player.Volume
-player.Effects.AddLimiter();     // optional clipping protection
+player.Effects.AddLimiter();     // sample-peak; default LookaheadMs=5
 ```
 
-Effects process after the PCM buffer so slider changes are audible immediately. Use `SonoraWindows.CreateEngine()` so the Windows effect factory is registered.
+Effects process after the PCM buffer so slider changes are audible immediately. Use `SonoraWindows.CreateEngine()` so the Windows effect factory is registered. See [limiter.md](limiter.md) for the sample-peak contract.
 
 ## Supported formats
 

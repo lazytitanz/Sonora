@@ -37,7 +37,7 @@ public sealed class CodecExpansionTests
         Assert.True(afterSeek > 0, $"{formatKey} must remain readable after seek.");
     }
 
-    [Theory]
+    [HardwareTheory]
     [Trait("Category", "Hardware")]
     [InlineData("aiff")]
     [InlineData("aac")]
@@ -56,6 +56,7 @@ public sealed class CodecExpansionTests
         using var completed = new ManualResetEventSlim(false);
         player.PlaybackCompleted += (_, _) => completed.Set();
 
+        player.Volume = 0.1f;
         player.Play();
         Assert.True(completed.Wait(TimeSpan.FromSeconds(10)), $"{formatKey} did not complete naturally.");
         Assert.Equal(Sonora.Audio.Formats.PlaybackState.Stopped, player.State);

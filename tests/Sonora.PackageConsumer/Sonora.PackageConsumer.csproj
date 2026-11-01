@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Restores Sonora packages from a local feed (artifacts/) after pack.
+    No ProjectReference to src — verifies the packed NuGet surface.
+    Set SonoraPackageConsumerWindows=false on Linux (Windows TFM blocks restore).
+  -->
+  <PropertyGroup>
+    <SonoraPackageConsumerWindows Condition="'$(SonoraPackageConsumerWindows)' == ''">true</SonoraPackageConsumerWindows>
+    <SonoraPackageVersion Condition="'$(SonoraPackageVersion)' == ''">1.0.0-rc.1</SonoraPackageVersion>
+    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework Condition="'$(SonoraPackageConsumerWindows)' == 'true' AND $([MSBuild]::IsOSPlatform('windows'))">net10.0-windows10.0.19041.0</TargetFramework>
+    <RootNamespace>Sonora.PackageConsumer</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <SupportedOSPlatformVersion Condition="$(TargetFramework.Contains('windows'))">10.0.19041.0</SupportedOSPlatformVersion>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="$(TargetFramework.Contains('windows'))">
+    <DefineConstants>$(DefineConstants);SONORA_WINDOWS_PACKAGE</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="Sonora.Audio" Version="$(SonoraPackageVersion)" />
+  </ItemGroup>
+
+  <ItemGroup Condition="$(TargetFramework.Contains('windows'))">
+    <PackageReference Include="Sonora.Audio.Windows" Version="$(SonoraPackageVersion)" />
+  </ItemGroup>
+
+</Project>

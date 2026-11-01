@@ -107,7 +107,19 @@ internal sealed class TrackDecodePipeline : IDisposable
         _pump.Start();
     }
 
+    /// <summary>
+    /// Stops the decode pump. May block up to two seconds waiting for the worker.
+    /// Callers must not hold the player command gate while invoking this.
+    /// </summary>
     public void StopPump()
+    {
+        StopPumpAsync().GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Asynchronously stops the decode pump. Callers must not hold the player command gate.
+    /// </summary>
+    public async Task StopPumpAsync()
     {
         var pump = _pump;
         _pump = null;
@@ -116,8 +128,14 @@ internal sealed class TrackDecodePipeline : IDisposable
             return;
         }
 
-        pump.StopAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
-        pump.Dispose();
+        try
+        {
+            await pump.StopAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+        }
+        finally
+        {
+            pump.Dispose();
+        }
     }
 
     public void Prime(TimeSpan primeDuration)
@@ -138,7 +156,21 @@ internal sealed class TrackDecodePipeline : IDisposable
         }
 
         _disposed = true;
+        // Prefer DisposeAsync when available; sync path stops the pump without holding player locks.
         StopPump();
+        Ring.Dispose();
+        Decoder.Dispose();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        await StopPumpAsync().ConfigureAwait(false);
         Ring.Dispose();
         Decoder.Dispose();
     }

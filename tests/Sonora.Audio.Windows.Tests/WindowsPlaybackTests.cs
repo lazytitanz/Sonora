@@ -6,7 +6,7 @@ namespace Sonora.Audio.Windows.Tests;
 
 public sealed class WindowsPlaybackTests
 {
-    [Fact]
+    [HardwareFact]
     [Trait("Category", "Hardware")]
     public async Task Wav_PlayCompletesNaturally()
     {
@@ -34,7 +34,7 @@ public sealed class WindowsPlaybackTests
         Assert.Equal(PlaybackState.Stopped, player.State);
     }
 
-    [Fact]
+    [HardwareFact]
     [Trait("Category", "Hardware")]
     public async Task M4a_PlayCompletesNaturally()
     {
@@ -62,7 +62,7 @@ public sealed class WindowsPlaybackTests
         Assert.Equal(PlaybackState.Stopped, player.State);
     }
 
-    [Fact]
+    [HardwareFact]
     [Trait("Category", "Hardware")]
     public async Task M4a_SeekDuringPlayback()
     {
@@ -73,6 +73,7 @@ public sealed class WindowsPlaybackTests
 
         Assert.True(player.Duration > TimeSpan.FromMilliseconds(500));
 
+        player.Volume = 0.1f;
         player.Play();
         await Task.Delay(80);
 
@@ -84,7 +85,7 @@ public sealed class WindowsPlaybackTests
         Assert.Equal(TimeSpan.Zero, player.Position);
     }
 
-    [Fact]
+    [HardwareFact]
     [Trait("Category", "Hardware")]
     public async Task Wav_SeekAndPositionsAdvance()
     {
@@ -93,6 +94,7 @@ public sealed class WindowsPlaybackTests
         using var player = engine.CreatePlayer();
         await player.LoadAsync(path);
 
+        player.Volume = 0.1f;
         player.Play();
         await Task.Delay(100);
         var mid = player.Position;
@@ -106,15 +108,31 @@ public sealed class WindowsPlaybackTests
         Assert.Equal(TimeSpan.Zero, player.Position);
     }
 
-    [Fact]
+    [HardwareFact]
+    [Trait("Category", "Hardware")]
+    public async Task SharedMode_LoadStopCycle_IsStable()
+    {
+        var path = FixtureHelper.EnsureToneWav(TimeSpan.FromMilliseconds(300));
+        using var engine = SonoraWindows.CreateEngine();
+        using var player = engine.CreatePlayer();
+
+        for (var i = 0; i < 3; i++)
+        {
+            await player.LoadAsync(path);
+            Assert.Equal(AudioOutputMode.Shared, player.EffectiveOutputMode);
+            player.Volume = 0.05f;
+            player.Play();
+            await Task.Delay(80);
+            player.Stop();
+            Assert.Equal(PlaybackState.Stopped, player.State);
+            Assert.Equal(TimeSpan.Zero, player.Position);
+        }
+    }
+
+    [HardwareFact]
     [Trait("Category", "Hardware")]
     public async Task Hardware_PlayAudibleSmoke()
     {
-        if (!ShouldRunHardwareTests())
-        {
-            return;
-        }
-
         var path = FixtureHelper.EnsureToneWav(TimeSpan.FromMilliseconds(400));
         using var engine = SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();
@@ -125,15 +143,10 @@ public sealed class WindowsPlaybackTests
         player.Stop();
     }
 
-    [Fact]
+    [HardwareFact]
     [Trait("Category", "Hardware")]
     public async Task Hardware_ExclusiveMode_ConfigureAndReturnToShared()
     {
-        if (!ShouldRunHardwareTests())
-        {
-            return;
-        }
-
         var path = FixtureHelper.EnsureToneWav(TimeSpan.FromMilliseconds(300));
         using var engine = SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();
@@ -162,7 +175,4 @@ public sealed class WindowsPlaybackTests
         Assert.Equal(AudioOutputMode.Shared, player.EffectiveOutputMode);
         Assert.Equal(PlaybackState.Paused, player.State);
     }
-
-    private static bool ShouldRunHardwareTests()
-        => string.Equals(Environment.GetEnvironmentVariable("SONORA_RUN_HARDWARE_TESTS"), "1", StringComparison.Ordinal);
 }

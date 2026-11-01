@@ -132,7 +132,7 @@ public sealed class FlacSeekTests
             440f);
     }
 
-    [Fact]
+    [HardwareFact]
     [Trait("Category", "Hardware")]
     public async Task Flac_Player_SeekWhilePlayingPausedStopped()
     {
@@ -163,7 +163,7 @@ public sealed class FlacSeekTests
         Assert.Equal(TimeSpan.Zero, player.Position);
     }
 
-    [Fact]
+    [HardwareFact]
     [Trait("Category", "Hardware")]
     public async Task Flac_Player_RapidSeeks_LastWins()
     {
@@ -184,7 +184,7 @@ public sealed class FlacSeekTests
         Assert.Equal(PlaybackState.Stopped, player.State);
     }
 
-    [Fact]
+    [HardwareFact]
     [Trait("Category", "Hardware")]
     public async Task Flac_Player_NaturalCompletion()
     {
@@ -209,7 +209,7 @@ public sealed class FlacSeekTests
         Assert.Equal(PlaybackState.Stopped, player.State);
     }
 
-    [Fact]
+    [HardwareFact]
     [Trait("Category", "Hardware")]
     public async Task Flac_Player_SeekNearEnd_WhilePaused_DoesNotComplete()
     {

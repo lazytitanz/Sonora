@@ -103,7 +103,24 @@ internal sealed class NAudioLimiterEffect : ILimiterEffect, IAudioEffectRuntime
             return;
         }
 
+        // Reject non-finite input so NaN/Inf cannot poison the look-ahead envelope or downstream PCM.
+        for (var i = 0; i < buffer.Length; i++)
+        {
+            if (!float.IsFinite(buffer[i]))
+            {
+                buffer[i] = 0f;
+            }
+        }
+
         _effect.Process(buffer);
+
+        for (var i = 0; i < buffer.Length; i++)
+        {
+            if (!float.IsFinite(buffer[i]))
+            {
+                buffer[i] = 0f;
+            }
+        }
     }
 
     public void Dispose()

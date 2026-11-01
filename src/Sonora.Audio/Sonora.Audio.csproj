@@ -18,6 +18,7 @@
     <InternalsVisibleTo Include="Sonora.Audio.Tests" />
     <InternalsVisibleTo Include="Sonora.Audio.Windows" />
     <InternalsVisibleTo Include="Sonora.Audio.Windows.Tests" />
+    <InternalsVisibleTo Include="Sonora.Benchmarks" />
   </ItemGroup>
 
   <ItemGroup>

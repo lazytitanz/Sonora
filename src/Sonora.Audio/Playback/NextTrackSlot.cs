@@ -149,19 +149,25 @@ internal sealed class NextTrackSlot
 
     public void Clear()
     {
-        TrackDecodePipeline? old;
+        TakeAndClear()?.Dispose();
+    }
+
+    /// <summary>
+    /// Clears the slot and returns any owned pipeline for disposal outside the player command gate.
+    /// </summary>
+    public TrackDecodePipeline? TakeAndClear()
+    {
         lock (_sync)
         {
             _generation++;
-            old = _pipeline;
+            var old = _pipeline;
             _pipeline = null;
             _path = null;
             _source = null;
             _failure = null;
             _state = NextTrackState.None;
+            return old;
         }
-
-        old?.Dispose();
     }
 
     /// <summary>
