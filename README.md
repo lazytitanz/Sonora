@@ -1,0 +1,219 @@
+# Sonora
+
+### A reliable .NET audio engine with a clean public API.
+
+**Independent, open-source C# playback for Windows apps — orchestration, buffering, and DSP without exposing NAudio types.**
+
+[![.NET 10](https://img.shields.io/badge/.NET-10-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/download)
+[![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue)](CHANGELOG.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+[Why Sonora?](#why-sonora) · [Quick start](#quick-start) · [Formats](#supported-audio-formats) · [DSP](#dsp-effects) · [Architecture](#how-it-works) · [Build](#build-and-test)
+
+---
+
+## Why Sonora?
+
+Sonora is a standalone audio engine for .NET applications. The Windows backend uses [NAudio](https://github.com/naudio/NAudio) with WASAPI shared-mode output, while Sonora owns playback state, bounded PCM buffering, decoding off the audio callback, and a per-player DSP rack.
+
+It is built for apps like [EMP](https://github.com/lazytitanz/EMP) but stays completely application-agnostic — no UI, playlists, or library scanning.
+
+| Goal | What that means |
+| --- | --- |
+| **Simple API** | Load, play, pause, seek, volume — minimal setup |
+| **Clean boundaries** | Platform-independent core; NAudio stays in `Sonora.Audio.Windows` |
+| **Predictable playback** | Deterministic state, resource disposal, and completion semantics |
+| **Real-time safe** | Decoding and file I/O stay off the WASAPI callback |
+| **Extensible DSP** | Equalizer, preamp, and limiter on a per-player effect rack |
+
+### At a glance
+
+- **.NET 10** — `Sonora.Audio` (`net10.0`) and `Sonora.Audio.Windows` (`net10.0-windows10.0.19041.0`)
+- **Wide format coverage** — WAV, AIFF, MP3, AAC, M4A, FLAC, WMA, ALAC, Ogg Vorbis, Ogg Opus, WebM audio
+- **Dual position tracking** — `Position` (audible estimate) and `BufferedPosition` (decode frontier)
+- **Live DSP** — EQ/preamp changes apply on the output path without waiting for the PCM buffer to drain
+- **MIT licensed** — packages prepared for NuGet (`Sonora.Audio`, `Sonora.Audio.Windows`)
+
+> [!NOTE]
+> Packages are not published to NuGet.org automatically during early development. Reference the projects or pack locally (see [Build and test](#build-and-test)).
+
+---
+
+## Quick start
+
+**Requirements:** Windows 10/11 and the [.NET 10 SDK](https://dotnet.microsoft.com/download).
+
+```csharp
+using Sonora.Audio;
+using Sonora.Audio.Windows;
+
+using var engine = SonoraWindows.CreateEngine();
+using var player = engine.CreatePlayer();
+
+await player.LoadAsync(@"C:\music\song.mp3");
+player.Volume = 0.75f;
+player.Play();
+
+Console.WriteLine(player.Position);          // estimated audible position
+Console.WriteLine(player.BufferedPosition);  // decode/buffer frontier
+Console.WriteLine(player.Duration);
+```
+
+### Playback controls
+
+| API | Behavior |
+| --- | --- |
+| `LoadAsync` | Opens a file; releases the previous source |
+| `Play` | Starts or resumes |
+| `Pause` | Preserves position |
+| `Stop` | Stops and resets to the beginning (does not raise completion) |
+| `Seek` | Seeks when the decoder supports it |
+| `Volume` | Linear gain in `[0, 1]` |
+
+**Events:** `StateChanged`, `PlaybackCompleted`, `ErrorOccurred`, `Underrun`. Raised on worker threads (not marshaled to a UI sync context).
+
+### Position accuracy
+
+- **`BufferedPosition`** — timeline of the latest sample written into the PCM ring buffer.
+- **`Position`** — estimated audible position (device clock when available, rebased across seeks).
+
+Shared-mode resampling, device padding, and underruns introduce error. Positions are suitable for UI scrubbers, but are **not** sample-accurate broadcast / lip-sync grade in 0.3.0.
+
+### Console sample
+
+```bash
+dotnet run --project samples/Sonora.ConsolePlayer -c Release -- path\to\file.mp3
+```
+
+---
+
+## Supported audio formats
+
+Formats are selected by container/header sniffing (not extension alone). Only formats that pass decode, seek, duration, and completion fixtures are claimed.
+
+| Format | Backend | Notes |
+| --- | --- | --- |
+| WAV | `WaveFileReader` | PCM |
+| AIFF / AIF | `AiffFileReader` | PCM (NAudio.Core; no extra package) |
+| MP3 | Media Foundation | |
+| ADTS AAC (`.aac`) | Media Foundation | |
+| M4A (AAC) | Media Foundation | MPEG-4 AAC |
+| M4A (ALAC) | Media Foundation | Apple Lossless in `.m4a` (Win10+) |
+| WMA | Media Foundation | ASF / WMA |
+| FLAC | Media Foundation | Seek is content-verified but not sample-accurate |
+| Ogg Vorbis | NVorbis + NAudio.Vorbis | Managed MIT |
+| Ogg Opus (`.opus`) | Concentus + Concentus.Oggfile | Managed MIT; MF does not open bare `.opus` reliably |
+| WebM (Opus / Vorbis audio) | Media Foundation | Fixture-verified on Windows 10/11 with stock MF; OS codec availability can vary |
+
+---
+
+## DSP effects
+
+Per-player effect rack via `player.Effects`. Processing runs **after** the PCM ring on the output path so EQ/preamp changes apply immediately. NAudio implementations stay inside `Sonora.Audio.Windows`.
+
+```csharp
+using Sonora.Audio.DSP;
+using Sonora.Audio.Windows;
+
+using var engine = SonoraWindows.CreateEngine();
+using var player = engine.CreatePlayer();
+await player.LoadAsync(@"C:\music\song.flac");
+
+var eq = player.Effects.AddEqualizer(); // default six-band
+eq.SetBandGain(0, 3f);
+eq.SetBandGain(5, -2f);
+eq.ApplyPreset(EqualizerPresets.BassBoost);
+
+player.Effects.AddPreamp(-3f);   // dB; distinct from player.Volume
+player.Effects.AddLimiter();    // optional clipping protection
+
+player.Play();
+```
+
+| Effect | Notes |
+| --- | --- |
+| **Equalizer** | Configurable bands (default 6); peaking / low-shelf / high-shelf; presets in `EqualizerPresets` |
+| **Preamp** | Gain in dB; distinct from `player.Volume` |
+| **Limiter** | Conservative peak limiting; zero lookahead by default |
+
+Settings persist across track changes; filter state resets on seek/stop/load. Structural chain edits use immutable snapshots; parameter updates apply on the audio thread at block boundaries.
+
+<details>
+<summary>Limiter limitations</summary>
+
+Zero-lookahead limiting is not a true look-ahead brick-wall or true-peak limiter. Extreme EQ boosts can still sound compressed or briefly over. Prefer sensible preamp/EQ gains rather than relying on the limiter alone.
+
+</details>
+
+---
+
+## How it works
+
+```text
+LoadAsync → decoder factory → format sniff → IAudioDecoder
+  → decode pump → [optional IAudioProcessor] → Volume → PCM ring
+  → output pull → player EffectRack → WASAPI (shared mode)
+```
+
+| Layer | Role |
+| --- | --- |
+| `Sonora.Audio` | Public API, player, ring buffer, decode pump, DSP contracts |
+| `Sonora.Audio.Windows` | NAudio/WASAPI output, Media Foundation + managed codecs, NAudio-backed effects |
+
+More detail: [docs/architecture.md](docs/architecture.md) · [docs/getting-started.md](docs/getting-started.md)
+
+---
+
+## Project structure
+
+```text
+Sonora/
+├── src/Sonora.Audio              # Platform-independent core
+├── src/Sonora.Audio.Windows      # NAudio / WASAPI backend
+├── tests/                        # Unit and Windows tests
+├── samples/Sonora.ConsolePlayer  # Interactive demo
+└── docs/                         # Architecture and getting started
+```
+
+---
+
+## Build and test
+
+```bash
+dotnet build Sonora.slnx -c Release
+dotnet test Sonora.slnx -c Release --filter "Category!=Hardware"
+dotnet pack src/Sonora.Audio/Sonora.Audio.csproj -c Release
+dotnet pack src/Sonora.Audio.Windows/Sonora.Audio.Windows.csproj -c Release
+```
+
+Hardware-dependent tests run only when `SONORA_RUN_HARDWARE_TESTS=1`.
+
+### Installation (local packages)
+
+```bash
+dotnet add package Sonora.Audio
+dotnet add package Sonora.Audio.Windows
+```
+
+---
+
+## Current limitations
+
+- Windows only for output (WASAPI shared mode; default device only)
+- No exclusive-mode WASAPI, gapless playback, playlists, metadata, or network streaming
+- FLAC / Media Foundation seeking is reliable for playback but not guaranteed sample-accurate
+- Bare Ogg Opus uses managed Concentus (not MF); WebM depends on host Media Foundation codecs
+- Zero-lookahead limiting can allow brief overs under extreme boosts
+
+## Roadmap
+
+- Stronger WebM portability across Windows SKUs
+- Output device enumeration and selection
+- Additional DSP effects (compressor, reverb, …) on the existing rack
+- Gapless / crossfade
+- Additional platform backends
+
+## License
+
+Sonora is licensed under the [MIT License](LICENSE).

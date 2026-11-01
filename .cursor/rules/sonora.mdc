@@ -1,0 +1,504 @@
+---
+alwaysApply: true
+---
+# Sonora — Development Rules
+
+## Project Identity
+
+Sonora is an independent, open-source .NET audio engine written in C#.
+
+Its purpose is to provide a reliable, performant, extensible, and developer-friendly audio library for .NET applications.
+
+Sonora uses NAudio for Windows-specific audio functionality while maintaining its own public API, playback orchestration, and processing architecture.
+
+Sonora is initially intended for use in EMP, a Windows desktop music player, but must remain completely independent of EMP.
+
+### Technology Stack
+
+- Language: C#
+- Framework: .NET 10
+- Audio foundation: NAudio
+- Initial platform: Windows 10/11
+- Package distribution: NuGet
+- License: MIT
+- Testing: xUnit
+- Dependency management: Central Package Management
+
+## 1. Core Principles
+
+Follow these principles for every implementation:
+
+1. **Correctness before optimization.** Reliable playback and predictable behavior are more important than premature performance improvements.
+2. **Simple public API.** Common operations should require minimal configuration.
+3. **Minimal dependencies.** Prefer built-in .NET functionality and existing project dependencies.
+4. **Clear separation of concerns.** Keep playback, decoding, output, processing, and application logic separate.
+5. **Extensibility without overengineering.** Introduce abstractions when they solve real problems.
+6. **Deterministic resource management.** Audio streams, native resources, and output devices must be released correctly.
+7. **Maintain backward compatibility.** Avoid unnecessary changes to established public APIs.
+8. **No speculative implementations.** Do not create placeholder classes or unused features for hypothetical requirements.
+
+Sonora should remain lightweight and approachable without sacrificing engineering quality.
+
+## 2. Repository Architecture
+
+The solution contains these primary projects:
+
+- `Sonora.Audio` — Platform-independent core library.
+- `Sonora.Audio.Windows` — Windows backend using NAudio.
+- `Sonora.Audio.Tests` — Platform-independent unit tests.
+- `Sonora.Audio.Windows.Tests` — Windows-specific tests.
+- `Sonora.ConsolePlayer` — Example console application.
+
+### Dependency Direction
+
+The dependency structure must remain:
+
+`Sonora.Audio.Windows` → `Sonora.Audio`
+
+`Sonora.ConsolePlayer` → `Sonora.Audio.Windows` and `Sonora.Audio`
+
+`Sonora.Audio` must never reference `Sonora.Audio.Windows`.
+
+The core library must not depend on NAudio, WASAPI, WinForms, WPF, WebView2, or other Windows-specific APIs.
+
+Platform-specific functionality belongs in the appropriate backend.
+
+Never introduce EMP-specific functionality into Sonora.
+
+## 3. C# Coding Standards
+
+Use modern, idiomatic C# and .NET conventions.
+
+- Enable nullable reference types.
+- Use file-scoped namespaces.
+- Prefer clear, descriptive names.
+- Use PascalCase for public types, methods, and properties.
+- Use camelCase for parameters and local variables.
+- Prefix private instance fields with `_`.
+- Prefer `readonly` fields when possible.
+- Prefer immutable data structures for configuration and value objects.
+- Use `sealed` for classes not intended for inheritance.
+- Use `var` when the type is obvious from context.
+- Avoid unnecessary inheritance.
+- Avoid excessive use of reflection.
+- Avoid magic numbers and unexplained constants.
+- Keep methods focused on one responsibility.
+- Prefer composition over inheritance.
+
+Use `async`/`await` for genuinely asynchronous operations.
+
+Do not wrap synchronous operations in `Task.Run` merely to make an API appear asynchronous.
+
+Avoid `async void` except where required by event-handler signatures.
+
+Support `CancellationToken` for cancellable asynchronous operations.
+
+Do not use `.Result`, `.Wait()`, or other synchronous blocking patterns on asynchronous operations.
+
+Do not introduce unsafe code unless justified by measurable performance requirements.
+
+## 4. Public API Design
+
+Sonora's public API is a product in its own right.
+
+Design APIs for developers who may have no knowledge of NAudio or Windows audio internals.
+
+### Requirements
+
+- Keep common playback operations intuitive.
+- Use consistent method and property naming.
+- Expose meaningful exceptions and events.
+- Avoid exposing implementation-specific details.
+- Document thread-safety expectations.
+- Document ownership and disposal responsibilities.
+- Prefer strongly typed options over ambiguous parameter combinations.
+- Use sensible defaults.
+- Avoid requiring consumers to configure unnecessary services.
+
+Do not expose NAudio-specific types through public APIs unless explicitly approved as an intentional integration point.
+
+Do not introduce breaking public API changes without explaining the reason and identifying affected consumers.
+
+Treat public API changes as deliberate design decisions.
+
+## 5. Playback State Management
+
+Playback behavior must be deterministic.
+
+Define and enforce valid transitions between states such as:
+
+- Stopped
+- Playing
+- Paused
+- Buffering
+
+Additional states may be introduced when necessary.
+
+### Required Behavior
+
+- Play must not create duplicate playback sessions.
+- Pause must preserve playback position.
+- Stop must stop playback and reset position.
+- Seek must validate requested positions.
+- Loading another source must release the previous source.
+- Natural playback completion must be distinguishable from an explicit stop.
+- Playback completion must not be raised multiple times for the same completion.
+- Disposed players must reject invalid operations predictably.
+- Failed operations must leave the player in a documented, consistent state.
+
+Handle rapid sequences of commands safely.
+
+Do not assume playback commands are always called from a single thread.
+
+Use cancellation, serialization, or other appropriate synchronization strategies to prevent stale asynchronous operations from overwriting newer state.
+
+## 6. Real-Time Audio Requirements
+
+Audio processing has strict timing requirements.
+
+The audio-critical path must be designed to minimize unpredictable latency.
+
+### Avoid in Real-Time Audio Callbacks
+
+- Disk or network I/O
+- Blocking locks
+- Thread sleeps
+- Waiting on tasks
+- Unbounded loops
+- Synchronous logging
+- UI operations
+- Event handlers that execute arbitrary consumer code
+- Avoidable heap allocations
+- Expensive resource initialization
+
+Prefer preallocated buffers and bounded processing.
+
+Use `Span<T>`, `Memory<T>`, `ArrayPool<T>`, and SIMD where they provide a clear benefit.
+
+Do not assume pooled memory is safe to reuse until all consumers have finished accessing it.
+
+Do not perform arbitrary user callbacks directly on audio-critical threads.
+
+### Performance Policy
+
+Do not optimize blindly.
+
+When introducing performance-oriented changes:
+
+1. Identify the bottleneck.
+2. Establish a baseline.
+3. Implement the improvement.
+4. Measure the result.
+5. Confirm correctness has not regressed.
+
+Performance improvements must not compromise predictable behavior or maintainability.
+
+## 7. Audio Formats and Decoding
+
+Keep decoding separate from playback and output.
+
+Decoders must expose sufficient information about the decoded audio format.
+
+Prefer 32-bit floating-point PCM for Sonora's internal processing pipeline.
+
+Handle sample-rate conversion, channel conversion, and output format negotiation explicitly where required.
+
+Do not assume all audio devices accept the same format.
+
+Do not claim a codec is supported without a working, verified implementation.
+
+### Decoder Requirements
+
+- Correctly report format information.
+- Handle invalid and truncated files.
+- Handle end-of-stream correctly.
+- Support seeking where available.
+- Report unsupported operations clearly.
+- Release file handles and native resources.
+- Avoid leaking implementation-specific exceptions where meaningful translation is appropriate.
+
+Do not implement complex codecs from scratch unless explicitly required.
+
+Use established decoding functionality with compatible licenses.
+
+## 8. NAudio Integration
+
+NAudio is Sonora's initial Windows audio foundation.
+
+Use NAudio for appropriate Windows-specific functionality, including WASAPI integration and supported decoding operations.
+
+### Rules
+
+- Keep NAudio dependencies inside `Sonora.Audio.Windows`.
+- Encapsulate NAudio implementation details.
+- Do not expose NAudio types in Sonora's platform-independent public contracts.
+- Handle NAudio events and callbacks carefully.
+- Translate relevant backend failures into useful Sonora errors.
+- Dispose NAudio resources deterministically.
+- Verify device and format compatibility.
+- Document backend-specific limitations.
+
+Do not rewrite functionality already provided reliably by NAudio without a clear technical justification.
+
+## 9. Threading and Concurrency
+
+Audio playback involves application threads, worker threads, and audio callbacks.
+
+Clearly define ownership and synchronization responsibilities.
+
+- Avoid shared mutable state where possible.
+- Keep synchronization scope small.
+- Never hold locks while invoking external event handlers.
+- Avoid deadlocks between playback commands and audio callbacks.
+- Prevent race conditions during load, stop, seek, and disposal.
+- Ensure canceled operations cannot update obsolete player state.
+- Avoid unnecessary background polling.
+- Do not assume events are delivered on the UI thread.
+
+Any change involving concurrency must include tests for relevant race conditions.
+
+## 10. Memory and Resource Management
+
+Audio engines frequently manage large buffers and native resources.
+
+Use deterministic disposal and clear ownership rules.
+
+- Implement `IDisposable` where appropriate.
+- Use `IAsyncDisposable` when asynchronous cleanup is genuinely required.
+- Dispose streams, decoders, and output devices.
+- Avoid unnecessary copying of PCM buffers.
+- Avoid retaining large buffers longer than necessary.
+- Ensure pooled buffers are returned exactly once.
+- Prevent use-after-disposal.
+- Avoid unnecessary finalizers.
+- Ensure partial initialization failures release previously acquired resources.
+
+Do not rely on garbage collection to release time-sensitive native audio resources.
+
+## 11. DSP Architecture
+
+Sonora will eventually support equalizers, gain processing, compressors, limiters, spectrum analysis, and other effects.
+
+Design the audio pipeline to accommodate these capabilities without prematurely implementing them.
+
+### DSP Rules
+
+- Keep DSP algorithms independent of Windows-specific APIs.
+- Prefer reusable processors operating on PCM data.
+- Define channel layout and sample format expectations.
+- Avoid allocations inside processing methods.
+- Ensure processors handle empty and partial buffers.
+- Avoid introducing clipping unintentionally.
+- Preserve numerical stability.
+- Test DSP algorithms with deterministic input signals.
+
+Do not introduce a complex processing graph until a real use case requires it.
+
+## 12. Error Handling
+
+Errors must be useful and predictable.
+
+- Validate public API arguments.
+- Throw appropriate .NET exceptions for programming errors.
+- Distinguish unsupported formats from invalid files.
+- Distinguish decoding errors from output errors.
+- Preserve underlying exception information when useful.
+- Do not silently swallow failures.
+- Do not use exceptions for normal playback state transitions.
+- Avoid throwing exceptions across native callback boundaries.
+- Keep error reporting safe for multithreaded applications.
+
+A failed operation must not leave Sonora in an undefined state.
+
+## 13. Testing Requirements
+
+Every meaningful behavior change should include appropriate automated tests.
+
+Use xUnit.
+
+### Unit Tests
+
+Test core behavior using fake decoders and output implementations.
+
+Cover:
+
+- Playback state transitions
+- Repeated commands
+- Seeking boundaries
+- Volume validation
+- Cancellation
+- Concurrent loading
+- Natural completion
+- Explicit stopping
+- Error propagation
+- Disposal
+- Resource ownership
+
+### Audio Tests
+
+Use small, deterministic, legally distributable audio fixtures.
+
+Test:
+
+- PCM sample accuracy
+- Audio format handling
+- End-of-stream behavior
+- Decoder failures
+- Buffer boundaries
+- DSP correctness when applicable
+
+### Integration Tests
+
+Windows-specific tests may use real audio devices.
+
+Separate hardware-dependent tests from normal CI tests.
+
+Do not allow missing audio hardware to cause unrelated unit tests to fail.
+
+Never introduce tests that require copyrighted commercial music or external network access.
+
+## 14. Dependencies and Security
+
+Keep runtime dependencies minimal.
+
+- Prefer .NET built-in functionality.
+- Use Central Package Management.
+- Pin dependency versions appropriately.
+- Review package licenses.
+- Avoid abandoned or poorly maintained packages.
+- Do not add packages solely to simplify trivial code.
+- Keep development-only dependencies out of runtime packages.
+- Enable NuGet vulnerability auditing.
+- Do not suppress security warnings without justification.
+
+Explain the reason for adding any new runtime dependency.
+
+## 15. Documentation
+
+Public APIs must have useful XML documentation.
+
+Documentation should explain behavior rather than repeat method names.
+
+Document:
+
+- Parameters and return values
+- Exceptions
+- Thread-safety expectations
+- Resource ownership
+- Platform restrictions
+- Supported audio formats
+- Important limitations
+
+Update README and relevant documentation when behavior changes.
+
+Examples must compile against the actual implemented API.
+
+Do not document planned functionality as if it already exists.
+
+## 16. NuGet and Versioning
+
+Sonora is intended for public NuGet distribution.
+
+Use Semantic Versioning.
+
+Before version 1.0.0, API changes are permitted but should still be deliberate and documented.
+
+- Maintain accurate package metadata.
+- Generate XML documentation.
+- Support Source Link.
+- Produce symbol packages.
+- Maintain a CHANGELOG.
+- Avoid unnecessary breaking changes.
+- Do not publish packages automatically without explicit approval.
+- Do not hardcode machine-specific paths or configuration.
+
+Keep public package dependencies accurate.
+
+## 17. Git and Repository Hygiene
+
+- Keep commits focused and descriptive.
+- Do not commit build output.
+- Do not commit temporary audio files.
+- Do not commit local IDE state.
+- Do not commit secrets or credentials.
+- Do not modify unrelated files.
+- Preserve existing project conventions unless there is a good reason to change them.
+- Keep sample applications separate from production libraries.
+
+Do not introduce unrelated formatting changes while implementing a feature.
+
+## 18. Cursor Development Workflow
+
+Before implementing a significant feature:
+
+1. Inspect relevant existing code.
+2. Identify the affected projects and dependencies.
+3. Explain the proposed implementation.
+4. Identify concurrency, performance, and compatibility risks.
+5. Present a plan when the change is substantial.
+6. Wait for approval when explicitly requested or when the change significantly alters architecture.
+
+During implementation:
+
+1. Make focused changes.
+2. Follow existing naming and organizational conventions.
+3. Avoid speculative features.
+4. Add meaningful tests.
+5. Update documentation when necessary.
+6. Keep the solution buildable.
+
+After implementation:
+
+1. Build affected projects.
+2. Run relevant tests.
+3. Verify public API compatibility.
+4. Review resource management.
+5. Review threading implications.
+6. Summarize changes.
+7. Report any limitations or unresolved issues.
+
+Never claim tests passed unless they were actually executed successfully.
+
+Do not claim functionality is complete when only interfaces or placeholders exist.
+
+## 19. EMP Compatibility
+
+EMP is Sonora's initial real-world consumer.
+
+However, Sonora must remain application-independent.
+
+Do not introduce:
+
+- EMP-specific classes
+- WebView2 dependencies
+- Music library scanning
+- Playlist management
+- Lyrics retrieval
+- Application UI components
+- EMP-specific configuration formats
+
+Provide generic playback functionality that EMP and other applications can consume.
+
+When evaluating an API decision, consider whether it would be understandable and useful to a developer who has never heard of EMP.
+
+## 20. Final Engineering Standard
+
+Treat Sonora as production-quality library software.
+
+Every implementation should aim to be:
+
+- Correct
+- Reliable
+- Maintainable
+- Testable
+- Efficient
+- Extensible
+- Well-documented
+- Easy to consume
+
+Do not prioritize cleverness over clarity.
+
+Do not introduce unnecessary architectural complexity.
+
+Build a dependable audio engine first, then expand its capabilities through carefully designed features.
+```

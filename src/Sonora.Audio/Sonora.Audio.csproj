@@ -1,0 +1,23 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Sonora.Audio</RootNamespace>
+    <AssemblyName>Sonora.Audio</AssemblyName>
+    <Description>Platform-independent core of the Sonora audio engine.</Description>
+    <PackageId>Sonora.Audio</PackageId>
+    <IsPackable>true</IsPackable>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Sonora.Audio.Tests" />
+    <InternalsVisibleTo Include="Sonora.Audio.Windows" />
+    <InternalsVisibleTo Include="Sonora.Audio.Windows.Tests" />
+  </ItemGroup>
+
+</Project>

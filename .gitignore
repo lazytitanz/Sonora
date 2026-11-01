@@ -1,0 +1,55 @@
+## Build
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Ll]og/
+[Ll]ogs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+*.DotSettings.user
+
+## NuGet
+*.nupkg
+*.snupkg
+artifacts/
+**/packages/*
+!**/packages/build/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+## Test / coverage
+TestResults/
+coverage*
+*.coverage
+*.coveragexml
+
+## OS / IDE
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+## Local / temp audio
+*.tmp
+*.temp
+/local/
+/tmp/
+
+## Local tooling (ffmpeg downloads, probe scratch)
+/tools/
+
+## Local assets (not part of the library)
+/img/
+
+## Secrets
+*.pfx
+*.snk
+.env
+.env.*
