@@ -278,7 +278,11 @@ internal class FakeAudioOutput : IAudioOutput
                     return;
                 }
 
-                Thread.Sleep(1);
+                // Wake immediately on cancel/shutdown so Join during switch cannot stall under load.
+                if (token.WaitHandle.WaitOne(1))
+                {
+                    return;
+                }
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)

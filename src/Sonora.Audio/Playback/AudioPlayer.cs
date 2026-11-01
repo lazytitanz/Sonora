@@ -1185,10 +1185,30 @@ public sealed class AudioPlayer : IDisposable
             }
 
             var kind = OutputFailureHelpers.KindOf(error);
+            if (kind == AudioOutputFailureKind.Unspecified)
+            {
+                // Walk inners (e.g. factory failure wrapped by teardown).
+                for (var inner = error.InnerException; inner is not null; inner = inner.InnerException)
+                {
+                    kind = OutputFailureHelpers.KindOf(inner);
+                    if (kind != AudioOutputFailureKind.Unspecified)
+                    {
+                        break;
+                    }
+                }
+            }
+
             if (kind != AudioOutputFailureKind.Unspecified
                 && kind != AudioOutputFailureKind.ShutdownFailed)
             {
                 _outputFallbackReason = OutputFailureHelpers.ToFallbackReason(kind);
+            }
+            else if (_outputConfiguration.Mode == AudioOutputMode.Exclusive
+                     && kind == AudioOutputFailureKind.ShutdownFailed)
+            {
+                // Quiesce failure during an exclusive rebind still leaves exclusive preferred;
+                // surface a classified reason so apps can retry / decide on fallback.
+                _outputFallbackReason = ExclusiveFallbackReason.InitializationFailed;
             }
 
             // Keep _hasSource, DSP, next-track selection, and recovery intent so apps can retry.
@@ -1490,6 +1510,13 @@ public sealed class AudioPlayer : IDisposable
 
             // If a next track became ready after EOS signaling started, do not complete the session.
             if (_next.State == NextTrackState.Ready)
+            {
+                return;
+            }
+
+            // Ignore spurious device EOS at a gapless A|B boundary: the sample source is still live
+            // after next was promoted (slot empty) but before the session has truly ended.
+            if (_sampleSource is { IsEndOfStream: false })
             {
                 return;
             }

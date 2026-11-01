@@ -67,13 +67,14 @@ public class OutputModeTests
         player.Play();
         player.Pause();
 
-        await Assert.ThrowsAsync<AudioOutputException>(() => player.ConfigureOutputAsync(
+        var exclusiveError = await Assert.ThrowsAsync<AudioOutputException>(() => player.ConfigureOutputAsync(
             new AudioOutputConfiguration
             {
                 Mode = AudioOutputMode.Exclusive,
                 ExclusiveFallback = ExclusiveModeFallback.None,
             }));
 
+        Assert.Equal(AudioOutputFailureKind.DeviceBusy, exclusiveError.FailureKind);
         Assert.True(player.HasSource);
         Assert.Equal(PlaybackState.Stopped, player.State);
         Assert.Equal(OutputRecoveryIntent.RemainPaused, player.OutputRecoveryIntent);
