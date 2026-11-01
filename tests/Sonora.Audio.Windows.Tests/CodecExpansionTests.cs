@@ -17,7 +17,6 @@ public sealed class CodecExpansionTests
     [InlineData("ogg")]
     [InlineData("opus")]
     [InlineData("webm-opus")]
-    [InlineData("webm-vorbis")]
     public void Format_SniffDecodeSeekAndDuration(string formatKey)
     {
         var path = ResolveFixture(formatKey);
@@ -39,6 +38,7 @@ public sealed class CodecExpansionTests
     }
 
     [Theory]
+    [Trait("Category", "Hardware")]
     [InlineData("aiff")]
     [InlineData("aac")]
     [InlineData("wma")]
@@ -48,7 +48,6 @@ public sealed class CodecExpansionTests
     [InlineData("webm-opus")]
     public async Task Format_NaturalCompletion(string formatKey)
     {
-        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
         var path = ResolveFixture(formatKey);
         using var engine = SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();
@@ -81,7 +80,6 @@ public sealed class CodecExpansionTests
         "ogg" => FixtureHelper.EnsureToneOggVorbis(),
         "opus" => FixtureHelper.EnsureToneOpus(),
         "webm-opus" => FixtureHelper.EnsureToneWebmOpus(),
-        "webm-vorbis" => FixtureHelper.EnsureToneWebmVorbis(),
         _ => throw new ArgumentOutOfRangeException(nameof(formatKey)),
     };
 
@@ -94,7 +92,6 @@ public sealed class CodecExpansionTests
         "ogg" => AudioContainerKind.OggVorbis,
         "opus" => AudioContainerKind.OggOpus,
         "webm-opus" => AudioContainerKind.WebM,
-        "webm-vorbis" => AudioContainerKind.WebM,
         _ => throw new ArgumentOutOfRangeException(nameof(formatKey)),
     };
 }

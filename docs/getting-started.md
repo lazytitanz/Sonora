@@ -72,6 +72,6 @@ Effects process after the PCM buffer so slider changes are audible immediately. 
 
 ## Supported formats
 
-On Windows, Sonora supports WAV, AIFF, MP3, ADTS AAC, M4A (AAC and ALAC), WMA, FLAC, Ogg Vorbis, Ogg Opus, and WebM audio (Opus/Vorbis) when the host can decode them. See the README format table for backends and caveats.
+On Windows, Sonora supports WAV, AIFF, MP3, ADTS AAC, M4A (AAC and ALAC), WMA, FLAC, Ogg Vorbis, Ogg Opus, and WebM Opus when the host can decode them. See the README format table for backends and caveats.
 
 FLAC / Media Foundation seeking is fixture-verified for correct audio content after seeks, but positioning is not guaranteed to be sample-accurate.

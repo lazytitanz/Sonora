@@ -31,7 +31,7 @@ All notable changes to Sonora will be documented in this file.
 - ADTS AAC (`.aac`), WMA, and M4A (ALAC) via Media Foundation (fixture-verified)
 - Ogg Vorbis via **NVorbis** + **NAudio.Vorbis** (MIT, managed)
 - Ogg Opus via **Concentus** + **Concentus.Oggfile** (MIT, managed)
-- WebM audio (Opus / Vorbis) via Media Foundation when the host OS demuxes/decodes the file
+- WebM Opus via Media Foundation when the host OS demuxes/decodes the file (WebM Vorbis not claimed)
 - Shared `WaveStreamAudioDecoder` adapter for WaveStream-backed formats
 - Codec expansion fixtures and decode/seek/completion tests
 

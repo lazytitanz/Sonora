@@ -133,9 +133,9 @@ public sealed class FlacSeekTests
     }
 
     [Fact]
+    [Trait("Category", "Hardware")]
     public async Task Flac_Player_SeekWhilePlayingPausedStopped()
     {
-        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
         var path = FixtureHelper.EnsureSegmentedFlac(SegmentMs);
         using var engine = SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();
@@ -164,9 +164,9 @@ public sealed class FlacSeekTests
     }
 
     [Fact]
+    [Trait("Category", "Hardware")]
     public async Task Flac_Player_RapidSeeks_LastWins()
     {
-        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
         var path = FixtureHelper.EnsureSegmentedFlac(SegmentMs);
         using var engine = SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();
@@ -185,9 +185,9 @@ public sealed class FlacSeekTests
     }
 
     [Fact]
+    [Trait("Category", "Hardware")]
     public async Task Flac_Player_NaturalCompletion()
     {
-        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
         // Short single-tone FLAC for timely completion.
         var path = FixtureHelper.EnsureToneFlac(TimeSpan.FromMilliseconds(220));
         using var engine = SonoraWindows.CreateEngine();
@@ -210,9 +210,9 @@ public sealed class FlacSeekTests
     }
 
     [Fact]
+    [Trait("Category", "Hardware")]
     public async Task Flac_Player_SeekNearEnd_WhilePaused_DoesNotComplete()
     {
-        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
         var path = FixtureHelper.EnsureSegmentedFlac(SegmentMs);
         using var engine = SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();

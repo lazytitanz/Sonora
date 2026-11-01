@@ -104,7 +104,7 @@ Formats are selected by container/header sniffing (not extension alone). Only fo
 | FLAC | Media Foundation | Seek is content-verified but not sample-accurate |
 | Ogg Vorbis | NVorbis + NAudio.Vorbis | Managed MIT |
 | Ogg Opus (`.opus`) | Concentus + Concentus.Oggfile | Managed MIT; MF does not open bare `.opus` reliably |
-| WebM (Opus / Vorbis audio) | Media Foundation | Fixture-verified on Windows 10/11 with stock MF; OS codec availability can vary |
+| WebM (Opus) | Media Foundation | Fixture-verified; WebM Vorbis is not claimed (MF codecs vary by Windows SKU) |
 
 ---
 
@@ -203,7 +203,8 @@ dotnet add package Sonora.Audio.Windows
 - Windows only for output (WASAPI shared mode; default device only)
 - No exclusive-mode WASAPI, gapless playback, playlists, metadata, or network streaming
 - FLAC / Media Foundation seeking is reliable for playback but not guaranteed sample-accurate
-- Bare Ogg Opus uses managed Concentus (not MF); WebM depends on host Media Foundation codecs
+- Bare Ogg Opus uses managed Concentus (not MF); WebM Opus depends on host Media Foundation codecs
+- WASAPI playback integration tests are tagged `Hardware` (skipped in default CI)
 - Zero-lookahead limiting can allow brief overs under extreme boosts
 
 ## Roadmap

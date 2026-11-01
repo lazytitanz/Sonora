@@ -6,9 +6,9 @@ namespace Sonora.Audio.Windows.Tests;
 public sealed class WindowsPlaybackTests
 {
     [Fact]
+    [Trait("Category", "Hardware")]
     public async Task Wav_PlayCompletesNaturally()
     {
-        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
         var path = FixtureHelper.EnsureToneWav(TimeSpan.FromMilliseconds(200));
         using var engine = SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();
@@ -34,9 +34,9 @@ public sealed class WindowsPlaybackTests
     }
 
     [Fact]
+    [Trait("Category", "Hardware")]
     public async Task M4a_PlayCompletesNaturally()
     {
-        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
         var path = FixtureHelper.EnsureToneM4a(TimeSpan.FromMilliseconds(250));
         using var engine = SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();
@@ -62,9 +62,9 @@ public sealed class WindowsPlaybackTests
     }
 
     [Fact]
+    [Trait("Category", "Hardware")]
     public async Task M4a_SeekDuringPlayback()
     {
-        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
         var path = FixtureHelper.EnsureToneM4a(TimeSpan.FromMilliseconds(800));
         using var engine = SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();
@@ -84,9 +84,9 @@ public sealed class WindowsPlaybackTests
     }
 
     [Fact]
+    [Trait("Category", "Hardware")]
     public async Task Wav_SeekAndPositionsAdvance()
     {
-        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
         var path = FixtureHelper.EnsureToneWav(TimeSpan.FromMilliseconds(800));
         using var engine = SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();

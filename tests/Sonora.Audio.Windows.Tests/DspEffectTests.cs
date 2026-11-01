@@ -221,9 +221,9 @@ public sealed class DspEffectTests
     }
 
     [Fact]
-    public async Task PlayerEffects_PreserveAcrossReload_ResetOnSeek()
+    public async Task PlayerEffects_PreserveAcrossReloadAndSeek()
     {
-        WindowsAudioEnvironment.SkipIfNoWasapiOutput();
+        // Load/seek only — no WASAPI Play (keeps this test CI-safe).
         using var engine = Sonora.Audio.Windows.SonoraWindows.CreateEngine();
         using var player = engine.CreatePlayer();
         var eq = player.Effects.AddEqualizer();
@@ -233,10 +233,11 @@ public sealed class DspEffectTests
         await player.LoadAsync(path);
         Assert.Equal(3f, eq.GetBandGain(0));
 
-        player.Play();
         player.Seek(TimeSpan.FromMilliseconds(100));
         Assert.Equal(3f, eq.GetBandGain(0));
-        player.Stop();
+
+        await player.LoadAsync(path);
+        Assert.Equal(3f, eq.GetBandGain(0));
     }
 
     private static float[] Tone(float hz, AudioFormat format, float amplitude, int frames)

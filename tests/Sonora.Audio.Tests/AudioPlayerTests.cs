@@ -38,7 +38,8 @@ public sealed class AudioPlayerTests
     [Fact]
     public async Task Stop_DoesNotRaisePlaybackCompleted()
     {
-        var decoder = FakeAudioDecoder.CreateTone(Format, TimeSpan.FromMilliseconds(400));
+        // Long enough that natural EOS cannot race Stop on a fast CI agent.
+        var decoder = FakeAudioDecoder.CreateTone(Format, TimeSpan.FromSeconds(5));
         using var engine = CreateEngine(decoder);
         using var player = engine.CreatePlayer();
         var completed = 0;
@@ -48,9 +49,9 @@ public sealed class AudioPlayerTests
         player.Play();
         await Task.Delay(30);
         player.Stop();
-        await Task.Delay(50);
+        await Task.Delay(100);
 
-        Assert.Equal(0, completed);
+        Assert.Equal(0, Volatile.Read(ref completed));
     }
 
     [Fact]
