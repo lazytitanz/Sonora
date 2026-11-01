@@ -9,6 +9,7 @@
     <PackageVersion Include="NVorbis" Version="0.10.5" />
     <PackageVersion Include="Concentus" Version="2.2.2" />
     <PackageVersion Include="Concentus.Oggfile" Version="1.0.7" />
+    <PackageVersion Include="z440.atl.core" Version="7.19.0" />
     <!-- Testing -->
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageVersion Include="xunit" Version="2.9.3" />

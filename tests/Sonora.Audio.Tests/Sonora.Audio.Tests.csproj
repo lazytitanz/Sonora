@@ -19,10 +19,19 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
+    <!-- Fixture tagging only; production metadata API does not expose ATL types. -->
+    <PackageReference Include="z440.atl.core" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Sonora.Audio\Sonora.Audio.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Shared synthetic tones for format-matrix metadata verification (Linux CI). -->
+    <None Include="..\Sonora.Audio.Windows.Tests\CommittedFixtures\*"
+          Link="CommittedFixtures\%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

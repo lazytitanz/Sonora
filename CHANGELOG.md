@@ -2,6 +2,30 @@
 
 All notable changes to Sonora will be documented in this file.
 
+## 0.8.0 — 2026-11-01
+
+### Added
+
+- Platform-neutral metadata API (`Sonora.Audio.Metadata`): `AudioTrackMetadata`, `AudioArtwork`, `IAudioMetadataReader`, `AudioMetadataReader`
+- Opt-in embedded artwork via `AudioMetadataReadOptions.IncludeArtwork` (default `false` for library scans)
+- Separate `ReadArtwork` path that avoids a full tag `Update` when ATL allows picture-focused reload
+- `SonoraWindows.CreateMetadataReader()` convenience factory (same managed reader; no WASAPI)
+- ReplayGain, MusicBrainz IDs, lyrics (unsynchronized plain text), compilation flag, and bounded `AdditionalTags`
+- Artwork size/count limits; owned artwork byte copies valid after file disposal
+- Non-hardware metadata tests and format coverage fixtures
+
+### Changed
+
+- `Sonora.Audio` depends on **z440.atl.core 7.19.0** (MIT) for tag extraction only; playback/decode paths remain independent. Transitive: `Ude.NetStandard` 1.2.0 (Mozilla Universal Charset Detector port; see package `COPYING`)
+- On first metadata use, Sonora sets ATL `Settings.UseFileNameWhenNoTitle = false` once (ATL has no per-call settings isolation). Documented for apps that also use ATL directly
+
+### Notes
+
+- Metadata reading does not create an `AudioPlayer`, initialize WASAPI, or decode PCM for playback
+- Multi-artist/genre: prefers format-native additional fields (e.g. Vorbis `ARTISTS`); does not blindly split on `;`
+- ATL reports ALAC as lossy (`IsLossless == false`); WebM Opus may omit sample rate / channel count
+- Duration is container-reported and not promised sample-accurate where encoder delay/padding exists
+
 ## 0.7.0 — 2026-11-01
 
 ### Added

@@ -27,6 +27,28 @@ player.ErrorOccurred += (_, ex) => Console.WriteLine(ex.Message);
 player.Play();
 ```
 
+## Read metadata without playback
+
+Metadata extraction does not create a player or initialize WASAPI.
+
+```csharp
+using Sonora.Audio.Metadata;
+using Sonora.Audio.Windows;
+
+var reader = SonoraWindows.CreateMetadataReader();
+var meta = reader.Read(@"C:\music\track.flac");
+
+Console.WriteLine(meta.Title);
+Console.WriteLine(string.Join(", ", meta.Artists));
+Console.WriteLine(meta.Duration);
+
+var art = reader.Read(
+    @"C:\music\track.flac",
+    new AudioMetadataReadOptions { IncludeArtwork = true });
+```
+
+Unavailable fields are `null` (or empty lists). Titles are never invented from file names. Prefer `IncludeArtwork = false` (default) for large library scans.
+
 ## Output devices
 
 ```csharp

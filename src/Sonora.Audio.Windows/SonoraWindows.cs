@@ -1,3 +1,4 @@
+using Sonora.Audio.Metadata;
 using Sonora.Audio.Playback;
 using Sonora.Audio.Windows.Decoding;
 using Sonora.Audio.Windows.Devices;
@@ -38,4 +39,11 @@ public static class SonoraWindows
             options,
             new WindowsAudioOutputDevices());
     }
+
+    /// <summary>
+    /// Creates a platform-neutral metadata reader.
+    /// Metadata extraction uses managed ATL.NET and does not require WASAPI or an <see cref="AudioEngine"/>.
+    /// Equivalent to constructing <see cref="AudioMetadataReader"/> directly from <c>Sonora.Audio</c>.
+    /// </summary>
+    public static IAudioMetadataReader CreateMetadataReader() => new AudioMetadataReader();
 }

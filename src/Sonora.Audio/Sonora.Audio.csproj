@@ -20,4 +20,8 @@
     <InternalsVisibleTo Include="Sonora.Audio.Windows.Tests" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="z440.atl.core" />
+  </ItemGroup>
+
 </Project>

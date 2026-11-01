@@ -10,7 +10,7 @@
 
 [![.NET 10](https://img.shields.io/badge/.NET-10-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/download)
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
-[![Version](https://img.shields.io/badge/version-0.6.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.8.0-blue)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 [Why Sonora?](#why-sonora) · [Quick start](#quick-start) · [Formats](#supported-audio-formats) · [DSP](#dsp-effects) · [Architecture](#how-it-works) · [Build](#build-and-test)
@@ -41,6 +41,7 @@ It is built for apps like [EMP](https://github.com/lazytitanz/EMP) but stays com
 - **Gapless playback** — `PreloadNextAsync` + seamless hard-cut transition on one WASAPI session
 - **Dual position tracking** — `Position` (audible estimate) and `BufferedPosition` (decode frontier)
 - **Live DSP** — EQ/preamp changes apply on the output path without waiting for the PCM buffer to drain
+- **Metadata** — read tags and optional embedded artwork without creating a player or opening WASAPI
 - **MIT licensed** — packages prepared for NuGet (`Sonora.Audio`, `Sonora.Audio.Windows`)
 
 > [!NOTE]
@@ -67,6 +68,28 @@ Console.WriteLine(player.Position);          // estimated audible position
 Console.WriteLine(player.BufferedPosition);  // decode/buffer frontier
 Console.WriteLine(player.Duration);
 ```
+
+### Metadata (independent of playback)
+
+```csharp
+using Sonora.Audio.Metadata;
+using Sonora.Audio.Windows;
+
+var reader = SonoraWindows.CreateMetadataReader(); // or new AudioMetadataReader()
+
+var meta = reader.Read(@"C:\music\song.flac");
+Console.WriteLine($"{meta.Title} — {string.Join(", ", meta.Artists)}");
+Console.WriteLine(meta.Duration);
+
+var withArt = reader.Read(
+    @"C:\music\song.flac",
+    new AudioMetadataReadOptions { IncludeArtwork = true });
+
+var cover = withArt.Artwork.FirstOrDefault(a => a.Kind == AudioArtworkKind.FrontCover)
+    ?? withArt.Artwork.FirstOrDefault();
+```
+
+Metadata uses managed [ATL.NET](https://github.com/Zeugma440/atldotnet) (`z440.atl.core` **7.19.0**, MIT; transitive `Ude.NetStandard` for charset detection). ATL types are not part of Sonora’s public API. Playback remains conceptually separate; the core package now carries this metadata-only dependency.
 
 ### Playback controls
 
@@ -220,6 +243,25 @@ Formats are selected by container/header sniffing (not extension alone). Only fo
 | Ogg Opus (`.opus`) | Concentus + Concentus.Oggfile | Managed MIT; MF does not open bare `.opus` reliably |
 | WebM (Opus) | Media Foundation | Fixture-verified; WebM Vorbis is not claimed (MF codecs vary by Windows SKU) |
 
+### Metadata coverage (0.8.0)
+
+Verified with fixtures via ATL.NET (tags / duration / technical props / artwork). Claims are read-only extraction, not tag writing.
+
+| Format | Basic tags | Duration | Sample rate / channels | Artwork | Notes |
+| --- | --- | --- | --- | --- | --- |
+| WAV | Verified | Verified | Verified | Verified | RIFF INFO / ID3 when present |
+| AIFF | Verified | Verified | Verified | Partial | Common chunks / ID3 when present |
+| MP3 | Verified | Verified | Verified | Partial | ID3v1/v2; VBR duration approximate |
+| FLAC | Verified | Verified | Verified | Partial | Vorbis comments; `IsLossless == true` |
+| Ogg Vorbis | Verified | Verified | Verified | Partial | |
+| Ogg Opus | Verified | Verified | Verified | Partial | |
+| M4A AAC | Verified | Verified | Verified | Partial | MP4 atoms |
+| ALAC | Verified | Verified | Verified | Partial | ATL reports `IsLossless == false` (limitation) |
+| WMA | Verified | Verified | Verified | Partial | ASF |
+| WebM Opus | Verified | Verified | Unverified | Partial | Sample rate / channels often omitted by ATL |
+
+“Partial” artwork means container support exists and Sonora returns owned bytes when present; not every fixture embeds covers.
+
 ---
 
 ## DSP effects
@@ -318,7 +360,9 @@ dotnet add package Sonora.Audio.Windows
 - Exclusive mode is not bit-perfect when DSP, volume, or format conversion are active
 - Device / mode switches are not sample-accurate; old-endpoint padding is skipped and a short gap may be heard
 - Follow-default uses notification-driven rebinds (Multimedia role), not OS stream-routing-as-correctness
-- No metadata extraction or network streaming
+- No network streaming or online metadata lookup
+- Metadata does not invent titles from file names; ATL `UseFileNameWhenNoTitle` is disabled once on first Sonora metadata use
+- ATL may report ALAC as lossy; WebM Opus may omit sample rate / channels; artwork write/edit is out of scope
 - Gapless joins are continuous PCM hard-cuts; encoder delay/padding trimming for lossy codecs is not applied
 - Audible track-change timing is not sample-accurate under shared-mode WASAPI
 - FLAC / Media Foundation seeking is reliable for playback; sample-accurate (`Exact`) seeking is not claimed for MF-backed formats

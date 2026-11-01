@@ -5,14 +5,18 @@
 ```text
 Application (console, WPF, WinForms, services)
         │
+        ├─ metadata (optional) ──► Sonora.Audio.Metadata ← ATL.NET (z440.atl.core)
+        │
         ▼
 Sonora.Audio.Windows          ← NAudio, WASAPI, MF, NVorbis, Concentus
-        │ implements
+    │ implements
         ▼
 Sonora.Audio                  ← public API, player, ring buffer, pump
 ```
 
 `Sonora.Audio` never references NAudio or Windows-specific assemblies. Platform backends implement `IAudioDecoderFactory` and `IAudioOutputFactory`. Managed Vorbis/Opus packages stay in `Sonora.Audio.Windows` only.
+
+Metadata (`IAudioMetadataReader` / `AudioMetadataReader`) lives in `Sonora.Audio` and uses ATL.NET for tag parsing. It does not touch the decode pump or WASAPI. Playback code paths do not call the metadata reader.
 
 ## Playback pipeline
 
@@ -138,3 +142,23 @@ Decoder → [optional IAudioProcessor] → Volume → PcmRingBuffer (dry)
 ## DSP extension (legacy)
 
 `IAudioProcessor` remains available on the pump path for non-interactive processing. Interactive EQ/preamp/limiter use `player.Effects`.
+
+## Metadata (0.8.0)
+
+```text
+AudioMetadataReader.Read(path, options?)
+        │
+        ▼
+ATL Track (tags; pictures only if IncludeArtwork / ReadArtwork)
+        │
+        ▼
+AudioTrackMetadata (immutable Sonora models; ATL types never escape)
+```
+
+| Concern | Behavior |
+|---|---|
+| Dependency | `z440.atl.core` **7.19.0** (MIT) on `Sonora.Audio` |
+| Settings | ATL has no isolated per-call config. Sonora sets `UseFileNameWhenNoTitle = false` once on first use; other Settings left alone. Empty strings / non-positive numbers normalized to null in Sonora |
+| Artwork | Default path does not access `EmbeddedPictures`. `ReadArtwork` uses `Track(path, load: false)` then picture reload |
+| Thread-safety | Concurrent independent reads on one reader instance are safe; no retained handles |
+| Errors | Missing file → `FileNotFoundException`; unsupported → `UnsupportedFormatException`; corrupt → `InvalidAudioException`; tagless valid file → empty fields |
