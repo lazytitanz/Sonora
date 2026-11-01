@@ -53,7 +53,7 @@ public sealed class AudioPlayer : IDisposable
 
     private string? _preferredOutputDeviceId;
     private string? _activeOutputDeviceId;
-    private OutputDeviceStatus _outputDeviceStatus = OutputDeviceStatus.Available;
+    private volatile OutputDeviceStatus _outputDeviceStatus = OutputDeviceStatus.Available;
     private OutputRecoveryIntent _outputRecoveryIntent = OutputRecoveryIntent.None;
     private int _recoveryInFlight;
 
@@ -225,6 +225,10 @@ public sealed class AudioPlayer : IDisposable
     /// Device switches reinitialize WASAPI and may briefly interrupt audible playback; the PCM ring,
     /// DSP configuration, and preloaded next track are preserved when possible.
     /// </summary>
+    /// <exception cref="OperationCanceledException">
+    /// The switch was superseded by <see cref="Stop"/>, <see cref="LoadAsync"/>, <see cref="Dispose"/>,
+    /// another <see cref="SetOutputDeviceAsync"/>, or <paramref name="cancellationToken"/>.
+    /// </exception>
     public async Task SetOutputDeviceAsync(string? deviceId, CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -259,9 +263,11 @@ public sealed class AudioPlayer : IDisposable
 
             var samePreferred = string.Equals(_preferredOutputDeviceId, deviceId, StringComparison.Ordinal);
             var sameActive = deviceId is null
-                ? _preferredOutputDeviceId is null && _outputDeviceStatus == OutputDeviceStatus.Available && _output is not null
+                ? _preferredOutputDeviceId is null
+                  && _outputDeviceStatus is OutputDeviceStatus.Available or OutputDeviceStatus.PreferredUnavailable
+                  && _output is not null
                 : string.Equals(_activeOutputDeviceId, deviceId, StringComparison.Ordinal)
-                  && _outputDeviceStatus == OutputDeviceStatus.Available
+                  && _outputDeviceStatus is OutputDeviceStatus.Available or OutputDeviceStatus.PreferredUnavailable
                   && _output is not null;
 
             Volatile.Write(ref _preferredOutputDeviceId, deviceId);
@@ -302,14 +308,45 @@ public sealed class AudioPlayer : IDisposable
                 : _heldPosition;
 
             oldOutput = DetachOutput_NoLock();
+            _outputDeviceStatus = OutputDeviceStatus.Switching;
+            RaiseOutputDeviceChanged(OutputDeviceChangeReason.Switching);
         }
         finally
         {
             _gate.Release();
         }
 
-        // Dispose previous output outside the gate so pull-loop join cannot deadlock.
-        DisposeOutputSafe(oldOutput);
+        // Yield so callers can observe Switching / supersede this switch before teardown blocks
+        // the calling thread (Shutdown may wait for a live pull consumer).
+        await Task.Yield();
+
+        // Join previous output outside the gate so pull-loop wait cannot deadlock.
+        try
+        {
+            ShutdownAndDispose(oldOutput);
+        }
+        catch (Exception ex)
+        {
+            // Prefer superseded over teardown failure when Stop/Load/Dispose/newer switch won.
+            if (_disposed
+                || switchGeneration != Volatile.Read(ref _outputSwitchGeneration)
+                || switchToken.IsCancellationRequested)
+            {
+                throw _disposed
+                    ? new ObjectDisposedException(nameof(AudioPlayer))
+                    : CreateSupersededException();
+            }
+
+            await FailSwitchAfterTeardownAsync(
+                switchGeneration,
+                wasPlaying,
+                wasPaused,
+                heldPosition,
+                ex).ConfigureAwait(false);
+            throw;
+        }
+
+        ThrowIfSwitchSuperseded(switchGeneration, switchToken);
 
         IAudioOutput? created = null;
         try
@@ -318,65 +355,46 @@ public sealed class AudioPlayer : IDisposable
         }
         catch (OperationCanceledException)
         {
+            ThrowIfSwitchSuperseded(switchGeneration, CancellationToken.None);
             throw;
         }
         catch (Exception ex)
         {
-            await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
-            try
-            {
-                if (_disposed || switchGeneration != _outputSwitchGeneration)
-                {
-                    return;
-                }
-
-                _activeOutputDeviceId = null;
-                _outputDeviceStatus = OutputDeviceStatus.Unavailable;
-                if (wasPlaying)
-                {
-                    _outputRecoveryIntent = OutputRecoveryIntent.ResumePlaying;
-                }
-                else if (wasPaused)
-                {
-                    _outputRecoveryIntent = OutputRecoveryIntent.RemainPaused;
-                }
-
-                _heldPosition = heldPosition;
-                SetState_NoLock(PlaybackState.Stopped);
-                RaiseError(ex is AudioException ? ex : new AudioOutputException("Failed to open the output device.", ex));
-                RaiseOutputDeviceChanged(OutputDeviceChangeReason.Unavailable);
-            }
-            finally
-            {
-                _gate.Release();
-            }
-
+            await FailSwitchAfterTeardownAsync(
+                switchGeneration,
+                wasPlaying,
+                wasPaused,
+                heldPosition,
+                ex is AudioException ? ex : new AudioOutputException("Failed to open the output device.", ex))
+                .ConfigureAwait(false);
             throw;
         }
 
         await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
         try
         {
-            if (_disposed || switchGeneration != _outputSwitchGeneration)
+            if (_disposed)
             {
                 created.Dispose();
-                return;
+                throw new ObjectDisposedException(nameof(AudioPlayer));
+            }
+
+            if (switchGeneration != _outputSwitchGeneration)
+            {
+                created.Dispose();
+                throw CreateSupersededException();
             }
 
             if (!_hasSource || _sampleSource is null)
             {
                 created.Dispose();
-                return;
+                _outputDeviceStatus = OutputDeviceStatus.Unavailable;
+                RaiseOutputDeviceChanged(OutputDeviceChangeReason.Unavailable);
+                throw CreateSupersededException();
             }
 
             // Seek may have advanced the timeline while create was off-gate.
-            var attachPosition = _state is PlaybackState.Playing
-                ? EstimateAudiblePosition()
-                : (_heldPosition != TimeSpan.Zero ? _heldPosition : heldPosition);
-            if (_heldPosition != heldPosition && _state is PlaybackState.Stopped or PlaybackState.Paused)
-            {
-                attachPosition = _heldPosition;
-            }
+            var attachPosition = _heldPosition != TimeSpan.Zero ? _heldPosition : heldPosition;
 
             AttachOutput_NoLock(created, attachPosition);
             created = null;
@@ -400,6 +418,10 @@ public sealed class AudioPlayer : IDisposable
             {
                 SetState_NoLock(PlaybackState.Paused);
                 _outputRecoveryIntent = OutputRecoveryIntent.None;
+            }
+            else
+            {
+                SetState_NoLock(PlaybackState.Stopped);
             }
 
             RaiseOutputDeviceChanged(OutputDeviceChangeReason.SelectionChanged);
@@ -690,7 +712,8 @@ public sealed class AudioPlayer : IDisposable
                 throw new InvalidOperationException("No audio source is loaded.");
             }
 
-            if (_output is null || _outputDeviceStatus == OutputDeviceStatus.Unavailable)
+            if (_output is null
+                || _outputDeviceStatus is OutputDeviceStatus.Unavailable or OutputDeviceStatus.Switching)
             {
                 _outputRecoveryIntent = OutputRecoveryIntent.ResumePlaying;
                 throw new InvalidOperationException("No usable audio output device is available.");
@@ -755,11 +778,20 @@ public sealed class AudioPlayer : IDisposable
             _next.Clear();
             if (!_hasSource)
             {
+                if (_outputDeviceStatus == OutputDeviceStatus.Switching)
+                {
+                    _outputDeviceStatus = OutputDeviceStatus.Unavailable;
+                }
+
                 SetState_NoLock(PlaybackState.Stopped);
                 return;
             }
 
             StopTransport_NoLock(resetToStart: true, raiseCompletion: false);
+            if (_output is null)
+            {
+                _outputDeviceStatus = OutputDeviceStatus.Unavailable;
+            }
         }
         finally
         {
@@ -948,20 +980,29 @@ public sealed class AudioPlayer : IDisposable
         return output;
     }
 
-    private static void DisposeOutputSafe(IAudioOutput? output)
+    /// <summary>
+    /// Guarantees the output will not read PCM again, then disposes it.
+    /// Throws if quiescence cannot be guaranteed; Dispose is still attempted.
+    /// </summary>
+    private static void ShutdownAndDispose(IAudioOutput? output)
     {
         if (output is null)
         {
             return;
         }
 
+        Exception? shutdownError = null;
         try
         {
-            output.Stop();
+            output.Shutdown();
         }
-        catch
+        catch (Exception ex)
         {
-            // ignored
+            shutdownError = ex is AudioOutputException
+                ? ex
+                : new AudioOutputException(
+                    "Output shutdown failed; replacement output was not started.",
+                    ex);
         }
 
         try
@@ -970,7 +1011,65 @@ public sealed class AudioPlayer : IDisposable
         }
         catch
         {
-            // ignored
+            // ignored — shutdown error (if any) is authoritative
+        }
+
+        if (shutdownError is not null)
+        {
+            throw shutdownError;
+        }
+    }
+
+    private void ThrowIfSwitchSuperseded(int switchGeneration, CancellationToken switchToken)
+    {
+        if (_disposed)
+        {
+            throw new ObjectDisposedException(nameof(AudioPlayer));
+        }
+
+        if (switchGeneration != Volatile.Read(ref _outputSwitchGeneration) || switchToken.IsCancellationRequested)
+        {
+            throw CreateSupersededException();
+        }
+    }
+
+    private static OperationCanceledException CreateSupersededException() =>
+        new("The output device switch was superseded by another operation.");
+
+    private async Task FailSwitchAfterTeardownAsync(
+        int switchGeneration,
+        bool wasPlaying,
+        bool wasPaused,
+        TimeSpan heldPosition,
+        Exception error)
+    {
+        await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            if (_disposed || switchGeneration != _outputSwitchGeneration)
+            {
+                throw CreateSupersededException();
+            }
+
+            _activeOutputDeviceId = null;
+            _outputDeviceStatus = OutputDeviceStatus.Unavailable;
+            _heldPosition = heldPosition;
+            if (wasPlaying)
+            {
+                _outputRecoveryIntent = OutputRecoveryIntent.ResumePlaying;
+            }
+            else if (wasPaused)
+            {
+                _outputRecoveryIntent = OutputRecoveryIntent.RemainPaused;
+            }
+
+            SetState_NoLock(PlaybackState.Stopped);
+            RaiseError(error);
+            RaiseOutputDeviceChanged(OutputDeviceChangeReason.Unavailable);
+        }
+        finally
+        {
+            _gate.Release();
         }
     }
 
@@ -1131,8 +1230,22 @@ public sealed class AudioPlayer : IDisposable
         }
 
         var oldOutput = DetachOutput_NoLock();
-        // Teardown already holds the gate; Stop/Dispose must not re-enter player callbacks.
-        DisposeOutputSafe(oldOutput);
+        // Best-effort during session teardown (Load/Dispose). Switch paths use ShutdownAndDispose off-gate.
+        try
+        {
+            ShutdownAndDispose(oldOutput);
+        }
+        catch
+        {
+            try
+            {
+                oldOutput?.Dispose();
+            }
+            catch
+            {
+                // ignored
+            }
+        }
 
         _active?.StopPump();
 
@@ -1279,9 +1392,20 @@ public sealed class AudioPlayer : IDisposable
 
             Volatile.Write(ref _acceptEndOfStreamCompletion, 0);
             var lostOutput = DetachOutput_NoLock();
+            _outputDeviceStatus = OutputDeviceStatus.Switching;
             SetState_NoLock(PlaybackState.Stopped);
-            // Dispose off the gate path: schedule after release via recovery / background.
-            _ = Task.Run(() => DisposeOutputSafe(lostOutput));
+            // Shutdown off the gate path: schedule after release via recovery / background.
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    ShutdownAndDispose(lostOutput);
+                }
+                catch (Exception ex)
+                {
+                    RaiseError(ex);
+                }
+            });
             ScheduleDeviceRecovery(OutputDeviceChangeReason.DeviceLostFallback);
         }
     }
@@ -1423,13 +1547,15 @@ public sealed class AudioPlayer : IDisposable
 
             if (_output is not null
                 && string.Equals(_activeOutputDeviceId, effectiveId, StringComparison.Ordinal)
-                && _outputDeviceStatus != OutputDeviceStatus.Unavailable)
+                && _outputDeviceStatus is OutputDeviceStatus.Available or OutputDeviceStatus.PreferredUnavailable)
             {
                 return;
             }
 
             BeginOutputSwitch_NoLock(CancellationToken.None, out switchGeneration, out switchToken);
             oldOutput = DetachOutput_NoLock();
+            _outputDeviceStatus = OutputDeviceStatus.Switching;
+            RaiseOutputDeviceChanged(OutputDeviceChangeReason.Switching);
             needsCreate = true;
         }
         finally
@@ -1437,9 +1563,38 @@ public sealed class AudioPlayer : IDisposable
             _gate.Release();
         }
 
-        DisposeOutputSafe(oldOutput);
+        await Task.Yield();
+
+        try
+        {
+            ShutdownAndDispose(oldOutput);
+        }
+        catch (Exception ex)
+        {
+            await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+            try
+            {
+                if (!_disposed && switchGeneration == _outputSwitchGeneration)
+                {
+                    _outputDeviceStatus = OutputDeviceStatus.Unavailable;
+                    RaiseError(ex);
+                    RaiseOutputDeviceChanged(OutputDeviceChangeReason.Unavailable);
+                }
+            }
+            finally
+            {
+                _gate.Release();
+            }
+
+            return;
+        }
 
         if (!needsCreate)
+        {
+            return;
+        }
+
+        if (switchGeneration != Volatile.Read(ref _outputSwitchGeneration))
         {
             return;
         }

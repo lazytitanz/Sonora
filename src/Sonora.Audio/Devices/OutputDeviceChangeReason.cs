@@ -19,4 +19,10 @@ public enum OutputDeviceChangeReason
 
     /// <summary>No usable output endpoint is available.</summary>
     Unavailable = 4,
+
+    /// <summary>An output rebind began; no endpoint is attached while switching.</summary>
+    Switching = 5,
+
+    /// <summary>A device-switch request was superseded by another operation.</summary>
+    Superseded = 6,
 }

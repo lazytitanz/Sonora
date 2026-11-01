@@ -46,6 +46,19 @@ public interface IAudioOutput : IDisposable
     void Stop();
 
     /// <summary>
+    /// Stops the output and guarantees that it will not issue any further reads against its
+    /// <see cref="IPcmSampleSource"/>. Blocks until pull/callback threads have quiesced.
+    /// </summary>
+    /// <exception cref="AudioOutputException">
+    /// Quiescence could not be guaranteed (for example, a pull thread did not stop in time).
+    /// </exception>
+    /// <remarks>
+    /// After a successful return, the instance must not read PCM again. <see cref="IDisposable.Dispose"/>
+    /// should still be called to release native resources. Safe to call more than once.
+    /// </remarks>
+    void Shutdown();
+
+    /// <summary>
     /// Raised when the output stops because the source reached end-of-stream (natural completion)
     /// or because of an error. The boolean is <see langword="true"/> for natural completion.
     /// </summary>

@@ -6,21 +6,28 @@ namespace Sonora.Audio.Tests.Fakes;
 /// <summary>
 /// Pulls PCM on a background thread when playing. Does not take the player command lock.
 /// </summary>
-internal sealed class FakeAudioOutput : IAudioOutput
+internal class FakeAudioOutput : IAudioOutput
 {
     private readonly int _blockSamples;
     private readonly TimeSpan _latency;
+    private readonly TimeSpan _shutdownTimeout;
     private IPcmSampleSource? _source;
     private CancellationTokenSource? _cts;
     private Task? _loop;
     private long _renderedSamples;
     private int _playing;
+    private bool _shutdown;
     private bool _disposed;
 
-    public FakeAudioOutput(int blockSamples = 256, TimeSpan? latency = null, string? endpointId = null)
+    public FakeAudioOutput(
+        int blockSamples = 256,
+        TimeSpan? latency = null,
+        string? endpointId = null,
+        TimeSpan? shutdownTimeout = null)
     {
         _blockSamples = blockSamples;
         _latency = latency ?? TimeSpan.FromMilliseconds(20);
+        _shutdownTimeout = shutdownTimeout ?? TimeSpan.FromSeconds(5);
         EndpointId = endpointId;
     }
 
@@ -32,8 +39,14 @@ internal sealed class FakeAudioOutput : IAudioOutput
     public int PlayCount { get; private set; }
     public int StopCount { get; private set; }
     public int InitializeCount { get; private set; }
+    public int ShutdownCount { get; private set; }
+    public int ReadCount { get; private set; }
     public int PullThreadId { get; private set; }
     public List<float> CapturedSamples { get; } = new();
+    public bool IsShutdown => _shutdown;
+
+    /// <summary>When set, <see cref="Shutdown"/> throws after attempting to stop the loop.</summary>
+    public Func<Exception>? ShutdownFault { get; set; }
 
     public void Initialize(IPcmSampleSource source)
     {
@@ -46,6 +59,11 @@ internal sealed class FakeAudioOutput : IAudioOutput
     public void Play()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_shutdown)
+        {
+            throw new InvalidOperationException("Output has been shut down.");
+        }
+
         if (_source is null)
         {
             throw new InvalidOperationException("Not initialized.");
@@ -59,7 +77,9 @@ internal sealed class FakeAudioOutput : IAudioOutput
 
         _cts = new CancellationTokenSource();
         var token = _cts.Token;
-        _loop = Task.Run(() => Loop(token), token);
+        // Do not pass token to Task.Run — Pause/Stop cancel the CTS cooperatively inside Loop
+        // without marking the task cancelled before Shutdown can join it.
+        _loop = Task.Run(() => Loop(token));
     }
 
     public void Pause()
@@ -88,21 +108,50 @@ internal sealed class FakeAudioOutput : IAudioOutput
             // ignored
         }
 
-        var loop = _loop;
-        if (loop is not null)
+        JoinLoop(TimeSpan.FromSeconds(2));
+        Interlocked.Exchange(ref _renderedSamples, 0);
+    }
+
+    public virtual void Shutdown()
+    {
+        if (_shutdown)
         {
-            // Prevent in-flight EOS Stopped notifications from racing command-thread Stop.
-            try
-            {
-                loop.Wait(TimeSpan.FromSeconds(2));
-            }
-            catch
-            {
-                // ignored
-            }
+            return;
         }
 
-        Interlocked.Exchange(ref _renderedSamples, 0);
+        ShutdownCount++;
+
+        // Sever the PCM source first so no further TransitionSampleSource reads can occur.
+        Volatile.Write(ref _source, null);
+        Interlocked.Exchange(ref _playing, 0);
+        try
+        {
+            _cts?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // ignored
+        }
+
+        OnShutdownSignaled();
+
+        if (!JoinLoop(_shutdownTimeout))
+        {
+            throw new AudioOutputException(
+                "Timed out waiting for the output pull loop to stop; replacement output was not started.");
+        }
+
+        var fault = ShutdownFault?.Invoke();
+        if (fault is not null)
+        {
+            // Quiescence of the loop succeeded; surface the injected fault without retrying on Dispose.
+            _shutdown = true;
+            throw fault is AudioOutputException
+                ? fault
+                : new AudioOutputException("Output shutdown failed; replacement output was not started.", fault);
+        }
+
+        _shutdown = true;
     }
 
     public TimeSpan? TryGetRenderedPosition()
@@ -123,7 +172,18 @@ internal sealed class FakeAudioOutput : IAudioOutput
         }
 
         _disposed = true;
-        Stop();
+        try
+        {
+            if (!_shutdown)
+            {
+                Shutdown();
+            }
+        }
+        catch
+        {
+            Volatile.Write(ref _source, null);
+        }
+
         _cts?.Dispose();
     }
 
@@ -143,16 +203,57 @@ internal sealed class FakeAudioOutput : IAudioOutput
         Stopped?.Invoke(this, new AudioOutputStoppedEventArgs(reachedEndOfStream: false, exception: exception));
     }
 
+    /// <summary>Hook for holdable outputs to unblock a stuck Read during shutdown.</summary>
+    protected virtual void OnShutdownSignaled()
+    {
+    }
+
+    /// <summary>Optional gate around each source.Read for subclasses.</summary>
+    protected virtual void BeforeRead()
+    {
+    }
+
+    private bool JoinLoop(TimeSpan timeout)
+    {
+        var loop = _loop;
+        if (loop is null || loop.IsCompleted)
+        {
+            return true;
+        }
+
+        try
+        {
+            return loop.Wait(timeout);
+        }
+        catch (AggregateException)
+        {
+            // Pull loop finished (possibly with an error); it will not read again.
+            return loop.IsCompleted;
+        }
+        catch
+        {
+            return loop.IsCompleted;
+        }
+    }
+
     private void Loop(CancellationToken token)
     {
-        var source = _source!;
         var buffer = new float[_blockSamples];
         PullThreadId = Environment.CurrentManagedThreadId;
         try
         {
             while (!token.IsCancellationRequested && Volatile.Read(ref _playing) == 1)
             {
+                BeforeRead();
+
+                var source = Volatile.Read(ref _source);
+                if (source is null)
+                {
+                    return;
+                }
+
                 var read = source.Read(buffer);
+                ReadCount++;
                 if (read > 0)
                 {
                     lock (CapturedSamples)
@@ -169,7 +270,11 @@ internal sealed class FakeAudioOutput : IAudioOutput
                 if (read <= 0 || source.IsEndOfStream)
                 {
                     Interlocked.Exchange(ref _playing, 0);
-                    Stopped?.Invoke(this, new AudioOutputStoppedEventArgs(reachedEndOfStream: true));
+                    if (!_shutdown && !_disposed)
+                    {
+                        Stopped?.Invoke(this, new AudioOutputStoppedEventArgs(reachedEndOfStream: true));
+                    }
+
                     return;
                 }
 
@@ -179,7 +284,10 @@ internal sealed class FakeAudioOutput : IAudioOutput
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             Interlocked.Exchange(ref _playing, 0);
-            Stopped?.Invoke(this, new AudioOutputStoppedEventArgs(reachedEndOfStream: false, exception: ex));
+            if (!_shutdown && !_disposed)
+            {
+                Stopped?.Invoke(this, new AudioOutputStoppedEventArgs(reachedEndOfStream: false, exception: ex));
+            }
         }
     }
 }

@@ -17,15 +17,20 @@ All notable changes to Sonora will be documented in this file.
 - Output-only rebind that preserves decode pipelines, gapless next track, volume, and DSP configuration
 - Deterministic device-management tests (hardware-free) plus Windows state-mapping tests
 - `AudioDeviceException` for invalid device selection
+- `IAudioOutput.Shutdown()` quiescence contract: after successful return, the old output must not read PCM again
+- `OutputDeviceStatus.Switching` while no output is attached during a rebind
+- Holdable fake-output regression tests for overlapping switches, Stop/Dispose during teardown, and teardown failure with a live consumer
 
 ### Changed
 
 - `IAudioOutputFactory` now exposes `CreateOutputAsync(string? deviceId, CancellationToken)` (replaces `CreateDefaultOutput`)
 - `IAudioOutput` reports `EndpointId` when known
+- Output switches detach under the gate, join/shutdown outside the gate, then attach only after a generation check; teardown failure leaves the player `Unavailable` and does not start a replacement
+- Superseded `SetOutputDeviceAsync` calls throw `OperationCanceledException` instead of reporting success when no output was attached
 
 ### Notes
 
-- Device switches reinitialize WASAPI and may briefly interrupt audible playback; endpoint padding already submitted to the old device is skipped (typically on the order of `CurrentLatency`).
+- Device switches reinitialize WASAPI and may briefly interrupt audible playback; endpoint padding already submitted to the old device is skipped (typically on the order of `CurrentLatency`). Correctness and resource ownership are preferred over minimizing interruption.
 - Follow-default correctness uses notification-driven rebinds with `WithDevice(Multimedia default)` — NAudio stream routing is not relied on for correctness.
 - When an explicitly preferred device is lost, Sonora falls back to the system default and does **not** auto-restore when the preferred endpoint returns.
 - Explicit `Stop`, `LoadAsync`, and `Dispose` clear recovery intent so auto-resume cannot revive a stopped session.

@@ -48,6 +48,11 @@ internal sealed class NoOpAudioOutput : IAudioOutput
         _ = Stopped;
     }
 
+    public void Shutdown()
+    {
+        _source = null;
+    }
+
     public TimeSpan? TryGetRenderedPosition() => TimeSpan.Zero;
 
     public void Dispose() => _disposed = true;

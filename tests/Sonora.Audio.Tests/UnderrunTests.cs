@@ -127,6 +127,11 @@ public sealed class UnderrunTests
         {
         }
 
+        public void Shutdown()
+        {
+            _source = null;
+        }
+
         public TimeSpan? TryGetRenderedPosition() => null;
 
         public void Pull(int samples)

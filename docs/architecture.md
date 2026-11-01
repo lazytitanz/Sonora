@@ -81,7 +81,10 @@ WasapiAudioOutput (WithDevice, Multimedia default when following)
 | Explicit select | `WithDevice(id)`; ignore unrelated default changes |
 | Preferred lost | Fall back to Multimedia default; keep preferred id; no auto-restore |
 | Recovery intent | Separate from `PlaybackState`; cleared by `Stop` / `LoadAsync` / `Dispose` |
-| Rebind | Dispose old WASAPI only; keep rings, next track, DSP rack; rebase position clock |
+| Rebind | Detach under gate → `Shutdown` join off-gate → attach with generation check |
+| Shutdown | Old output must not read `TransitionSampleSource` after successful `Shutdown`; failure → Unavailable, no replacement |
+| Status | `Switching` while detached mid-rebind; independent of `PlaybackState` |
+| Superseded | Concurrent Stop/Load/Dispose/newer switch cancels in-flight switch (`OperationCanceledException`) |
 | Clock / PCM | Ring preserved; old endpoint padding skipped (~`CurrentLatency`); brief gap expected |
 | Sync | Switch generation + CTS; create runs **off** the command gate; stale outputs disposed |
 | Events | Marshaled off native IMM / WASAPI threads |

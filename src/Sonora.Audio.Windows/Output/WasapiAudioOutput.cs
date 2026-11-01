@@ -18,6 +18,7 @@ internal sealed class WasapiAudioOutput : IAudioOutput
     private PcmSampleProviderAdapter? _adapter;
     private AudioFormat? _format;
     private bool _initialized;
+    private bool _shutdown;
     private bool _disposed;
 
     private WasapiAudioOutput(WasapiPlayer player, string? endpointId)
@@ -172,6 +173,37 @@ internal sealed class WasapiAudioOutput : IAudioOutput
         _player.Stop();
     }
 
+    public void Shutdown()
+    {
+        if (_disposed || _shutdown)
+        {
+            _source = null;
+            return;
+        }
+
+        try
+        {
+            if (_initialized)
+            {
+                _player.Stop();
+            }
+        }
+        catch (Exception ex)
+        {
+            // Still sever the source so late callbacks cannot read TransitionSampleSource.
+            _adapter?.Disconnect();
+            _source = null;
+            throw new AudioOutputException(
+                "Failed to stop WASAPI output during shutdown; replacement output was not started.",
+                ex);
+        }
+
+        // Sever the PCM source so any late callback cannot read TransitionSampleSource.
+        _adapter?.Disconnect();
+        _source = null;
+        _shutdown = true;
+    }
+
     public TimeSpan? TryGetRenderedPosition()
     {
         if (!_initialized || _format is null || _adapter is null)
@@ -208,18 +240,34 @@ internal sealed class WasapiAudioOutput : IAudioOutput
 
         try
         {
-            _player.Stop();
+            if (!_shutdown)
+            {
+                Shutdown();
+            }
+        }
+        catch
+        {
+            // Dispose must not throw; Shutdown failures are reported by switch/recovery paths.
+            _source = null;
+        }
+
+        try
+        {
+            _player.Dispose();
         }
         catch
         {
             // ignored
         }
-
-        _player.Dispose();
     }
 
     private void OnPlaybackStopped(object? sender, StoppedEventArgs e)
     {
+        if (_shutdown || _disposed)
+        {
+            return;
+        }
+
         if (e.Exception is not null)
         {
             RaiseStopped(new AudioOutputStoppedEventArgs(

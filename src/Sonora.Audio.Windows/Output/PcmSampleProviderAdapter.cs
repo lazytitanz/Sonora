@@ -9,7 +9,7 @@ namespace Sonora.Audio.Windows.Output;
 /// </summary>
 internal sealed class PcmSampleProviderAdapter : ISampleProvider
 {
-    private readonly IPcmSampleSource _source;
+    private IPcmSampleSource? _source;
     private readonly WaveFormat _waveFormat;
 
     public PcmSampleProviderAdapter(IPcmSampleSource source)
@@ -21,13 +21,19 @@ internal sealed class PcmSampleProviderAdapter : ISampleProvider
 
     public WaveFormat WaveFormat => _waveFormat;
 
+    /// <summary>
+    /// Prevents any further reads of the PCM source (used during output shutdown).
+    /// </summary>
+    public void Disconnect() => Volatile.Write(ref _source, null);
+
     public int Read(Span<float> buffer)
     {
-        if (_source.IsEndOfStream)
+        var source = Volatile.Read(ref _source);
+        if (source is null || source.IsEndOfStream)
         {
             return 0;
         }
 
-        return _source.Read(buffer);
+        return source.Read(buffer);
     }
 }

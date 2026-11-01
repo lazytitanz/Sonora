@@ -106,15 +106,18 @@ public class OutputDeviceManagementTests
     public async Task RapidSelection_OnlyLatestWins()
     {
         var devices = CreateTwoActiveDevices();
-        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var createCount = 0;
-        var outputs = new FakeAudioOutputFactory(asyncId =>
+        var createBStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var outputs = new FakeAudioOutputFactory((id, ct) =>
         {
-            var id = asyncId;
-            Interlocked.Increment(ref createCount);
             if (id == "b")
             {
-                gate.Task.Wait(TimeSpan.FromSeconds(2));
+                createBStarted.TrySetResult();
+                while (!ct.IsCancellationRequested)
+                {
+                    Thread.Sleep(10);
+                }
+
+                ct.ThrowIfCancellationRequested();
             }
 
             return new FakeAudioOutput(endpointId: id ?? "default");
@@ -125,17 +128,11 @@ public class OutputDeviceManagementTests
         await player.LoadAsync("track.wav");
 
         var first = player.SetOutputDeviceAsync("b");
+        await createBStarted.Task.WaitAsync(TimeSpan.FromSeconds(3));
         var second = player.SetOutputDeviceAsync("a");
-        gate.TrySetResult();
         await second;
-        try
-        {
-            await first;
-        }
-        catch
-        {
-            // cancelled/stale may throw or complete harmlessly
-        }
+        var firstError = await Record.ExceptionAsync(() => first);
+        Assert.IsType<OperationCanceledException>(firstError);
 
         Assert.Equal("a", player.PreferredOutputDeviceId);
         Assert.Equal("a", player.ActiveOutputDeviceId);
