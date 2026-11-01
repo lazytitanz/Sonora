@@ -37,7 +37,7 @@ It is built for apps like [EMP](https://github.com/lazytitanz/EMP) but stays com
 ### At a glance
 
 - **.NET 10** — `Sonora.Audio` (`net10.0`) and `Sonora.Audio.Windows` (`net10.0-windows10.0.19041.0`)
-- **Wide format coverage** — WAV, AIFF, MP3, AAC, M4A, FLAC, WMA, ALAC, Ogg Vorbis, Ogg Opus, WebM audio
+- **Wide format coverage** — WAV, AIFF, MP3, AAC, M4A, FLAC, WMA, ALAC, Ogg Vorbis, Ogg Opus, WebM Opus
 - **Gapless playback** — `PreloadNextAsync` + seamless hard-cut transition on one WASAPI session
 - **Dual position tracking** — `Position` (audible estimate) and `BufferedPosition` (decode frontier)
 - **Live DSP** — EQ/preamp changes apply on the output path without waiting for the PCM buffer to drain
@@ -314,7 +314,7 @@ Recommended rack order: **Preamp → EQ → Limiter**. Settings persist across t
 <details>
 <summary>Limiter limitations</summary>
 
-Default look-ahead guarantees the sample-peak ceiling for abrupt steps in Sonora’s tests. Explicit `LookaheadMs=0` minimizes latency (still ≥1 sample delay on Windows) but is not true-peak safe. Prefer sensible preamp/EQ gains rather than relying on the limiter alone.
+Sample-peak only (not true-peak / inter-sample; no soft clip). Default `LookaheadMs=5` is the guaranteeing multi-sample setting under Sonora’s tests. Explicit `LookaheadMs=0` is minimum-latency: measured with NAudio 3.3.0 it still uses ≥1 sample of delay and held the sample-peak ceiling for impulses, mid-buffer steps, and sparse bursts, but it is not a true-peak guarantee. Prefer sensible preamp/EQ gains; see [docs/limiter.md](docs/limiter.md).
 
 </details>
 
@@ -348,7 +348,7 @@ More detail: [docs/architecture.md](docs/architecture.md) · [docs/getting-start
 | [docs/limiter.md](docs/limiter.md) | Sample-peak limiter contract |
 | [docs/hardware-testing.md](docs/hardware-testing.md) | Opt-in WASAPI tests |
 | [docs/production-checklist.md](docs/production-checklist.md) | Gates for `rc.1` → `1.0.0` |
-| [docs/performance-baseline.md](docs/performance-baseline.md) | Measurement template |
+| [docs/performance-baseline.md](docs/performance-baseline.md) | Measured microbenchmarks (host-local) |
 | [SECURITY.md](SECURITY.md) | Reporting, SSRF responsibility |
 | [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) | ATL, Ude, NAudio, NVorbis, Concentus |
 
@@ -389,22 +389,23 @@ dotnet add package Sonora.Audio.Windows
 
 ## Current limitations
 
-- Windows only for output (WASAPI shared by default; optional exclusive)
+- **Playback is Windows-only** (WASAPI shared by default; optional exclusive). `Sonora.Audio` builds and unit-tests on Linux; decode/output backends live in `Sonora.Audio.Windows`
 - Exclusive mode is not bit-perfect when DSP, volume, or format conversion are active
 - Device / mode switches are not sample-accurate; old-endpoint padding is skipped and a short gap may be heard
 - Follow-default uses notification-driven rebinds (Multimedia role), not OS stream-routing-as-correctness
 - No HLS/DASH, podcast feeds, or online metadata lookup
 - HTTP seeking requires verified byte-range support; MF formats need a seekable body (forward-only MF is not claimed)
-- Applications accepting arbitrary URLs should apply SSRF / egress controls
+- Applications accepting arbitrary URLs should apply SSRF / egress controls ([SECURITY.md](SECURITY.md))
 - Metadata does not invent titles from file names; ATL `UseFileNameWhenNoTitle` is disabled once on first Sonora metadata use
 - ATL may report ALAC as lossy; WebM Opus may omit sample rate / channels; artwork write/edit is out of scope
 - Gapless joins are continuous PCM hard-cuts; encoder delay/padding trimming for lossy codecs is not applied
 - Audible track-change timing is not sample-accurate under shared-mode WASAPI
 - FLAC / Media Foundation seeking is reliable for playback; sample-accurate (`Exact`) seeking is not claimed for MF-backed formats
-- Bare Ogg Opus uses managed Concentus (not MF); WebM Opus depends on host Media Foundation codecs
-- WASAPI playback integration tests are tagged `Hardware` (skipped in default CI; require `SONORA_RUN_HARDWARE_TESTS=1`)
-- Explicit `LookaheadMs=0` limiting can allow brief overs; default LA=5 is the guaranteeing setting
-- Performance baselines are not yet measured (`docs/performance-baseline.md`)
+- Bare Ogg Opus uses managed Concentus (not MF); WebM Opus depends on host Media Foundation codecs (WebM Vorbis is not claimed)
+- The limiter is **sample-peak** only (not true-peak); default `LookaheadMs=5` is the guaranteeing setting. Explicit `LookaheadMs=0` held sample-peak ceilings in measured tests but is not true-peak safe ([docs/limiter.md](docs/limiter.md))
+- Synchronous `Dispose` may still block off-gate while waiting for output quiescence or the decode pump; prefer `DisposeAsync` from async/UI contexts
+- WASAPI hardware tests are tagged `Hardware` (excluded from default CI; require `SONORA_RUN_HARDWARE_TESTS=1`). Hardware/soak results are not claimed unless actually run
+- Host-local ring/DSP/metadata microbenchmarks are recorded in [docs/performance-baseline.md](docs/performance-baseline.md); WASAPI callback latency, underrun soak, and exclusive-mode timings are not yet measured
 
 ## Roadmap
 
