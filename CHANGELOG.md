@@ -29,7 +29,10 @@ All notable changes to Sonora will be documented in this file.
 - Engine unregisters players on dispose (avoids double-dispose list growth)
 - Limiter sanitizes non-finite PCM samples; default look-ahead raised to 5 ms after measurement (explicit `LookaheadMs=0` still available)
 - WASAPI exclusive: wrong `AUDCLNT_E_BUFFER_SIZE_ERROR` HRESULT constant (`0x88890018` → `0x88890016`) caused end-of-stream to be misclassified as device failure; Shared→Exclusive with `ExclusiveModeFallback.None` could crash/hang Test Player via recovery storm
-- Test Player: serialize output configure commands; surface configure failures as nonfatal UI errors and resync effective mode after success or failure
+- WASAPI exclusive Pause: NAudio soft-pause left `IAudioClient` running so the last exclusive period repeated (~1 ms loop); Pause now keeps the client running but feeds silence from the PCM adapter (avoids Stop/GetBuffer races)
+- WASAPI Shared→Exclusive: avoid exclusive open/close during format probe; brief endpoint-release grace after disposing the previous output (mitigates intermittent native `GetBuffer` AV `0xC0000005`)
+- PCM adapter: pad short periods without latching EOS on transient underruns; silence-after-EOS must not interfere with pause
+- Test Player: serialize output configure commands; surface configure failures as nonfatal UI errors and resync effective mode after success or failure; clarify configure-before-load messaging when `EffectiveMode` is null by design
 
 ### Notes
 

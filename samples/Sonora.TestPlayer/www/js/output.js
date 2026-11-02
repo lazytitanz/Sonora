@@ -234,8 +234,14 @@
         const out = state.output || result.value;
         const eff = out && out.effectiveMode;
         const requested = out && out.mode;
+        const hasSource = out && out.hasSource;
         if (eff) {
           toast(`Output configured. Effective mode: ${fmt.humanize(eff)}.`, 'success');
+        } else if (!hasSource) {
+          // Sonora stores the requested mode and applies it on the next Load / attach.
+          toast(
+            `Output preference saved (${fmt.humanize(requested || 'shared')}). It will apply when a track is loaded.`,
+            'success');
         } else if (requested === 'exclusive') {
           toast('Exclusive mode was requested but no output is attached. Check Diagnostics for details.', 'warning');
         } else {

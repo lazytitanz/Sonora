@@ -12,38 +12,33 @@ internal static class ExclusiveFormatNegotiator
 {
     /// <summary>
     /// Probes exclusive capability for <paramref name="preferred"/> on <paramref name="device"/>.
-    /// Builds a temporary exclusive <see cref="WasapiPlayer"/> for format queries only; never calls Init with PCM.
+    /// Uses <see cref="MMDevice.AudioClient"/> format queries only — does not build a
+    /// <see cref="WasapiPlayer"/> or call <c>Initialize</c>, so the endpoint is not taken
+    /// exclusively during the probe (avoids exclusive open/close churn before the real open).
     /// </summary>
     public static AudioOutputFormatProbeResult Probe(MMDevice device, AudioFormat preferred)
     {
         ArgumentNullException.ThrowIfNull(device);
 
-        WasapiPlayer? player = null;
+        AudioClient? client = null;
         try
         {
-            player = new WasapiPlayerBuilder()
-                .WithExclusiveMode()
-                .WithEventSync()
-                .WithDevice(device)
-                .WithLatency(50)
-                .Build();
-
+            client = device.CreateAudioClient();
             var preferredWave = WaveFormat.CreateIeeeFloatWaveFormat(preferred.SampleRate, preferred.ChannelCount);
-            if (player.IsFormatSupported(preferredWave))
+            if (client.IsFormatSupported(AudioClientShareMode.Exclusive, preferredWave))
             {
                 return new AudioOutputFormatProbeResult(
                     Supported: true,
                     RequiredSessionFormat: AudioFormat.CreateFloat32(preferred.SampleRate, preferred.ChannelCount));
             }
 
-            var supported = player.GetSupportedExclusiveFormat(preferredWave);
+            var supported = FindSupportedExclusiveFormat(client, preferredWave);
             if (supported is null)
             {
-                // Try PCM 16/24/32 at the preferred rate via GetSupportedExclusiveFormat from int preferred.
                 foreach (var bits in new[] { 32, 24, 16 })
                 {
                     var pcmPreferred = new WaveFormat(preferred.SampleRate, bits, preferred.ChannelCount);
-                    supported = player.GetSupportedExclusiveFormat(pcmPreferred);
+                    supported = FindSupportedExclusiveFormat(client, pcmPreferred);
                     if (supported is not null)
                     {
                         break;
@@ -78,7 +73,45 @@ internal static class ExclusiveFormatNegotiator
         }
         finally
         {
-            player?.Dispose();
+            client?.Dispose();
+        }
+    }
+
+    private static WaveFormat? FindSupportedExclusiveFormat(AudioClient client, WaveFormat preferred)
+    {
+        // Mirror WasapiPlayer.GetSupportedExclusiveFormat: try exact, then channel/bit variants at same rate.
+        if (client.IsFormatSupported(AudioClientShareMode.Exclusive, preferred))
+        {
+            return preferred;
+        }
+
+        foreach (var channels in Distinct(preferred.Channels, 2, 1, 6, 8))
+        {
+            foreach (var bits in Distinct(preferred.BitsPerSample, 32, 24, 16))
+            {
+                WaveFormat candidate = preferred.Encoding == WaveFormatEncoding.IeeeFloat && bits == 32
+                    ? WaveFormat.CreateIeeeFloatWaveFormat(preferred.SampleRate, channels)
+                    : new WaveFormat(preferred.SampleRate, bits, channels);
+
+                if (client.IsFormatSupported(AudioClientShareMode.Exclusive, candidate))
+                {
+                    return candidate;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<int> Distinct(int first, params int[] rest)
+    {
+        yield return first;
+        foreach (var value in rest)
+        {
+            if (value != first)
+            {
+                yield return value;
+            }
         }
     }
 }

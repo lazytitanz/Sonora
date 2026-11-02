@@ -260,4 +260,90 @@ public sealed class WindowsPlaybackTests
         Assert.Null(error);
         Assert.Equal(PlaybackState.Stopped, player.State);
     }
+
+    [HardwareFact]
+    [Trait("Category", "Hardware")]
+    public async Task Hardware_Exclusive_Pause_PositionDoesNotAdvance_AndResumeWorks()
+    {
+        var path = FixtureHelper.EnsureToneWav(TimeSpan.FromMilliseconds(2000));
+        using var engine = SonoraWindows.CreateEngine();
+        await using var player = engine.CreatePlayer();
+
+        Exception? error = null;
+        player.ErrorOccurred += (_, ex) => Interlocked.Exchange(ref error, ex);
+
+        await player.LoadAsync(path);
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration
+        {
+            Mode = AudioOutputMode.Exclusive,
+            ExclusiveFallback = ExclusiveModeFallback.None,
+        });
+        if (player.EffectiveOutputMode != AudioOutputMode.Exclusive)
+        {
+            return;
+        }
+
+        player.Volume = 0.05f;
+        player.Play();
+        await Task.Delay(250);
+        Assert.Equal(PlaybackState.Playing, player.State);
+
+        player.Pause();
+        Assert.Equal(PlaybackState.Paused, player.State);
+        var pausedAt = player.Position;
+        await Task.Delay(500);
+        var pausedDelta = (player.Position - pausedAt).Duration();
+        Assert.True(
+            pausedDelta < TimeSpan.FromMilliseconds(80),
+            $"Exclusive pause advanced position by {pausedDelta.TotalMilliseconds:F1} ms (client likely still rendering).");
+        Assert.Null(error);
+
+        player.Play();
+        await Task.Delay(350);
+        Assert.Equal(PlaybackState.Playing, player.State);
+        Assert.True(
+            player.Position >= pausedAt,
+            $"Resume rewound or stalled position (pausedAt={pausedAt}, now={player.Position}).");
+        // Allow a short settle window: exclusive pause restarts the device clock.
+        Assert.True(
+            player.Position > pausedAt - TimeSpan.FromMilliseconds(5),
+            $"Exclusive resume position {player.Position} drifted behind pause hold {pausedAt}.");
+        var advanced = player.Position - pausedAt;
+        Assert.True(
+            advanced > TimeSpan.FromMilliseconds(40),
+            $"Exclusive resume did not advance audible position (delta={advanced.TotalMilliseconds:F1} ms).");
+        Assert.Null(error);
+        player.Stop();
+    }
+
+    [HardwareFact]
+    [Trait("Category", "Hardware")]
+    public async Task Hardware_SharedToExclusive_RepeatedSwitches_DoNotNativeCrash()
+    {
+        var path = FixtureHelper.EnsureToneWav(TimeSpan.FromMilliseconds(1200));
+        using var engine = SonoraWindows.CreateEngine();
+        await using var player = engine.CreatePlayer();
+
+        Exception? error = null;
+        player.ErrorOccurred += (_, ex) => Interlocked.Exchange(ref error, ex);
+
+        await player.LoadAsync(path);
+        player.Volume = 0.04f;
+        player.Play();
+
+        for (var i = 0; i < 6; i++)
+        {
+            await player.ConfigureOutputAsync(new AudioOutputConfiguration
+            {
+                Mode = i % 2 == 0 ? AudioOutputMode.Exclusive : AudioOutputMode.Shared,
+                ExclusiveFallback = ExclusiveModeFallback.None,
+            });
+            await Task.Delay(120);
+            Assert.True(player.HasSource);
+            Assert.Null(error);
+        }
+
+        // Surviving without a process-killing AV is the primary assertion.
+        Assert.True(player.State is PlaybackState.Playing or PlaybackState.Stopped or PlaybackState.Paused);
+    }
 }

@@ -24,6 +24,46 @@ public class OutputModeTests
     }
 
     [Fact]
+    public async Task ConfigureExclusive_BeforeLoad_StoresPreferenceWithoutAttaching()
+    {
+        using var engine = CreateEngine();
+        using var player = engine.CreatePlayer();
+
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration
+        {
+            Mode = AudioOutputMode.Exclusive,
+            ExclusiveFallback = ExclusiveModeFallback.None,
+        });
+
+        Assert.False(player.HasSource);
+        Assert.Equal(AudioOutputMode.Exclusive, player.OutputConfiguration.Mode);
+        Assert.Null(player.EffectiveOutputMode);
+
+        await player.LoadAsync("track.wav");
+        Assert.Equal(AudioOutputMode.Exclusive, player.EffectiveOutputMode);
+        Assert.Equal(PlaybackState.Stopped, player.State);
+    }
+
+    [Fact]
+    public async Task ConfigureExclusive_AfterLoad_BeforePlay_AttachesExclusive()
+    {
+        using var engine = CreateEngine();
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync("track.wav");
+        Assert.Equal(AudioOutputMode.Shared, player.EffectiveOutputMode);
+
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration
+        {
+            Mode = AudioOutputMode.Exclusive,
+            ExclusiveFallback = ExclusiveModeFallback.None,
+        });
+
+        Assert.Equal(AudioOutputMode.Exclusive, player.EffectiveOutputMode);
+        Assert.Equal(PlaybackState.Stopped, player.State);
+        Assert.True(player.HasSource);
+    }
+
+    [Fact]
     public async Task ConfigureExclusive_SetsEffectiveExclusive()
     {
         var outputs = new FakeAudioOutputFactory((req, _) =>
@@ -315,6 +355,117 @@ public class OutputModeTests
     }
 
     [Fact]
+    public async Task Exclusive_Pause_Resume_DoesNotReplayConsumedPcm()
+    {
+        FakeAudioOutput? exclusive = null;
+        var outputs = new FakeAudioOutputFactory((req, _) =>
+        {
+            var output = new FakeAudioOutput(endpointId: req.DeviceId ?? "a", blockSamples: 32);
+            if (req.Mode == AudioOutputMode.Exclusive)
+            {
+                exclusive = output;
+            }
+
+            return output;
+        });
+
+        using var engine = CreateEngine(outputs: outputs);
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync("track.wav");
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration
+        {
+            Mode = AudioOutputMode.Exclusive,
+            ExclusiveFallback = ExclusiveModeFallback.None,
+        });
+
+        player.Play();
+        await WaitForAsync(() => exclusive is { ReadCount: > 4 }, TimeSpan.FromSeconds(2));
+        Assert.NotNull(exclusive);
+
+        player.Pause();
+        Assert.Equal(PlaybackState.Paused, player.State);
+        Assert.True(exclusive.IsPullLoopIdle);
+
+        var readsAtPause = exclusive.ReadCount;
+        int capturedAtPause;
+        lock (exclusive.CapturedSamples)
+        {
+            capturedAtPause = exclusive.CapturedSamples.Count;
+        }
+
+        await Task.Delay(80);
+        Assert.Equal(readsAtPause, exclusive.ReadCount);
+        lock (exclusive.CapturedSamples)
+        {
+            Assert.Equal(capturedAtPause, exclusive.CapturedSamples.Count);
+        }
+
+        player.Play();
+        await WaitForAsync(() => exclusive.ReadCount > readsAtPause, TimeSpan.FromSeconds(2));
+        Assert.Equal(PlaybackState.Playing, player.State);
+        Assert.True(exclusive.ReadCount > readsAtPause);
+    }
+
+    [Fact]
+    public async Task Exclusive_RepeatedPauseResume_RemainsStable()
+    {
+        using var engine = CreateEngine();
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync("track.wav");
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration { Mode = AudioOutputMode.Exclusive });
+        player.Play();
+
+        for (var i = 0; i < 5; i++)
+        {
+            player.Pause();
+            Assert.Equal(PlaybackState.Paused, player.State);
+            player.Play();
+            Assert.Equal(PlaybackState.Playing, player.State);
+        }
+
+        Assert.Equal(AudioOutputMode.Exclusive, player.EffectiveOutputMode);
+        Assert.True(player.HasSource);
+    }
+
+    [Fact]
+    public async Task Pause_ImmediatelyAfterSharedToExclusive_PreservesPausedState()
+    {
+        using var engine = CreateEngine();
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync("track.wav");
+        player.Play();
+
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration
+        {
+            Mode = AudioOutputMode.Exclusive,
+            ExclusiveFallback = ExclusiveModeFallback.None,
+        });
+        player.Pause();
+
+        Assert.Equal(PlaybackState.Paused, player.State);
+        Assert.Equal(AudioOutputMode.Exclusive, player.EffectiveOutputMode);
+
+        player.Play();
+        Assert.Equal(PlaybackState.Playing, player.State);
+    }
+
+    [Fact]
+    public async Task Stop_WhilePausedExclusive_ResetsTransport()
+    {
+        using var engine = CreateEngine();
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync("track.wav");
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration { Mode = AudioOutputMode.Exclusive });
+        player.Play();
+        player.Pause();
+        player.Stop();
+
+        Assert.Equal(PlaybackState.Stopped, player.State);
+        Assert.Equal(AudioOutputMode.Exclusive, player.EffectiveOutputMode);
+        Assert.True(player.Position < TimeSpan.FromMilliseconds(50));
+    }
+
+    [Fact]
     public async Task RapidModeChanges_SettleOnLastRequest()
     {
         using var engine = CreateEngine();
@@ -460,6 +611,20 @@ public class OutputModeTests
 
         Assert.Equal(AudioOutputFailureKind.UnsupportedFormat, ex.FailureKind);
         Assert.True(player.HasSource);
+    }
+
+    private static async Task WaitForAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var start = Environment.TickCount64;
+        while (!condition())
+        {
+            if (Environment.TickCount64 - start > timeout.TotalMilliseconds)
+            {
+                throw new TimeoutException("Condition was not met within the timeout.");
+            }
+
+            await Task.Delay(5);
+        }
     }
 
     private static AudioEngine CreateEngine(FakeAudioOutputFactory? outputs = null)

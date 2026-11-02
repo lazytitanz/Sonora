@@ -55,6 +55,54 @@ public sealed class PcmSampleProviderAdapterTests
         Assert.Equal(1, Volatile.Read(ref eos));
     }
 
+    [Fact]
+    public void Short_read_without_eos_is_padded_but_does_not_latch_eos()
+    {
+        var eos = 0;
+        // One short read, source remains open (underrun-like).
+        var source = new ScriptedSource(Format, [3]) { MarkEndedAfterReads = 0, EndWhenQueueEmpty = false };
+        var adapter = new PcmSampleProviderAdapter(source, () => Interlocked.Increment(ref eos));
+        Span<float> buffer = stackalloc float[8];
+
+        Assert.Equal(8, adapter.Read(buffer));
+        Assert.Equal(0, Volatile.Read(ref eos));
+        Assert.False(adapter.HasSignaledEndOfStream);
+    }
+
+    [Fact]
+    public void SetPaused_returns_silence_without_consuming_source()
+    {
+        var source = new ScriptedSource(Format, [8, 8]);
+        var adapter = new PcmSampleProviderAdapter(source);
+        Span<float> buffer = stackalloc float[8];
+
+        adapter.SetPaused(true);
+        Assert.Equal(8, adapter.Read(buffer));
+        Assert.All(buffer.ToArray(), s => Assert.Equal(0f, s));
+        Assert.Equal(2, source.RemainingReads);
+
+        adapter.SetPaused(false);
+        Assert.Equal(8, adapter.Read(buffer));
+        Assert.Equal(1, source.RemainingReads);
+    }
+
+    [Fact]
+    public void ResetEndOfStreamLatch_allows_reads_again()
+    {
+        var source = new ScriptedSource(Format, []) { IsEndOfStream = true };
+        var adapter = new PcmSampleProviderAdapter(source);
+        Span<float> buffer = stackalloc float[4];
+        Assert.Equal(4, adapter.Read(buffer));
+        Assert.True(adapter.HasSignaledEndOfStream);
+
+        source.IsEndOfStream = false;
+        source.Enqueue(4);
+        adapter.ResetEndOfStreamLatch();
+        Assert.False(adapter.HasSignaledEndOfStream);
+        Assert.Equal(4, adapter.Read(buffer));
+        Assert.False(adapter.HasSignaledEndOfStream);
+    }
+
     private sealed class ScriptedSource : IPcmSampleSource
     {
         private readonly Queue<int> _reads;
@@ -68,12 +116,25 @@ public sealed class PcmSampleProviderAdapterTests
         public AudioFormat Format { get; }
         public bool IsEndOfStream { get; set; }
         public int MarkEndedAfterReads { get; set; }
+        public bool EndWhenQueueEmpty { get; set; } = true;
+        public int RemainingReads => _reads.Count;
+
+        public void Enqueue(int samples) => _reads.Enqueue(samples);
 
         public int Read(Span<float> destination)
         {
-            if (IsEndOfStream || _reads.Count == 0)
+            if (IsEndOfStream)
             {
-                IsEndOfStream = true;
+                return 0;
+            }
+
+            if (_reads.Count == 0)
+            {
+                if (EndWhenQueueEmpty)
+                {
+                    IsEndOfStream = true;
+                }
+
                 return 0;
             }
 
@@ -88,7 +149,7 @@ public sealed class PcmSampleProviderAdapterTests
                 }
             }
 
-            if (_reads.Count == 0)
+            if (EndWhenQueueEmpty && _reads.Count == 0)
             {
                 IsEndOfStream = true;
             }

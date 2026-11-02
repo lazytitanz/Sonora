@@ -63,6 +63,13 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     /// </summary>
     private int _acceptEndOfStreamCompletion;
 
+    /// <summary>
+    /// Brief pause after disposing a live WASAPI output before opening exclusive mode on the
+    /// same endpoint. Mitigates intermittent native crashes in <c>IAudioRenderClient.GetBuffer</c>
+    /// observed when Shared→Exclusive rebinds immediately.
+    /// </summary>
+    private static readonly TimeSpan ExclusiveEndpointReleaseGrace = TimeSpan.FromMilliseconds(50);
+
     private TrackDecodePipeline? _active;
     private IAudioOutput? _output;
     private TransitionSampleSource? _sampleSource;
@@ -567,6 +574,15 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
         ThrowIfSwitchSuperseded(switchGeneration, switchToken);
 
+        // WASAPI: opening exclusive immediately after tearing down a shared client on the same
+        // endpoint can intermittently native-crash inside IAudioRenderClient.GetBuffer (0xC0000005)
+        // on some drivers. Give the endpoint a brief release window before rebinding exclusive.
+        if (configuration.Mode == AudioOutputMode.Exclusive && oldOutput is not null)
+        {
+            await Task.Delay(ExclusiveEndpointReleaseGrace, switchToken).ConfigureAwait(false);
+            ThrowIfSwitchSuperseded(switchGeneration, switchToken);
+        }
+
         await FinishOutputRebindAsync(
             preferredDeviceId,
             effectiveDeviceId,
@@ -944,6 +960,13 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 return;
             }
 
+            // Exclusive WASAPI Pause stops the device client; on resume the device clock restarts
+            // near zero. Re-anchor to the held logical position before starting the output again.
+            if (_state == PlaybackState.Paused)
+            {
+                RebasePositionClock_NoLock(_heldPosition);
+            }
+
             EnsureActivePumpRunning_NoLock();
             _active.Prime(_options.PrimeDuration);
             _completionRaised = false;
@@ -972,6 +995,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             }
 
             _heldPosition = EstimateAudiblePosition();
+            RebasePositionClock_NoLock(_heldPosition);
             _output?.Pause();
             SetState_NoLock(PlaybackState.Paused);
         }

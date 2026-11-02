@@ -24,8 +24,15 @@ public sealed record OutputConfigDto
 
     // ---- Effective (output only) ----
 
-    /// <summary>Mode of the currently attached output, or <see langword="null"/> when none is attached.</summary>
+    /// <summary>
+    /// Mode of the currently attached output, or <see langword="null"/> when none is attached.
+    /// Sonora stores <see cref="Mode"/> even before a track is loaded; <see cref="EffectiveMode"/>
+    /// stays null until an output instance is created (typically on Load or a configure-with-source).
+    /// </summary>
     public AudioOutputMode? EffectiveMode { get; init; }
+
+    /// <summary>Whether the player currently has a loaded audio source.</summary>
+    public bool HasSource { get; init; }
 
     /// <summary>Why shared fallback is active or why the last exclusive attempt was classified.</summary>
     public ExclusiveFallbackReason FallbackReason { get; init; }
@@ -70,6 +77,7 @@ public sealed record OutputConfigDto
             ExclusiveFallback = requested.ExclusiveFallback,
             RequestedLatencyMs = requested.RequestedLatency?.TotalMilliseconds,
             EffectiveMode = player.EffectiveOutputMode,
+            HasSource = player.HasSource,
             FallbackReason = player.OutputFallbackReason,
             DeviceStatus = player.OutputDeviceStatus,
             PreferredDeviceId = player.PreferredOutputDeviceId,

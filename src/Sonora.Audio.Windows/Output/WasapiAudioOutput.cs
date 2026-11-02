@@ -79,10 +79,8 @@ internal sealed class WasapiAudioOutput : IAudioOutput
         try
         {
             device = ResolveDevice(deviceId);
-            var result = ExclusiveFormatNegotiator.Probe(device, preferred);
-            // Probe builds a WasapiPlayer that retains MMDevice and disposes it with the player.
-            device = null;
-            return result;
+            // Query-only probe: does not Initialize or take exclusive ownership of the endpoint.
+            return ExclusiveFormatNegotiator.Probe(device, preferred);
         }
         catch (AudioException)
         {
@@ -205,6 +203,12 @@ internal sealed class WasapiAudioOutput : IAudioOutput
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         EnsureInitialized();
+
+        // Clear exclusive silence-pause and allow Stopped after a prior EOS stop.
+        _adapter?.SetPaused(false);
+        Interlocked.Exchange(ref _stoppedRaised, 0);
+        Interlocked.Exchange(ref _eosStopRequested, 0);
+
         _player.Play();
     }
 
@@ -213,6 +217,16 @@ internal sealed class WasapiAudioOutput : IAudioOutput
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (!_initialized)
         {
+            return;
+        }
+
+        if (_mode == AudioOutputMode.Exclusive)
+        {
+            // NAudio WasapiPlayer.Pause only flips PlaybackState and skips FillBuffer while leaving
+            // IAudioClient running. Exclusive event mode then typically repeats the last period
+            // (~1 ms loop). Keep the client/thread running and feed silence from the adapter
+            // instead — avoids the loop without Stop()/Restart races that can AV GetBuffer.
+            _adapter?.SetPaused(true);
             return;
         }
 
@@ -227,6 +241,7 @@ internal sealed class WasapiAudioOutput : IAudioOutput
             return;
         }
 
+        _adapter?.SetPaused(false);
         _player.Stop();
     }
 
