@@ -66,23 +66,33 @@ public sealed class WindowsAudioDecoderFactory : IAudioDecoderFactory
         }
         catch (NetworkAudioException)
         {
-            // Fall back to forward-only progressive stream when ranges are unavailable.
+            // Fall back when ranges are unavailable or the server lied about Content-Range (live radio).
         }
 
+        // Progressive forward-only works for some containers (e.g. Ogg); MF still needs seekable bytes.
         var forward = new HttpContentByteStream(http.Uri, _httpOptions);
         var transferred = false;
+        NotSupportedException? nonSeekable = null;
         try
         {
             await forward.OpenAsync(cancellationToken).ConfigureAwait(false);
-            var decoder = await OpenOwnedAsync(
-                    forward,
-                    http.Uri.AbsoluteUri,
-                    forward.ContentType,
-                    d => NetworkTransportDecoder.ForHttpContent(forward, d),
-                    cancellationToken)
-                .ConfigureAwait(false);
-            transferred = true;
-            return decoder;
+            try
+            {
+                var decoder = await OpenOwnedAsync(
+                        forward,
+                        http.Uri.AbsoluteUri,
+                        forward.ContentType,
+                        d => NetworkTransportDecoder.ForHttpContent(forward, d),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                transferred = true;
+                return decoder;
+            }
+            catch (NotSupportedException ex)
+            {
+                // MF rejected the non-seekable byte stream — try MF's own URL HTTP stack below.
+                nonSeekable = ex;
+            }
         }
         finally
         {
@@ -91,6 +101,34 @@ public sealed class WindowsAudioDecoderFactory : IAudioDecoderFactory
                 await forward.DisposeAsync().ConfigureAwait(false);
             }
         }
+
+        // Live Icecast/SHOUTcast MP3 mounts: Media Foundation can open the URL directly.
+        try
+        {
+            return await OpenMediaFoundationUrlAsync(http.Uri, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (
+            ex is not OperationCanceledException
+            && ex is not ObjectDisposedException
+            && nonSeekable is not null)
+        {
+            throw new Sonora.Audio.UnsupportedFormatException(
+                $"The audio format of '{http.Uri.AbsoluteUri}' is not supported over a non-seekable HTTP stream.",
+                nonSeekable);
+        }
+    }
+
+    private static async Task<IAudioDecoder> OpenMediaFoundationUrlAsync(Uri uri, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return await Task.Run(
+            () =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                IAudioDecoder decoder = WaveStreamAudioDecoder.OpenMediaFoundationUrl(uri.AbsoluteUri);
+                return (IAudioDecoder)NetworkTransportDecoder.ForExternalReady(decoder);
+            },
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<IAudioDecoder> OpenOwnedAsync(

@@ -64,11 +64,18 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     private int _acceptEndOfStreamCompletion;
 
     /// <summary>
-    /// Brief pause after disposing a live WASAPI output before opening exclusive mode on the
-    /// same endpoint. Mitigates intermittent native crashes in <c>IAudioRenderClient.GetBuffer</c>
-    /// observed when Shared→Exclusive rebinds immediately.
+    /// Pause after disposing a live WASAPI output before opening exclusive mode on the
+    /// same endpoint. Short values (≤50ms) still allow intermittent native
+    /// <c>IAudioRenderClient.GetBuffer</c> AVs (<c>0xC0000005</c>) on some drivers when
+    /// Shared→Exclusive follows a device switch while playing.
     /// </summary>
-    private static readonly TimeSpan ExclusiveEndpointReleaseGrace = TimeSpan.FromMilliseconds(50);
+    private static readonly TimeSpan ExclusiveEndpointReleaseGrace = TimeSpan.FromMilliseconds(400);
+
+    /// <summary>
+    /// Extra settle after constructing an exclusive client before <see cref="IAudioOutput.Initialize"/>,
+    /// and again before <see cref="IAudioOutput.Play"/> so the first GetBuffer is not immediate.
+    /// </summary>
+    private static readonly TimeSpan ExclusiveEndpointInitGrace = TimeSpan.FromMilliseconds(100);
 
     private TrackDecodePipeline? _active;
     private IAudioOutput? _output;
@@ -428,9 +435,9 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             _gate.Release();
         }
 
-        // Yield so callers can observe Switching / supersede this switch before teardown blocks
-        // the calling thread (Shutdown may wait for a live pull consumer).
-        await Task.Yield();
+        // Leave any UI SynchronizationContext before Stop/Join teardown (Task.Yield alone
+        // would bounce back onto WinForms and AppHang when Join runs on the UI thread).
+        await Task.Run(() => { }).ConfigureAwait(false);
         await WaitForOutputShutdownAsync().ConfigureAwait(false);
 
         // Join previous output outside the gate so pull-loop wait cannot deadlock.
@@ -566,7 +573,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             return;
         }
 
-        await Task.Yield();
+        await Task.Run(() => { }).ConfigureAwait(false);
         await WaitForOutputShutdownAsync().ConfigureAwait(false);
 
         try
@@ -1482,6 +1489,8 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     /// <summary>
     /// Guarantees the output will not read PCM again, then disposes it.
     /// Throws if quiescence cannot be guaranteed; Dispose is still attempted.
+    /// Always runs on the thread pool so WASAPI <c>Stop</c>/<c>Join</c> cannot deadlock a
+    /// WinForms/Vetra UI <see cref="SynchronizationContext"/> (AppHangB1).
     /// </summary>
     private static void ShutdownAndDispose(IAudioOutput? output)
     {
@@ -1491,27 +1500,30 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         }
 
         Exception? shutdownError = null;
-        try
+        Task.Run(() =>
         {
-            output.Shutdown();
-        }
-        catch (Exception ex)
-        {
-            shutdownError = ex is AudioOutputException
-                ? ex
-                : new AudioOutputException(
-                    "Output shutdown failed; replacement output was not started.",
-                    ex);
-        }
+            try
+            {
+                output.Shutdown();
+            }
+            catch (Exception ex)
+            {
+                shutdownError = ex is AudioOutputException
+                    ? ex
+                    : new AudioOutputException(
+                        "Output shutdown failed; replacement output was not started.",
+                        ex);
+            }
 
-        try
-        {
-            output.Dispose();
-        }
-        catch
-        {
-            // ignored — shutdown error (if any) is authoritative
-        }
+            try
+            {
+                output.Dispose();
+            }
+            catch
+            {
+                // ignored — shutdown error (if any) is authoritative
+            }
+        }).GetAwaiter().GetResult();
 
         if (shutdownError is not null)
         {
@@ -2330,7 +2342,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             _gate.Release();
         }
 
-        await Task.Yield();
+        await Task.Run(() => { }).ConfigureAwait(false);
         await WaitForOutputShutdownAsync().ConfigureAwait(false);
 
         try
@@ -2924,6 +2936,23 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             }
         }
 
+        // Exclusive Initialize/Play immediately after Create still AVs GetBuffer on some
+        // endpoints (especially after a prior Shared device switch). Brief settle helps.
+        if (modeToCreate == AudioOutputMode.Exclusive)
+        {
+            try
+            {
+                await Task.Delay(ExclusiveEndpointInitGrace, switchToken).ConfigureAwait(false);
+                ThrowIfSwitchSuperseded(switchGeneration, switchToken);
+            }
+            catch
+            {
+                ShutdownAndDispose(created);
+                created = null;
+                throw;
+            }
+        }
+
         var attachPosition = heldPosition;
         Exception? attachError = null;
         await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
@@ -2976,6 +3005,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             _gate.Release();
         }
 
+        var deferExclusivePlay = false;
         if (attachError is not null)
         {
             if (modeToCreate == AudioOutputMode.Exclusive
@@ -3042,7 +3072,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
                     if (attachError is null)
                     {
-                        CompleteRebindTransport_NoLock(
+                        deferExclusivePlay = CompleteRebindTransport_NoLock(
                             preferredDeviceId,
                             wasPlaying,
                             wasPaused,
@@ -3105,7 +3135,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                     throw CreateSupersededException();
                 }
 
-                CompleteRebindTransport_NoLock(
+                deferExclusivePlay = CompleteRebindTransport_NoLock(
                     preferredDeviceId,
                     wasPlaying,
                     wasPaused,
@@ -3119,6 +3149,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             }
         }
 
+        if (deferExclusivePlay)
+        {
+            await StartDeferredExclusivePlaybackAsync(switchGeneration, switchToken).ConfigureAwait(false);
+        }
+
         if (raiseConfigurationChanged
             || requestedMode == AudioOutputMode.Exclusive
             || pendingFallbackReason != ExclusiveFallbackReason.None)
@@ -3127,7 +3162,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         }
     }
 
-    private void CompleteRebindTransport_NoLock(
+    /// <returns>
+    /// <see langword="true"/> when exclusive playback was armed but <see cref="IAudioOutput.Play"/>
+    /// was deferred so the caller can settle the endpoint before starting the WASAPI play thread.
+    /// </returns>
+    private bool CompleteRebindTransport_NoLock(
         string? preferredDeviceId,
         bool wasPlaying,
         bool wasPaused,
@@ -3145,6 +3184,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 ? OutputDeviceStatus.PreferredUnavailable
                 : OutputDeviceStatus.Available;
 
+        var deferExclusivePlay = false;
         if (wasPlaying || _outputRecoveryIntent == OutputRecoveryIntent.ResumePlaying)
         {
             EnsureActivePumpRunning_NoLock();
@@ -3152,7 +3192,17 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             _completionRaised = false;
             Volatile.Write(ref _acceptEndOfStreamCompletion, 1);
             SetState_NoLock(PlaybackState.Playing);
-            _output!.Play();
+            if (modeToCreate == AudioOutputMode.Exclusive)
+            {
+                // Defer Play: starting the exclusive play thread in the same breath as Init
+                // still AVs GetBuffer on some drivers after a Shared device switch.
+                deferExclusivePlay = true;
+            }
+            else
+            {
+                _output!.Play();
+            }
+
             _outputRecoveryIntent = OutputRecoveryIntent.None;
         }
         else if (wasPaused || _outputRecoveryIntent == OutputRecoveryIntent.RemainPaused)
@@ -3166,6 +3216,31 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         }
 
         RaiseOutputDeviceChanged(OutputDeviceChangeReason.SelectionChanged);
+        return deferExclusivePlay;
+    }
+
+    private async Task StartDeferredExclusivePlaybackAsync(
+        int switchGeneration,
+        CancellationToken switchToken)
+    {
+        await Task.Delay(ExclusiveEndpointInitGrace, switchToken).ConfigureAwait(false);
+        ThrowIfSwitchSuperseded(switchGeneration, switchToken);
+
+        await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            ThrowIfSwitchSuperseded(switchGeneration, switchToken);
+            if (_output is null || _state != PlaybackState.Playing)
+            {
+                return;
+            }
+
+            _output.Play();
+        }
+        finally
+        {
+            _gate.Release();
+        }
     }
 
     private void ApplyStrictOutputFailure_NoLock(

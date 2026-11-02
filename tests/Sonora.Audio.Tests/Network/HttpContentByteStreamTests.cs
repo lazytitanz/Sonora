@@ -163,6 +163,92 @@ public sealed class HttpContentByteStreamTests
     }
 
     [Fact]
+    public async Task IcecastFakeContentRange_RandomAccessOpen_ThrowsNetworkAudioException()
+    {
+        var handler = new FakeHttpMessageHandler(req =>
+        {
+            var probe = new HttpResponseMessage(HttpStatusCode.PartialContent)
+            {
+                Content = new ByteArrayContent(new byte[] { 0xFF }),
+            };
+            probe.Content.Headers.ContentType = new MediaTypeHeaderValue("audio/mpeg");
+            probe.Content.Headers.ContentLength = 1;
+            probe.Content.Headers.ContentRange = new ContentRangeHeaderValue(
+                0, 0, HttpLiveStreamProbe.IcecastFakeLength);
+            probe.Headers.TryAddWithoutValidation("icy-name", "Groove Salad");
+            return probe;
+        });
+
+        using var client = new HttpClient(handler);
+        var options = CreateOptions(client);
+        var ex = await Assert.ThrowsAsync<NetworkAudioException>(
+            () => HttpRandomAccessStream.OpenAsync(new Uri("http://test.local/live.mp3"), options));
+        Assert.Contains("live stream", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task IcecastFakeContentRange_OpensForwardOnlyWithoutRange()
+    {
+        var body = FakeHttpMessageHandler.AsciiPayload(2048, 'L');
+        var requests = new List<string>();
+        var handler = new FakeHttpMessageHandler(req =>
+        {
+            var range = req.Headers.Range?.Ranges.FirstOrDefault();
+            requests.Add(range is null
+                ? "none"
+                : $"{range.From}-{range.To?.ToString() ?? string.Empty}");
+
+            // Probe Range: 0-0 → classic Icecast live lie.
+            if (range is { From: 0, To: 0 })
+            {
+                var probe = new HttpResponseMessage(HttpStatusCode.PartialContent)
+                {
+                    Content = new ByteArrayContent(new byte[] { body[0] }),
+                };
+                probe.Content.Headers.ContentType = new MediaTypeHeaderValue("audio/mpeg");
+                probe.Content.Headers.ContentLength = 1;
+                probe.Content.Headers.ContentRange = new ContentRangeHeaderValue(
+                    0, 0, HttpLiveStreamProbe.IcecastFakeLength);
+                probe.Headers.TryAddWithoutValidation("icy-name", "Test Live");
+                probe.Headers.TryAddWithoutValidation("icy-br", "128");
+                return probe;
+            }
+
+            // Unranged reopen must succeed; open-ended Range must not be required.
+            Assert.Null(req.Headers.Range);
+            return FakeHttpMessageHandler.Ok(body, etag: null);
+        });
+
+        using var client = new HttpClient(handler);
+        var options = CreateOptions(client, initial: 64);
+        await using var stream = new HttpContentByteStream(new Uri("http://test.local/live.mp3"), options);
+        await stream.OpenAsync();
+
+        Assert.False(stream.CanSeek);
+        Assert.Contains("0-0", requests);
+        Assert.Contains("none", requests);
+        Assert.DoesNotContain("0-", requests);
+
+        var buf = new byte[128];
+        Assert.True(stream.Read(buf) > 0);
+    }
+
+    [Fact]
+    public async Task ConnectTimeout_ThrowsNetworkAudioExceptionNotBareCancel()
+    {
+        var handler = new FakeHttpMessageHandler(async (_, ct) =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(30), ct);
+            return FakeHttpMessageHandler.Ok(FakeHttpMessageHandler.AsciiPayload(16));
+        });
+        using var client = new HttpClient(handler);
+        var options = CreateOptions(client, connectTimeout: TimeSpan.FromMilliseconds(80));
+        await using var stream = new HttpContentByteStream(new Uri("http://test.local/slow.mp3"), options);
+        var ex = await Assert.ThrowsAsync<NetworkAudioException>(() => stream.OpenAsync());
+        Assert.Contains("Timed out", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Cancellation_AbortsOpen()
     {
         var handler = new FakeHttpMessageHandler(async (_, ct) =>

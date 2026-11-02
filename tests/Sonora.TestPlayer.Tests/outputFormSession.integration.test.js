@@ -104,6 +104,45 @@ describe('output form session integration', () => {
     assert.deepEqual(afterShared.sentRequests.map((r) => r.mode), ['exclusive', 'shared']);
   });
 
+  it('in-flight Exclusive ignores Switching snapshots until EffectiveMode settles', () => {
+    const session = logic.createFormSession(outputState({
+      mode: 'shared',
+      effectiveMode: 'shared',
+      hasSource: true,
+    }));
+
+    session.selectMode('exclusive');
+    assert.equal(session.beginApply().ok, true);
+    assert.equal(session.snapshot().configureInFlight, true);
+
+    // Mid-rebind: requested mode already Exclusive, but EffectiveMode is null.
+    const midSwitch = session.receiveOutput(outputState({
+      mode: 'exclusive',
+      exclusiveFallback: 'none',
+      effectiveMode: null,
+      deviceStatus: 'switching',
+      hasSource: true,
+    }));
+    assert.equal(midSwitch.configureInFlight, true);
+    assert.equal(midSwitch.lastReconcile, null);
+    assert.equal(midSwitch.savedRequest.mode, 'shared');
+    assert.deepEqual(midSwitch.sentRequests, []);
+
+    // Settled exclusive attach completes the in-flight Apply.
+    const settled = session.receiveOutput(outputState({
+      mode: 'exclusive',
+      exclusiveFallback: 'none',
+      effectiveMode: 'exclusive',
+      deviceStatus: 'available',
+      hasSource: true,
+      activeDeviceId: 'dev-1',
+    }));
+    assert.equal(settled.configureInFlight, false);
+    assert.equal(settled.lastReconcile, 'outputMatchedPending');
+    assert.equal(settled.savedRequest.mode, 'exclusive');
+    assert.deepEqual(settled.sentRequests.map((r) => r.mode), ['exclusive']);
+  });
+
   it('in-flight Exclusive is reconciled from output events; selecting Shared then enables Apply', () => {
     const session = logic.createFormSession(outputState({ mode: 'shared', effectiveMode: 'shared' }));
 
@@ -208,6 +247,13 @@ describe('output form session integration', () => {
 
   it('exposes a non-empty asset build id for runtime verification', () => {
     assert.match(logic.ASSET_BUILD_ID, /^output-form-/);
-    assert.equal(logic.ASSET_BUILD_ID, 'output-form-2026-11-02c');
+    assert.equal(logic.ASSET_BUILD_ID, 'output-form-2026-11-02d');
+  });
+
+  it('isOutputSwitching detects mid-rebind deviceStatus', () => {
+    assert.equal(logic.isOutputSwitching({ deviceStatus: 'switching' }), true);
+    assert.equal(logic.isOutputSwitching({ DeviceStatus: 'Switching' }), true);
+    assert.equal(logic.isOutputSwitching({ deviceStatus: 'available' }), false);
+    assert.equal(logic.isOutputSwitching(null), false);
   });
 });

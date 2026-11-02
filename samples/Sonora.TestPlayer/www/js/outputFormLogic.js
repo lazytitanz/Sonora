@@ -6,7 +6,14 @@
   'use strict';
 
   const DEFAULT_LATENCY_INPUT_MS = 100;
-  const ASSET_BUILD_ID = 'output-form-2026-11-02c';
+  const ASSET_BUILD_ID = 'output-form-2026-11-02d';
+
+  /** True when the host snapshot is mid exclusive↔shared rebind (EffectiveMode may be null). */
+  function isOutputSwitching(output) {
+    if (!output) return false;
+    const status = output.deviceStatus != null ? output.deviceStatus : output.DeviceStatus;
+    return String(status == null ? '' : status).trim().toLowerCase() === 'switching';
+  }
 
   function normalizeMode(value) {
     // Vetra may emit camelCase strings or numeric JsonStringEnum fallbacks.
@@ -149,10 +156,12 @@
     /**
      * Host output snapshot. While an Apply is in flight, a matching requested config
      * completes the apply even if the bridge promise is still pending (or refresh hangs).
+     * Mid-rebind "switching" snapshots are ignored for reconcile — requested mode may
+     * already match while EffectiveMode is still null (false-alarm exclusive toast).
      * Dirty user edits (e.g. switching back to Shared) are preserved.
      */
     function receiveOutput(output) {
-      if (configureInFlight && pendingRequest) {
+      if (configureInFlight && pendingRequest && !isOutputSwitching(output)) {
         const incoming = requestedFromOutput(output);
         if (requestsEqual(incoming, pendingRequest)) {
           return completeApplySuccess(output, { preserveDirtyForm: true, source: 'outputMatchedPending' });
@@ -234,6 +243,7 @@
     normalizeMode,
     normalizeFallback,
     normalizeLatencyMs,
+    isOutputSwitching,
     requestedFromOutput,
     requestedFromForm,
     requestsEqual,

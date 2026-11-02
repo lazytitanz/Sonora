@@ -81,64 +81,87 @@ internal sealed class HttpContentByteStream : Stream
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetimeCts.Token);
         linked.CancelAfter(_options.ConnectTimeout);
 
-        var probe = await SendAsync(
-            createRequest: () => CreateRequest(HttpMethod.Get, rangeStart: 0, rangeEndInclusive: 0),
-            cancellationToken: linked.Token).ConfigureAwait(false);
-
         try
         {
-            ValidateHeaderBudget(probe);
-            if (probe.StatusCode == HttpStatusCode.PartialContent)
+            var probe = await SendAsync(
+                createRequest: () => CreateRequest(HttpMethod.Get, rangeStart: 0, rangeEndInclusive: 0),
+                cancellationToken: linked.Token).ConfigureAwait(false);
+
+            try
             {
-                var identity = ParseIdentity(probe);
-                if (!TryParseContentRange(probe, out var start, out var end, out var total)
-                    || start != 0
-                    || end < start
-                    || total is null or <= 0)
+                ValidateHeaderBudget(probe);
+                if (probe.StatusCode == HttpStatusCode.PartialContent)
                 {
+                    if (!TryParseContentRange(probe, out var start, out var end, out var total)
+                        || start != 0
+                        || end < start
+                        || total is null or <= 0)
+                    {
+                        probe.Dispose();
+                        throw new NetworkAudioException(
+                            $"Invalid Content-Range from '{HttpUriSafety.Describe(_uri)}'.");
+                    }
+
+                    _contentType = probe.Content.Headers.ContentType?.MediaType;
+
+                    // Live Icecast/SHOUTcast mounts lie about Content-Range — reopen without Range.
+                    if (HttpLiveStreamProbe.IsNonSeekablePartialContent(probe, total))
+                    {
+                        probe.Dispose();
+                        _identity = new HttpResourceIdentity(contentLength: null, strongETag: null, lastModified: null);
+                        _length = null;
+                        _canSeek = false;
+                        await StartProducerFromAsync(offset: 0, cancellationToken).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        _identity = ParseIdentity(probe);
+                        _length = total;
+                        _canSeek = true;
+                        // Discard the single probe byte body and reopen a full-range stream from 0.
+                        probe.Dispose();
+                        await StartProducerFromAsync(offset: 0, cancellationToken).ConfigureAwait(false);
+                    }
+                }
+                else if (probe.StatusCode == HttpStatusCode.OK)
+                {
+                    // Server ignored Range or does not support it — forward-only.
+                    _identity = ParseIdentity(probe);
+                    _length = probe.Content.Headers.ContentLength;
+                    _canSeek = false;
+                    _contentType = probe.Content.Headers.ContentType?.MediaType;
+                    _response = probe;
+                    _responseStream = await probe.Content.ReadAsStreamAsync(linked.Token).ConfigureAwait(false);
+                    _position = 0;
+                    _opened = true;
+                    SetStatus(NetworkTransportStatus.Buffering);
+                    _producer = Task.Run(() => ProducerLoopAsync(_lifetimeCts.Token), CancellationToken.None);
+                }
+                else
+                {
+                    var code = (int)probe.StatusCode;
                     probe.Dispose();
                     throw new NetworkAudioException(
-                        $"Invalid Content-Range from '{HttpUriSafety.Describe(_uri)}'.");
+                        $"HTTP {code} while opening '{HttpUriSafety.Describe(_uri)}'.");
                 }
+            }
+            catch
+            {
+                SetStatus(NetworkTransportStatus.Failed);
+                throw;
+            }
 
-                _identity = identity;
-                _length = total;
-                _canSeek = true;
-                _contentType = probe.Content.Headers.ContentType?.MediaType;
-                // Discard the single probe byte body and reopen a full-range stream from 0.
-                probe.Dispose();
-                await StartProducerFromAsync(offset: 0, cancellationToken).ConfigureAwait(false);
-            }
-            else if (probe.StatusCode == HttpStatusCode.OK)
-            {
-                // Server ignored Range or does not support it — forward-only.
-                _identity = ParseIdentity(probe);
-                _length = probe.Content.Headers.ContentLength;
-                _canSeek = false;
-                _contentType = probe.Content.Headers.ContentType?.MediaType;
-                _response = probe;
-                _responseStream = await probe.Content.ReadAsStreamAsync(linked.Token).ConfigureAwait(false);
-                _position = 0;
-                _opened = true;
-                SetStatus(NetworkTransportStatus.Buffering);
-                _producer = Task.Run(() => ProducerLoopAsync(_lifetimeCts.Token), CancellationToken.None);
-            }
-            else
-            {
-                var code = (int)probe.StatusCode;
-                probe.Dispose();
-                throw new NetworkAudioException(
-                    $"HTTP {(int)code} while opening '{HttpUriSafety.Describe(_uri)}'.");
-            }
+            await WaitForInitialBufferAsync(cancellationToken).ConfigureAwait(false);
+            SetStatus(NetworkTransportStatus.Ready);
         }
-        catch
+        catch (OperationCanceledException ex)
+            when (!cancellationToken.IsCancellationRequested && !_lifetimeCts.IsCancellationRequested)
         {
             SetStatus(NetworkTransportStatus.Failed);
-            throw;
+            throw new NetworkAudioException(
+                $"Timed out connecting to '{HttpUriSafety.Describe(_uri)}'.",
+                ex);
         }
-
-        await WaitForInitialBufferAsync(cancellationToken).ConfigureAwait(false);
-        SetStatus(NetworkTransportStatus.Ready);
     }
 
     public override int Read(byte[] buffer, int offset, int count)
@@ -289,9 +312,11 @@ internal sealed class HttpContentByteStream : Stream
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetimeCts.Token);
         linked.CancelAfter(_options.ConnectTimeout);
 
+        // Forward-only opens must not send Range: bytes=0- — Icecast live mounts often 403 or stall on it.
+        long? rangeStart = offset > 0 || _canSeek ? offset : null;
         long? rangeEnd = null;
         var response = await SendAsync(
-            () => CreateRequest(HttpMethod.Get, offset, rangeEnd),
+            () => CreateRequest(HttpMethod.Get, rangeStart, rangeEnd),
             linked.Token).ConfigureAwait(false);
 
         try

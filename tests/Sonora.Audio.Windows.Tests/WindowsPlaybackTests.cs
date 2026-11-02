@@ -1,3 +1,4 @@
+using Sonora.Audio.Devices;
 using Sonora.Audio.Formats;
 using Sonora.Audio.Output;
 using Sonora.Audio.Windows;
@@ -345,5 +346,65 @@ public sealed class WindowsPlaybackTests
 
         // Surviving without a process-killing AV is the primary assertion.
         Assert.True(player.State is PlaybackState.Playing or PlaybackState.Stopped or PlaybackState.Paused);
+    }
+
+    [HardwareFact]
+    [Trait("Category", "Hardware")]
+    public async Task Hardware_DeviceSwitchThenSharedToExclusive_WhilePlaying_DoNotNativeCrash()
+    {
+        // Regression: play → SetOutputDevice → Shared→Exclusive crashed some machines with
+        // IAudioRenderClient.GetBuffer AV (0xC0000005) on WasapiPlayer.PlayThread.
+        var path = FixtureHelper.EnsureToneWav(TimeSpan.FromMilliseconds(2000));
+        using var engine = SonoraWindows.CreateEngine();
+        await using var player = engine.CreatePlayer();
+
+        Exception? error = null;
+        player.ErrorOccurred += (_, ex) => Interlocked.Exchange(ref error, ex);
+
+        var devices = engine.OutputDevices.GetDevices()
+            .Where(d => d.State == AudioDeviceState.Active)
+            .Take(2)
+            .ToList();
+
+        await player.LoadAsync(path);
+        player.Volume = 0.04f;
+        player.Play();
+        await Task.Delay(150);
+
+        if (devices.Count >= 2)
+        {
+            var target = devices.FirstOrDefault(d => d.Id != player.ActiveOutputDeviceId) ?? devices[0];
+            await player.SetOutputDeviceAsync(target.Id);
+            await Task.Delay(100);
+        }
+        else
+        {
+            // Single-device machines: still exercise a no-op preference round-trip.
+            await player.SetOutputDeviceAsync(devices[0].Id);
+            await Task.Delay(50);
+        }
+
+        Assert.Equal(PlaybackState.Playing, player.State);
+
+        try
+        {
+            await player.ConfigureOutputAsync(new AudioOutputConfiguration
+            {
+                Mode = AudioOutputMode.Exclusive,
+                ExclusiveFallback = ExclusiveModeFallback.None,
+            });
+        }
+        catch (AudioOutputException)
+        {
+            Assert.True(player.HasSource);
+            Assert.Null(error);
+            return;
+        }
+
+        await Task.Delay(400);
+        Assert.Null(error);
+        Assert.Equal(AudioOutputMode.Exclusive, player.EffectiveOutputMode);
+        Assert.True(player.HasSource);
+        Assert.True(player.State is PlaybackState.Playing or PlaybackState.Paused or PlaybackState.Stopped);
     }
 }

@@ -117,12 +117,33 @@
     }
   }
 
+  function clearDeviceSwitchBusy() {
+    if (switchingId === undefined) return;
+    switchingId = undefined;
+    renderDevices();
+  }
+
+  /** True when the host output snapshot matches the in-flight Use click target. */
+  function outputMatchesSwitchTarget(out, targetId) {
+    if (!out || targetId === undefined) return false;
+    const preferred = out.preferredDeviceId == null ? null : String(out.preferredDeviceId);
+    const target = targetId == null ? null : String(targetId);
+    return preferred === target;
+  }
+
   async function selectDevice(id) {
     switchingId = id;
     renderDevices();
-    const result = await run('devices.set', [id], { label: 'Device switch' });
-    switchingId = undefined;
-    if (result.ok) toast(id === null ? 'Following the system default device.' : `Selected ${deviceName(id) || 'device'}.`, 'success');
+    try {
+      const result = await run('devices.set', [id], { label: 'Device switch' });
+      if (result.ok) {
+        toast(id === null ? 'Following the system default device.' : `Selected ${deviceName(id) || 'device'}.`, 'success');
+      }
+    } finally {
+      // Always re-render after clearing: refresh may no-op when output events already
+      // applied the settled Available snapshot while switchingId was still set.
+      clearDeviceSwitchBusy();
+    }
     await refresh({ quiet: true });
     await TP.core.refreshSnapshot();
   }
@@ -221,6 +242,11 @@
   }
 
   function toastConfigureResult(out) {
+    // Mid exclusive↔shared rebind: EffectiveMode is briefly null while music continues.
+    // Do not warn until the host reports a settled snapshot.
+    if (logic.isOutputSwitching(out)) {
+      return;
+    }
     const eff = out && out.effectiveMode;
     const requested = out && out.mode;
     const hasSource = out && out.hasSource;
@@ -440,9 +466,16 @@
       renderDevices();
     });
     TP.bus.on('output', (payload) => {
+      const out = payload || state.output;
+      // Host often settles to Available before devices.set returns; drop the local
+      // spinner as soon as the preferred device matches the Use click target.
+      if (switchingId !== undefined && out && !logic.isOutputSwitching(out)
+        && outputMatchesSwitchTarget(out, switchingId)) {
+        switchingId = undefined;
+      }
       renderEffective();
       renderDevices();
-      syncFormFromOutput(payload || state.output);
+      syncFormFromOutput(out);
     });
 
     updateApplyEnabled();

@@ -50,6 +50,17 @@ internal sealed class NetworkTransportDecoder : IAudioDecoder, INetworkTransport
             h => transport.StatusChanged += h,
             h => transport.StatusChanged -= h);
 
+    /// <summary>
+    /// Wraps a decoder whose bytes are fetched outside Sonora's HTTP transport (for example MF URL open).
+    /// </summary>
+    public static NetworkTransportDecoder ForExternalReady(IAudioDecoder inner)
+        => new(
+            inner,
+            () => NetworkTransportStatus.Ready,
+            () => 0,
+            _ => { },
+            _ => { });
+
     public AudioFormat Format => _inner.Format;
     public TimeSpan Duration => _inner.Duration;
     public bool HasKnownDuration => _inner.HasKnownDuration;

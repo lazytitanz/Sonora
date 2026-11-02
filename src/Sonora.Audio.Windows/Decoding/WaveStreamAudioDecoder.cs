@@ -153,6 +153,34 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
             ownedByteStream: stream);
     }
 
+    /// <summary>
+    /// Opens Media Foundation against a URL so MF's HTTP stack can handle live/Icecast mounts
+    /// that do not support authoritative byte ranges.
+    /// </summary>
+    public static WaveStreamAudioDecoder OpenMediaFoundationUrl(string url)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(url);
+        Func<WaveStream> factory = () => new MediaFoundationReader(url, CreateMediaFoundationSettings());
+        var reader = factory();
+        var knownDuration = false;
+        try
+        {
+            knownDuration = reader.TotalTime > TimeSpan.Zero;
+        }
+        catch (NotSupportedException)
+        {
+            knownDuration = false;
+        }
+
+        return new(
+            reader,
+            sourcePath: url,
+            isMediaFoundation: true,
+            supportsExactByteSeek: false,
+            hasKnownDuration: knownDuration,
+            streamFactory: factory);
+    }
+
     public static WaveStreamAudioDecoder FromWaveStream(
         WaveStream stream,
         string? sourcePath,

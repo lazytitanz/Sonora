@@ -10,9 +10,13 @@ namespace Sonora.Audio.Windows.Output;
 /// WASAPI output using NAudio <see cref="WasapiPlayer"/> (shared or exclusive).
 /// Pulls PCM from an <see cref="IPcmSampleSource"/> (ring buffer); never decodes on the callback path.
 /// </summary>
-internal sealed class WasapiAudioOutput : IAudioOutput
+internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
 {
-    private const int DefaultExclusiveLatencyMs = 50;
+    /// <summary>
+    /// Exclusive event-sync at 50ms still trips native GetBuffer AVs on some HDMI/AMD endpoints
+    /// during Shared→Exclusive rebinds. Prefer a slightly larger exclusive period.
+    /// </summary>
+    private const int DefaultExclusiveLatencyMs = 100;
     private const int MaxAlignmentRetries = 2;
 
     private WasapiPlayer _player;
@@ -323,7 +327,53 @@ internal sealed class WasapiAudioOutput : IAudioOutput
 
         try
         {
+            // Prefer sync Dispose here. NAudio DisposeAsync joins via Task.Run and posts
+            // its continuation to the ambient SynchronizationContext — calling it with
+            // GetResult() on a WinForms UI thread deadlocks (AppHang).
             _player.Dispose();
+        }
+        catch
+        {
+            // ignored
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        _player.PlaybackStopped -= OnPlaybackStopped;
+
+        try
+        {
+            // Stop/Join and COM release must not run on a UI sync context.
+            await Task.Run(() =>
+            {
+                try
+                {
+                    if (!_shutdown)
+                    {
+                        Shutdown();
+                    }
+                }
+                catch
+                {
+                    _source = null;
+                }
+
+                try
+                {
+                    _player.Dispose();
+                }
+                catch
+                {
+                    // ignored
+                }
+            }).ConfigureAwait(false);
         }
         catch
         {
@@ -361,13 +411,19 @@ internal sealed class WasapiAudioOutput : IAudioOutput
     private static WasapiPlayer BuildPlayer(MMDevice device, AudioOutputMode mode, int latencyMs)
     {
         var builder = new WasapiPlayerBuilder()
-            .WithEventSync()
             .WithDevice(device)
             .WithLatency(latencyMs);
 
-        return mode == AudioOutputMode.Exclusive
-            ? builder.WithExclusiveMode().Build()
-            : builder.WithSharedMode().Build();
+        // Exclusive + event sync fills the full WASAPI period every wake (padding forced to 0).
+        // That path has caused process-killing IAudioRenderClient.GetBuffer AVs (0xC0000005)
+        // on some endpoints when rebinding Shared→Exclusive after a device switch. Polling
+        // exclusive uses CurrentPadding and is materially more stable on those drivers.
+        if (mode == AudioOutputMode.Exclusive)
+        {
+            return builder.WithExclusiveMode().WithPollingSync().Build();
+        }
+
+        return builder.WithSharedMode().WithEventSync().Build();
     }
 
     private static int ResolveLatencyMs(AudioOutputCreateRequest request)

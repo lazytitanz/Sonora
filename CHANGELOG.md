@@ -35,6 +35,11 @@ All notable changes to Sonora will be documented in this file.
 - PCM adapter: pad short periods without latching EOS on transient underruns; silence-after-EOS must not interfere with pause
 - Test Player: serialize output configure commands; surface configure failures as nonfatal UI errors and resync effective mode after success or failure; clarify configure-before-load messaging when `EffectiveMode` is null by design
 - Test Player Audio Output form: Apply enablement tracks dirty requested config (not effective mode); output snapshots no longer clobber unsaved Shared/Exclusive selections; clear `configureInFlight` as soon as configure returns (before refresh) and reconcile in-flight applies from matching output events so Exclusive→Shared Apply cannot stay stuck while playback continues
+- Test Player: do not toast exclusive “no output attached” while `deviceStatus` is mid-rebind (`switching`)
+- HTTP live radio (Icecast/SHOUTcast): reject fake `Content-Range: …/1073741823` as seekable; open forward-only without `Range: bytes=0-`; fall back to Media Foundation URL open for non-seekable MP3 mounts (fixes SomaFM-style loads timing out as `TaskCanceledException` / false `stream.cancelled`)
+- WASAPI Shared→Exclusive after a device switch while playing: exclusive uses polling sync (not event sync), 100ms default exclusive latency, longer release/init settle, deferred exclusive `Play` (mitigates native `GetBuffer` AV `0xC0000005` process crash)
+- WASAPI output teardown: never sync-over-async `DisposeAsync` on a WinForms/Vetra UI sync context; run Stop/Join dispose on the thread pool (fixes AppHang after exclusive → device switch)
+- Test Player: clear device-row “Switching” spinner when host settles to Available (and always re-render after `devices.set`)
 
 ### Notes
 

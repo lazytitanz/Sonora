@@ -120,6 +120,13 @@ internal sealed class HttpRandomAccessStream : Stream
                     $"Invalid Content-Range from '{HttpUriSafety.Describe(uri)}'.");
             }
 
+            // Icecast/SHOUTcast live mounts advertise a fake Content-Range; do not treat as seekable.
+            if (HttpLiveStreamProbe.IsNonSeekablePartialContent(probe, total))
+            {
+                throw new NetworkAudioException(
+                    $"HTTP resource '{HttpUriSafety.Describe(uri)}' looks like a live stream; byte-range random access is unavailable.");
+            }
+
             var identity = ParseIdentity(probe, total);
             var contentType = probe.Content.Headers.ContentType?.MediaType;
             return new HttpRandomAccessStream(uri, options, client, identity, total.Value, contentType);
