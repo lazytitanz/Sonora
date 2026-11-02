@@ -38,7 +38,7 @@ All notable changes to Sonora will be documented in this file.
 - Test Player: do not toast exclusive “no output attached” while `deviceStatus` is mid-rebind (`switching`)
 - HTTP live radio (Icecast/SHOUTcast): reject fake `Content-Range: …/1073741823` as seekable; open forward-only without `Range: bytes=0-`; fall back to Media Foundation URL open for non-seekable MP3 mounts (fixes SomaFM-style loads timing out as `TaskCanceledException` / false `stream.cancelled`)
 - WASAPI Shared→Exclusive after a device switch while playing: exclusive uses polling sync (not event sync), 100ms default exclusive latency, longer release/init settle, deferred exclusive `Play` (mitigates native `GetBuffer` AV `0xC0000005` process crash)
-- WASAPI output teardown: never sync-over-async `DisposeAsync` on a WinForms/Vetra UI sync context; run Stop/Join dispose on the thread pool (fixes AppHang after exclusive → device switch)
+- WASAPI output teardown: on a UI sync context, run Stop/Join dispose on a dedicated thread (not `Task.Run().GetResult()`, which starved under parallel CI and caused AppHang on WinForms/Vetra)
 - Test Player: clear device-row “Switching” spinner when host settles to Available (and always re-render after `devices.set`)
 
 ### Notes

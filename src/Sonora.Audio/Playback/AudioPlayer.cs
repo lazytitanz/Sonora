@@ -437,7 +437,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
         // Leave any UI SynchronizationContext before Stop/Join teardown (Task.Yield alone
         // would bounce back onto WinForms and AppHang when Join runs on the UI thread).
-        await Task.Run(() => { }).ConfigureAwait(false);
+        await LeaveSynchronizationContextAsync().ConfigureAwait(false);
         await WaitForOutputShutdownAsync().ConfigureAwait(false);
 
         // Join previous output outside the gate so pull-loop wait cannot deadlock.
@@ -573,7 +573,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             return;
         }
 
-        await Task.Run(() => { }).ConfigureAwait(false);
+        await LeaveSynchronizationContextAsync().ConfigureAwait(false);
         await WaitForOutputShutdownAsync().ConfigureAwait(false);
 
         try
@@ -1489,9 +1489,13 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     /// <summary>
     /// Guarantees the output will not read PCM again, then disposes it.
     /// Throws if quiescence cannot be guaranteed; Dispose is still attempted.
-    /// Always runs on the thread pool so WASAPI <c>Stop</c>/<c>Join</c> cannot deadlock a
-    /// WinForms/Vetra UI <see cref="SynchronizationContext"/> (AppHangB1).
     /// </summary>
+    /// <remarks>
+    /// When a <see cref="SynchronizationContext"/> is present (WinForms/Vetra UI), teardown runs on a
+    /// dedicated thread so WASAPI <c>Stop</c>/<c>Join</c> cannot AppHang the UI. Plain
+    /// <c>Task.Run(...).GetResult()</c> is avoided: under parallel test load it starves and never
+    /// enters <see cref="IAudioOutput.Shutdown"/>.
+    /// </remarks>
     private static void ShutdownAndDispose(IAudioOutput? output)
     {
         if (output is null)
@@ -1499,36 +1503,79 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             return;
         }
 
-        Exception? shutdownError = null;
-        Task.Run(() =>
+        if (SynchronizationContext.Current is null)
+        {
+            ShutdownAndDisposeCore(output);
+            return;
+        }
+
+        Exception? error = null;
+        using var done = new ManualResetEventSlim(false);
+        var thread = new Thread(() =>
         {
             try
             {
-                output.Shutdown();
+                ShutdownAndDisposeCore(output);
             }
             catch (Exception ex)
             {
-                shutdownError = ex is AudioOutputException
-                    ? ex
-                    : new AudioOutputException(
-                        "Output shutdown failed; replacement output was not started.",
-                        ex);
+                error = ex;
             }
+            finally
+            {
+                done.Set();
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "Sonora.OutputShutdown",
+        };
+        thread.Start();
+        done.Wait();
+        if (error is not null)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw();
+        }
+    }
 
-            try
-            {
-                output.Dispose();
-            }
-            catch
-            {
-                // ignored — shutdown error (if any) is authoritative
-            }
-        }).GetAwaiter().GetResult();
+    private static void ShutdownAndDisposeCore(IAudioOutput output)
+    {
+        Exception? shutdownError = null;
+        try
+        {
+            output.Shutdown();
+        }
+        catch (Exception ex)
+        {
+            shutdownError = ex is AudioOutputException
+                ? ex
+                : new AudioOutputException(
+                    "Output shutdown failed; replacement output was not started.",
+                    ex);
+        }
+
+        try
+        {
+            output.Dispose();
+        }
+        catch
+        {
+            // ignored — shutdown error (if any) is authoritative
+        }
 
         if (shutdownError is not null)
         {
             throw shutdownError;
         }
+    }
+
+    /// <summary>
+    /// Yields off any ambient <see cref="SynchronizationContext"/> without
+    /// <c>Task.Run().GetResult()</c> nesting (thread-pool starvation under parallel tests).
+    /// </summary>
+    private static async Task LeaveSynchronizationContextAsync()
+    {
+        await Task.CompletedTask.ConfigureAwait(ConfigureAwaitOptions.ForceYielding);
     }
 
     /// <summary>
@@ -2342,7 +2389,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             _gate.Release();
         }
 
-        await Task.Run(() => { }).ConfigureAwait(false);
+        await LeaveSynchronizationContextAsync().ConfigureAwait(false);
         await WaitForOutputShutdownAsync().ConfigureAwait(false);
 
         try
