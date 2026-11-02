@@ -9,14 +9,16 @@
   const { run } = TP.bridge;
   const fmt = TP.fmt;
   const state = TP.state;
+  const logic = TP.outputFormLogic;
 
   const MIN_LATENCY_MS = 5;
   const MAX_LATENCY_MS = 500;
-  const DEFAULT_LATENCY_INPUT_MS = 100;
 
   const dom = {};
   let formDirty = false;
   let configureInFlight = false;
+  /** Last saved requested configuration (engine `OutputConfiguration`), not effective mode. */
+  let savedRequest = logic.requestedFromOutput(null);
   let switchingId; // undefined = idle, null = switching to system default, string = switching to device id
 
   const DEVICE_STATE_TONE = { active: 'ok', disabled: 'warn', unplugged: 'warn', notPresent: 'bad', unknown: 'muted' };
@@ -169,25 +171,72 @@
   // Configuration form
   // ---------------------------------------------------------------------------------------------
 
+  function readFormRequest() {
+    return logic.requestedFromForm({
+      mode: dom['out-mode'].value,
+      exclusiveFallback: dom['out-fallback'].value,
+      useDefaultLatency: dom['out-latency-default'].checked,
+      latencyMs: dom['out-latency'].value,
+    });
+  }
+
   function syncLatencyInput() {
     const useDefault = dom['out-latency-default'].checked;
     dom['out-latency'].disabled = useDefault;
   }
 
-  function syncForm() {
-    const out = state.output;
-    if (!out || formDirty) return;
-    dom['out-mode'].value = out.mode || 'shared';
-    dom['out-fallback'].value = out.exclusiveFallback || 'none';
-    const useDefault = out.requestedLatencyMs == null;
-    dom['out-latency-default'].checked = useDefault;
-    dom['out-latency'].value = String(Math.round(out.requestedLatencyMs == null ? DEFAULT_LATENCY_INPUT_MS : out.requestedLatencyMs));
+  function syncFallbackEnabled() {
+    dom['out-fallback'].disabled = dom['out-mode'].value !== 'exclusive';
+  }
+
+  function updateApplyEnabled() {
+    const button = dom['btn-apply-output'];
+    if (!button) return;
+    const enable = logic.shouldEnableApply({
+      formRequest: readFormRequest(),
+      savedRequest,
+      configureInFlight,
+    });
+    button.disabled = !enable;
+    button.title = configureInFlight
+      ? 'Configuration change in progress…'
+      : enable
+        ? 'Apply the selected output configuration'
+        : 'No pending configuration changes';
+  }
+
+  function markFormDirty() {
+    formDirty = true;
+    syncFallbackEnabled();
+    updateApplyEnabled();
+  }
+
+  function applyFormValues(values) {
+    dom['out-mode'].value = values.mode;
+    dom['out-fallback'].value = values.exclusiveFallback;
+    dom['out-latency-default'].checked = values.useDefaultLatency;
+    dom['out-latency'].value = String(values.latencyMs);
     syncLatencyInput();
     syncFallbackEnabled();
   }
 
-  function syncFallbackEnabled() {
-    dom['out-fallback'].disabled = dom['out-mode'].value !== 'exclusive';
+  /**
+   * Sync editable controls from engine requested configuration only.
+   * Never overwrites pending edits; ignores effective-only output updates.
+   */
+  function syncForm(incomingOutput) {
+    const out = incomingOutput || state.output;
+    if (!out) return;
+
+    if (!logic.shouldSyncFormFromOutput({ formDirty, savedRequest, incomingOutput: out })) {
+      updateApplyEnabled();
+      return;
+    }
+
+    savedRequest = logic.requestedFromOutput(out);
+    applyFormValues(logic.formValuesFromRequest(savedRequest));
+    formDirty = false;
+    updateApplyEnabled();
   }
 
   function showFormError(message) {
@@ -199,6 +248,12 @@
     event.preventDefault();
     if (configureInFlight) {
       toast('An output configuration change is already in progress.', 'info');
+      return;
+    }
+
+    if (!logic.shouldEnableApply({ formRequest: readFormRequest(), savedRequest, configureInFlight: false })) {
+      toast('No output configuration changes to apply.', 'info');
+      updateApplyEnabled();
       return;
     }
 
@@ -214,23 +269,25 @@
     }
 
     const request = {
-      mode: dom['out-mode'].value,
-      exclusiveFallback: dom['out-fallback'].value,
+      mode: logic.normalizeMode(dom['out-mode'].value),
+      exclusiveFallback: logic.normalizeFallback(dom['out-fallback'].value),
       requestedLatencyMs: latency,
     };
 
-    const button = dom['btn-apply-output'];
     configureInFlight = true;
-    button.disabled = true;
+    updateApplyEnabled();
     try {
       const result = await run('output.configure', [request], { label: 'Output configuration', toast: false });
-      // Always resync from the host so the form shows effective mode after success or failure.
+      // Always resync host state after success or failure; do not clobber a still-dirty retry form
+      // until we know whether the request stuck.
       await refresh({ quiet: true });
       await TP.core.refreshSnapshot();
 
       if (result.ok) {
-        formDirty = false;
         if (result.value) TP.core.setOutput(result.value);
+        savedRequest = logic.requestedFromOutput(result.value || state.output);
+        formDirty = false;
+        applyFormValues(logic.formValuesFromRequest(savedRequest));
         const out = state.output || result.value;
         const eff = out && out.effectiveMode;
         const requested = out && out.mode;
@@ -238,7 +295,6 @@
         if (eff) {
           toast(`Output configured. Effective mode: ${fmt.humanize(eff)}.`, 'success');
         } else if (!hasSource) {
-          // Sonora stores the requested mode and applies it on the next Load / attach.
           toast(
             `Output preference saved (${fmt.humanize(requested || 'shared')}). It will apply when a track is loaded.`,
             'success');
@@ -251,11 +307,12 @@
         const message = result.message || 'Output configuration failed.';
         showFormError(message);
         toast(`Output configuration: ${message}`, 'danger');
+        // Keep the user's attempted values so they can edit and retry.
         formDirty = true;
       }
     } finally {
       configureInFlight = false;
-      button.disabled = false;
+      updateApplyEnabled();
     }
   }
 
@@ -280,12 +337,14 @@
     'Hold the device in another exclusive app, then request Exclusive with fallback Shared: effective mode is Shared and a fallback reason is shown.',
     'Change the Windows default device while following “System default”: the output follows it.',
     'Request a latency (e.g. 20 ms and 200 ms): configuration is accepted and effective latency is reported or shown as unavailable.',
+    'After Exclusive applies, change Share mode back to Shared and Apply: the switch succeeds in both directions.',
   ];
 
   function render() {
     renderDevices();
     renderEffective();
-    syncForm();
+    // Only rewrite editable controls when the *requested* config changes and the form is clean.
+    syncForm(state.output);
   }
 
   function init() {
@@ -294,23 +353,27 @@
 
     dom['btn-refresh-devices'].addEventListener('click', () => refresh());
     dom['output-form'].addEventListener('submit', applyConfiguration);
-    dom['out-latency-default'].addEventListener('change', () => {
-      formDirty = true;
-      syncLatencyInput();
-    });
-    dom['out-mode'].addEventListener('change', () => {
-      formDirty = true;
-      syncFallbackEnabled();
-    });
-    dom['out-fallback'].addEventListener('change', () => (formDirty = true));
+    dom['out-latency-default'].addEventListener('change', markFormDirty);
+    // input fires as soon as the selection changes; change alone can lose to a same-tick syncForm.
+    dom['out-mode'].addEventListener('input', markFormDirty);
+    dom['out-mode'].addEventListener('change', markFormDirty);
+    dom['out-fallback'].addEventListener('input', markFormDirty);
+    dom['out-fallback'].addEventListener('change', markFormDirty);
     dom['out-latency'].addEventListener('input', () => {
-      formDirty = true;
       showFormError('');
+      markFormDirty();
     });
 
-    TP.bus.on('devices', render);
-    TP.bus.on('output', render);
-    render();
+    TP.bus.on('devices', () => {
+      renderDevices();
+    });
+    TP.bus.on('output', (payload) => {
+      renderEffective();
+      renderDevices();
+      syncForm(payload || state.output);
+    });
+
+    updateApplyEnabled();
     return refresh({ quiet: true });
   }
 

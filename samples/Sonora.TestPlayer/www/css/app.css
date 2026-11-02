@@ -258,10 +258,14 @@ body {
   --bs-btn-active-color: var(--tp-accent-ink);
   --bs-btn-active-bg: #7fd0da;
   --bs-btn-active-border-color: #7fd0da;
-  --bs-btn-disabled-color: var(--tp-accent-ink);
-  --bs-btn-disabled-bg: var(--tp-accent);
-  --bs-btn-disabled-border-color: var(--tp-accent);
+  --bs-btn-disabled-color: #9aa7ab;
+  --bs-btn-disabled-bg: #3a4a4e;
+  --bs-btn-disabled-border-color: #3a4a4e;
+  --bs-btn-disabled-opacity: 1;
   font-weight: 500;
+}
+#btn-apply-output:disabled {
+  cursor: not-allowed;
 }
 .btn-outline-secondary {
   --bs-btn-color: #b4bbc4;

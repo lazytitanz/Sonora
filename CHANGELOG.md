@@ -33,6 +33,7 @@ All notable changes to Sonora will be documented in this file.
 - WASAPI Shared→Exclusive: avoid exclusive open/close during format probe; brief endpoint-release grace after disposing the previous output (mitigates intermittent native `GetBuffer` AV `0xC0000005`)
 - PCM adapter: pad short periods without latching EOS on transient underruns; silence-after-EOS must not interfere with pause
 - Test Player: serialize output configure commands; surface configure failures as nonfatal UI errors and resync effective mode after success or failure; clarify configure-before-load messaging when `EffectiveMode` is null by design
+- Test Player Audio Output form: Apply enablement tracks dirty requested config (not effective mode); output snapshots no longer clobber unsaved Shared/Exclusive selections; `configureInFlight` always cleared in `finally`
 
 ### Notes
 
