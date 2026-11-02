@@ -47,8 +47,9 @@ public sealed class DisposalHardeningTests
         var loadTask = player.LoadAsync("tone.wav");
         Assert.True(createEntered.Wait(TimeSpan.FromSeconds(2)));
 
-        // Dispose while decoder open is still pending (off-gate).
-        var disposeTask = Task.Run(player.Dispose);
+        // Dispose while decoder open is still pending (off-gate). Dedicated thread — not Task.Run —
+        // so parallel suite thread-pool pressure cannot delay Dispose past Load completion races.
+        var disposeTask = RunOnDedicatedThread(player.Dispose, "Sonora.Test.DisposeDuringLoad");
         allowCreate.Set();
 
         try
@@ -170,6 +171,10 @@ public sealed class DisposalHardeningTests
         // Contract: Dispose detaches under _gate, then Shutdown runs only after the gate is released.
         // Reaching a held Shutdown therefore proves the gate is already free. A sibling Load was
         // previously used as a probe but hung under CI scheduling; it is not required for this proof.
+        //
+        // Dispose is started on a dedicated thread (not Task.Run): under parallel xUnit load the
+        // thread pool can be saturated by other held work, so Task.Run(Dispose) may not schedule
+        // before WaitUntilShutdownHeld times out — a false failure of a correct production path.
         HoldableFakeAudioOutput? output = null;
         var outputFactory = new FakeAudioOutputFactory(_ =>
         {
@@ -191,7 +196,7 @@ public sealed class DisposalHardeningTests
         Task? disposeTask = null;
         try
         {
-            disposeTask = Task.Run(player.Dispose);
+            disposeTask = RunOnDedicatedThread(player.Dispose, "Sonora.Test.DisposeHeldShutdown");
 
             Assert.True(
                 output.WaitUntilShutdownHeld(TimeSpan.FromSeconds(5)),
@@ -224,5 +229,32 @@ public sealed class DisposalHardeningTests
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Starts work on a dedicated OS thread so held-Shutdown tests do not depend on thread-pool
+    /// availability under parallel xUnit scheduling.
+    /// </summary>
+    private static Task RunOnDedicatedThread(Action action, string name)
+    {
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                action();
+                tcs.TrySetResult();
+            }
+            catch (Exception ex)
+            {
+                tcs.TrySetException(ex);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = name,
+        };
+        thread.Start();
+        return tcs.Task;
     }
 }

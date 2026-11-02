@@ -1489,14 +1489,23 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     /// Throws if quiescence cannot be guaranteed; Dispose is still attempted.
     /// </summary>
     /// <remarks>
-    /// Always runs on a dedicated thread so WASAPI <c>Stop</c>/<c>Join</c> cannot AppHang a UI
-    /// sync context, and so callers that <c>await</c> the async variant yield before Shutdown
-    /// (held-shutdown tests) without <c>Task.Run</c>/<c>ForceYield</c> pool starvation.
+    /// When a UI <see cref="SynchronizationContext"/> is present, teardown hops to a dedicated
+    /// thread so WASAPI <c>Stop</c>/<c>Join</c> cannot AppHang the UI. Without a sync context the
+    /// caller already runs off-UI (Dispose after gate release, queued teardown thread, etc.) and
+    /// executes Shutdown inline. Prefer <see cref="ShutdownAndDisposeAsync"/> from async rebind
+    /// paths so the caller yields before a held Shutdown without <c>Task.Run</c>/<c>ForceYield</c>
+    /// pool starvation.
     /// </remarks>
     private static void ShutdownAndDispose(IAudioOutput? output)
     {
         if (output is null)
         {
+            return;
+        }
+
+        if (SynchronizationContext.Current is null)
+        {
+            ShutdownAndDisposeCore(output);
             return;
         }
 
@@ -2008,7 +2017,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     {
         try
         {
-            ShutdownAndDispose(bag.Output);
+            await ShutdownAndDisposeAsync(bag.Output).ConfigureAwait(false);
         }
         catch
         {

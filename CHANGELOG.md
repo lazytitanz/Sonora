@@ -40,6 +40,7 @@ All notable changes to Sonora will be documented in this file.
 - WASAPI Shared→Exclusive after a device switch while playing: exclusive uses polling sync (not event sync), 100ms default exclusive latency, longer release/init settle, deferred exclusive `Play` (mitigates native `GetBuffer` AV `0xC0000005` process crash)
 - WASAPI output teardown: on a UI sync context, run Stop/Join dispose on a dedicated thread (not `Task.Run().GetResult()`, which starved under parallel CI and caused AppHang on WinForms/Vetra)
 - Output rebind: await Shutdown on a dedicated thread (not `ForceYield`/`Task.Run` on the pool) so Switching observers can proceed without starving under parallel held-shutdown CI; queue orphaned teardowns on a dedicated thread as well
+- Disposal hardening tests: start `Dispose` on a dedicated thread when observing held Shutdown (avoids false CI failures when `Task.Run` cannot schedule under parallel pool saturation); `DisposeAsync` teardown awaits Shutdown instead of sync-over-async `GetResult`)
 - Test Player: clear device-row “Switching” spinner when host settles to Available (and always re-render after `devices.set`)
 
 ### Notes
