@@ -435,15 +435,14 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             _gate.Release();
         }
 
-        // Leave any UI SynchronizationContext before Stop/Join teardown (Task.Yield alone
-        // would bounce back onto WinForms and AppHang when Join runs on the UI thread).
-        await LeaveSynchronizationContextAsync().ConfigureAwait(false);
+        // Dedicated-thread Shutdown yields the caller (so Switching observers can proceed) without
+        // ForceYield/Task.Run onto a pool that parallel held-shutdown tests can starve.
         await WaitForOutputShutdownAsync().ConfigureAwait(false);
 
         // Join previous output outside the gate so pull-loop wait cannot deadlock.
         try
         {
-            ShutdownAndDispose(oldOutput);
+            await ShutdownAndDisposeAsync(oldOutput).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -573,12 +572,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             return;
         }
 
-        await LeaveSynchronizationContextAsync().ConfigureAwait(false);
         await WaitForOutputShutdownAsync().ConfigureAwait(false);
 
         try
         {
-            ShutdownAndDispose(oldOutput);
+            await ShutdownAndDisposeAsync(oldOutput).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -1491,10 +1489,9 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     /// Throws if quiescence cannot be guaranteed; Dispose is still attempted.
     /// </summary>
     /// <remarks>
-    /// When a <see cref="SynchronizationContext"/> is present (WinForms/Vetra UI), teardown runs on a
-    /// dedicated thread so WASAPI <c>Stop</c>/<c>Join</c> cannot AppHang the UI. Plain
-    /// <c>Task.Run(...).GetResult()</c> is avoided: under parallel test load it starves and never
-    /// enters <see cref="IAudioOutput.Shutdown"/>.
+    /// Always runs on a dedicated thread so WASAPI <c>Stop</c>/<c>Join</c> cannot AppHang a UI
+    /// sync context, and so callers that <c>await</c> the async variant yield before Shutdown
+    /// (held-shutdown tests) without <c>Task.Run</c>/<c>ForceYield</c> pool starvation.
     /// </remarks>
     private static void ShutdownAndDispose(IAudioOutput? output)
     {
@@ -1503,27 +1500,31 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             return;
         }
 
-        if (SynchronizationContext.Current is null)
+        ShutdownAndDisposeAsync(output).GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Async variant of <see cref="ShutdownAndDispose"/>: starts teardown on a dedicated thread and
+    /// returns a task that completes when Shutdown/Dispose finish (or fail).
+    /// </summary>
+    private static Task ShutdownAndDisposeAsync(IAudioOutput? output)
+    {
+        if (output is null)
         {
-            ShutdownAndDisposeCore(output);
-            return;
+            return Task.CompletedTask;
         }
 
-        Exception? error = null;
-        using var done = new ManualResetEventSlim(false);
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var thread = new Thread(() =>
         {
             try
             {
                 ShutdownAndDisposeCore(output);
+                tcs.TrySetResult();
             }
             catch (Exception ex)
             {
-                error = ex;
-            }
-            finally
-            {
-                done.Set();
+                tcs.TrySetException(ex);
             }
         })
         {
@@ -1531,11 +1532,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             Name = "Sonora.OutputShutdown",
         };
         thread.Start();
-        done.Wait();
-        if (error is not null)
-        {
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw();
-        }
+        return tcs.Task;
     }
 
     private static void ShutdownAndDisposeCore(IAudioOutput output)
@@ -1570,16 +1567,8 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Yields off any ambient <see cref="SynchronizationContext"/> without
-    /// <c>Task.Run().GetResult()</c> nesting (thread-pool starvation under parallel tests).
-    /// </summary>
-    private static async Task LeaveSynchronizationContextAsync()
-    {
-        await Task.CompletedTask.ConfigureAwait(ConfigureAwaitOptions.ForceYielding);
-    }
-
-    /// <summary>
     /// Queues Shutdown/Dispose off the command gate and serializes with other pending teardowns.
+    /// Uses a dedicated thread (not the thread pool) so a held Shutdown cannot starve other work.
     /// </summary>
     private void QueueOutputShutdown(IAudioOutput? output)
     {
@@ -1591,26 +1580,40 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         lock (_outputShutdownSync)
         {
             var previous = _outputShutdownTask;
-            _outputShutdownTask = Task.Run(() =>
+            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _outputShutdownTask = tcs.Task;
+            var thread = new Thread(() =>
             {
                 try
                 {
-                    previous.GetAwaiter().GetResult();
-                }
-                catch
-                {
-                    // ignored — prior shutdown failure must not block releasing this client
-                }
+                    try
+                    {
+                        previous.GetAwaiter().GetResult();
+                    }
+                    catch
+                    {
+                        // ignored — prior shutdown failure must not block releasing this client
+                    }
 
-                try
-                {
-                    ShutdownAndDispose(output);
+                    try
+                    {
+                        ShutdownAndDispose(output);
+                    }
+                    catch (Exception ex)
+                    {
+                        RaiseError(ex);
+                    }
                 }
-                catch (Exception ex)
+                finally
                 {
-                    RaiseError(ex);
+                    tcs.TrySetResult();
                 }
-            });
+            })
+            {
+                IsBackground = true,
+                Name = "Sonora.QueuedOutputShutdown",
+            };
+            thread.Start();
         }
     }
 
@@ -2389,12 +2392,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             _gate.Release();
         }
 
-        await LeaveSynchronizationContextAsync().ConfigureAwait(false);
         await WaitForOutputShutdownAsync().ConfigureAwait(false);
 
         try
         {
-            ShutdownAndDispose(oldOutput);
+            await ShutdownAndDisposeAsync(oldOutput).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
