@@ -15,7 +15,8 @@ internal static class WasapiErrorMapper
     private const int AudClntEEndpointCreateFailed = unchecked((int)0x88890017);
     private const int AudClntEDeviceInvalidated = unchecked((int)0x88890004);
     private const int AudClntEBufferSizeNotAligned = unchecked((int)0x88890019);
-    private const int AudClntEBufferSizeError = unchecked((int)0x88890018);
+    // AUDCLNT_E_BUFFER_SIZE_ERROR — exclusive ReleaseBuffer with a short/zero period.
+    private const int AudClntEBufferSizeError = unchecked((int)0x88890016);
     private const int AudClntEInvalidDevicePeriod = unchecked((int)0x88890020);
 
     public static AudioOutputFailureKind Classify(Exception exception)

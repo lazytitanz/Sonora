@@ -22,8 +22,8 @@ Metadata (`IAudioMetadataReader` / `AudioMetadataReader`) lives in `Sonora.Audio
 
 1. `AudioPlayer.LoadAsync` opens an `IAudioDecoder` from a file path or `AudioSource` (may perform disk/network/codec I/O).
 2. HTTP sources use a bounded byte transport in `Sonora.Audio` (`HttpRandomAccessStream` for verified ranges, `HttpContentByteStream` for forward-only). Network stalls block the **decode worker** only and never return `0` (EOF) until the body completes.
-3. A **decode pump** (background worker) reads float32 PCM, runs optional `IAudioProcessor`s and volume, and writes into a **bounded ring buffer**.
-4. WASAPI / `IAudioOutput` callbacks pull only from the ring via `IPcmSampleSource` — **no decoding, file, or HTTP I/O on the audio callback**.
+3. A **decode pump** (background worker) reads float32 PCM, runs optional `IAudioProcessor`s, and writes into a **bounded ring buffer**.
+4. WASAPI / `IAudioOutput` callbacks pull from the ring via `IPcmSampleSource`, then apply master `Volume` and the effect rack — **no decoding, file, or HTTP I/O on the audio callback**. Volume and live DSP therefore do not wait for the ring to drain.
 5. Underruns fill silence and raise an edge-triggered `Underrun` event; audible `Position` freezes during underrun silence and network buffering so device clocks do not invent timeline progress.
 6. `NetworkTransportStatus` is independent of `PlaybackState` (Playing/Paused intent is preserved while buffering/reconnecting).
 

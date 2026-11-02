@@ -1,0 +1,795 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sonora Test Player</title>
+  <link rel="stylesheet" href="vendor/bootstrap-5.3.8/css/bootstrap.min.css">
+  <link rel="stylesheet" href="vendor/bootstrap-icons-1.13.2/font/bootstrap-icons.min.css">
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div class="app-shell">
+
+  <!-- ============================== Header ============================== -->
+  <header class="app-header">
+    <div class="brand">
+      <i class="bi bi-soundwave brand-icon" aria-hidden="true"></i>
+      <h1 class="brand-title">Sonora Test Player</h1>
+      <span id="app-version" class="badge badge-soft" title="Test Player version">v—</span>
+    </div>
+    <div class="header-spacer"></div>
+    <button id="btn-refresh-all" type="button" class="btn btn-sm btn-ghost" title="Re-read all state from the engine">
+      <i class="bi bi-arrow-clockwise" aria-hidden="true"></i><span class="visually-hidden">Refresh all</span>
+    </button>
+    <span id="engine-status" class="status-pill" data-status="connecting" role="status" aria-live="polite">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span id="engine-status-text">Connecting…</span>
+    </span>
+  </header>
+
+  <!-- ============================== Sidebar ============================== -->
+  <nav class="app-sidebar" aria-label="Sections">
+    <button type="button" class="nav-btn active" data-section="player" aria-current="page">
+      <i class="bi bi-music-note-beamed" aria-hidden="true"></i><span>Player</span>
+    </button>
+    <button type="button" class="nav-btn" data-section="output">
+      <i class="bi bi-speaker" aria-hidden="true"></i><span>Audio Output</span>
+    </button>
+    <button type="button" class="nav-btn" data-section="dsp">
+      <i class="bi bi-sliders" aria-hidden="true"></i><span>DSP &amp; Effects</span>
+    </button>
+    <button type="button" class="nav-btn" data-section="streaming">
+      <i class="bi bi-broadcast" aria-hidden="true"></i><span>Streaming</span>
+    </button>
+    <button type="button" class="nav-btn" data-section="diagnostics">
+      <i class="bi bi-activity" aria-hidden="true"></i><span>Diagnostics</span>
+    </button>
+    <button type="button" class="nav-btn" data-section="scenarios">
+      <i class="bi bi-clipboard-check" aria-hidden="true"></i><span>Test Scenarios</span>
+    </button>
+    <div class="sidebar-foot">
+      Manual verification harness for Sonora. Nothing here marks a test as passed automatically.
+    </div>
+  </nav>
+
+  <!-- ============================== Main ============================== -->
+  <main class="app-main" id="app-main" tabindex="-1">
+
+    <!-- ---------- Player ---------- -->
+    <section id="section-player" class="app-section" aria-label="Player">
+      <div class="row g-3">
+        <div class="col-12 col-xl-7">
+          <div class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">Queue <span id="queue-count" class="badge badge-soft ms-1">0</span></h2>
+              <div class="panel-tools">
+                <button id="btn-add-files" type="button" class="btn btn-sm btn-accent">
+                  <i class="bi bi-plus-lg" aria-hidden="true"></i> Add files…
+                </button>
+                <button id="btn-load-file" type="button" class="btn btn-sm btn-outline-secondary" title="Load a file into the player without starting playback">
+                  <i class="bi bi-box-arrow-in-down" aria-hidden="true"></i> Load file…
+                </button>
+                <button id="btn-clear-queue" type="button" class="btn btn-sm btn-outline-secondary" title="Clear the queue (the loaded track keeps playing)">
+                  <i class="bi bi-trash3" aria-hidden="true"></i> Clear
+                </button>
+              </div>
+            </div>
+            <div class="panel-body">
+              <div class="input-group input-group-sm mb-2">
+                <label class="visually-hidden" for="path-input">Audio file path</label>
+                <input id="path-input" type="text" class="form-control" placeholder="Paste a full file path (works without file dialogs)" autocomplete="off" spellcheck="false">
+                <button id="btn-add-path" type="button" class="btn btn-outline-secondary">Add path</button>
+                <button id="btn-load-path" type="button" class="btn btn-outline-secondary" title="Load without starting playback">Load</button>
+              </div>
+              <p id="dialogs-note" class="form-text text-warning mb-2" hidden>
+                File dialogs are not enabled in this host. Paste paths into the field above instead.
+              </p>
+              <div id="queue-empty" class="empty-state">
+                <i class="bi bi-music-note-list" aria-hidden="true"></i>
+                <div>The queue is empty.</div>
+                <div class="small text-body-secondary">Add local audio files to begin. Drag rows to reorder.</div>
+              </div>
+              <ol id="queue-list" class="queue-list" aria-label="Playback queue"></ol>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12 col-xl-5 d-flex flex-column gap-3">
+          <!-- Current source -->
+          <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">Current source</h2></div>
+            <div class="panel-body">
+              <div class="np">
+                <div class="art art-lg" id="np-art">
+                  <i class="bi bi-music-note-beamed art-ph" id="np-art-ph" aria-hidden="true"></i>
+                  <img id="np-art-img" alt="Artwork for the current track" hidden>
+                </div>
+                <dl class="kv kv-tight flex-grow-1">
+                  <dt>Title</dt><dd id="np-title">—</dd>
+                  <dt>Artist</dt><dd id="np-artist">—</dd>
+                  <dt>Album</dt><dd id="np-album">—</dd>
+                  <dt>Format</dt><dd id="np-format">—</dd>
+                  <dt>Source</dt><dd id="np-source" class="text-truncate">—</dd>
+                  <dt>Queue position</dt><dd id="np-queue-pos">—</dd>
+                  <dt>Session generation</dt><dd id="np-generation">—</dd>
+                </dl>
+              </div>
+            </div>
+          </div>
+
+          <!-- Gapless -->
+          <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">Gapless &amp; preload</h2></div>
+            <div class="panel-body">
+              <div class="form-check form-switch mb-2">
+                <input id="gapless-switch" class="form-check-input" type="checkbox" role="switch">
+                <label class="form-check-label" for="gapless-switch">Gapless preload of the next queue item</label>
+              </div>
+              <dl class="kv kv-tight mb-2">
+                <dt>Next-track slot</dt><dd id="gapless-next-state">—</dd>
+                <dt>Preloaded path</dt><dd id="gapless-next-path" class="text-truncate">—</dd>
+                <dt>Transitions observed</dt><dd id="gapless-transitions">—</dd>
+                <dt>Completions observed</dt><dd id="gapless-completions">—</dd>
+                <dt>Completion advances</dt><dd id="gapless-advances">—</dd>
+              </dl>
+              <div class="d-flex flex-wrap gap-2 mb-3">
+                <button id="btn-preload-next" type="button" class="btn btn-sm btn-outline-secondary" title="Preload the queue item after the current one">
+                  <i class="bi bi-skip-forward-btn" aria-hidden="true"></i> Preload next
+                </button>
+                <button id="btn-clear-next" type="button" class="btn btn-sm btn-outline-secondary">
+                  <i class="bi bi-x-circle" aria-hidden="true"></i> Clear next
+                </button>
+              </div>
+              <div class="form-check form-switch unsupported">
+                <input id="crossfade-switch" class="form-check-input" type="checkbox" role="switch" disabled aria-describedby="crossfade-note">
+                <label class="form-check-label" for="crossfade-switch">
+                  Crossfade <span class="badge text-bg-secondary ms-1">Not supported</span>
+                </label>
+                <div id="crossfade-note" class="form-text">
+                  Sonora does not implement crossfade. Track changes are either gapless (preloaded) or sequential. This control is intentionally disabled.
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Seek tests -->
+          <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">Seek test</h2></div>
+            <div class="panel-body">
+              <div class="input-group input-group-sm mb-2">
+                <label class="input-group-text" for="seek-input">Seconds</label>
+                <input id="seek-input" type="number" step="0.1" class="form-control" value="0" inputmode="decimal">
+                <button id="btn-seek" type="button" class="btn btn-outline-secondary">Seek</button>
+                <button id="btn-seek-result" type="button" class="btn btn-accent">Seek with result</button>
+              </div>
+              <div class="d-flex flex-wrap gap-1 mb-3" role="group" aria-label="Seek presets">
+                <button type="button" class="btn btn-xs btn-chip" data-seek-preset="start">Start</button>
+                <button type="button" class="btn btn-xs btn-chip" data-seek-preset="middle">Middle</button>
+                <button type="button" class="btn btn-xs btn-chip" data-seek-preset="nearEnd">Duration − 2 s</button>
+                <button type="button" class="btn btn-xs btn-chip" data-seek-preset="pastEnd">Duration + 10 s</button>
+                <button type="button" class="btn btn-xs btn-chip" data-seek-preset="negative" title="Expected to be rejected">−1 s (invalid)</button>
+              </div>
+              <div id="seek-result" class="seek-result" aria-live="polite">
+                <div class="text-body-secondary small">No seek issued yet. “Seek with result” reports requested vs. actual landing position.</div>
+              </div>
+              <ul id="seek-history" class="seek-history"></ul>
+              <p class="form-text mb-0">
+                Accuracy is reported by the engine. “Unknown” means no decoder evidence of the landing position, not a failure.
+              </p>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">Manual checklist</h2>
+            </div>
+            <div class="panel-body" id="player-checklist"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- Audio Output ---------- -->
+    <section id="section-output" class="app-section" aria-label="Audio output" hidden>
+      <div class="row g-3">
+        <div class="col-12 col-xl-6">
+          <div class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">Output devices</h2>
+              <div class="panel-tools">
+                <button id="btn-refresh-devices" type="button" class="btn btn-sm btn-outline-secondary">
+                  <i class="bi bi-arrow-clockwise" aria-hidden="true"></i> Refresh
+                </button>
+              </div>
+            </div>
+            <div class="panel-body">
+              <div id="device-empty" class="empty-state" hidden>
+                <i class="bi bi-speaker" aria-hidden="true"></i>
+                <div>No render endpoints reported.</div>
+              </div>
+              <ul id="device-list" class="device-list" aria-label="Output devices"></ul>
+              <p class="form-text mb-0 mt-2">Switching device may briefly interrupt audio. “System default” follows the Windows default render endpoint.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12 col-xl-6 d-flex flex-column gap-3">
+          <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">Output configuration</h2></div>
+            <div class="panel-body">
+              <form id="output-form" class="row g-2" novalidate>
+                <div class="col-sm-6">
+                  <label for="out-mode" class="form-label">Share mode</label>
+                  <select id="out-mode" class="form-select form-select-sm">
+                    <option value="shared">Shared</option>
+                    <option value="exclusive">Exclusive</option>
+                  </select>
+                </div>
+                <div class="col-sm-6">
+                  <label for="out-fallback" class="form-label">Exclusive fallback</label>
+                  <select id="out-fallback" class="form-select form-select-sm">
+                    <option value="none">None (strict, report failure)</option>
+                    <option value="shared">Fall back to Shared</option>
+                  </select>
+                </div>
+                <div class="col-12">
+                  <label for="out-latency" class="form-label">Requested latency (ms, 5–500)</label>
+                  <div class="input-group input-group-sm">
+                    <input id="out-latency" type="number" min="5" max="500" step="1" class="form-control" value="100" disabled>
+                    <div class="input-group-text">
+                      <div class="form-check mb-0">
+                        <input id="out-latency-default" class="form-check-input" type="checkbox" checked>
+                        <label class="form-check-label" for="out-latency-default">Backend default</label>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="col-12">
+                  <div id="out-form-error" class="text-danger small mb-1" role="alert" hidden></div>
+                  <button id="btn-apply-output" type="submit" class="btn btn-sm btn-accent">
+                    <i class="bi bi-check2" aria-hidden="true"></i> Apply configuration
+                  </button>
+                  <span class="form-text ms-2">May briefly interrupt audio.</span>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">Requested vs. effective</h2></div>
+            <div class="panel-body">
+              <div id="eff-fallback-banner" class="alert alert-warning py-2 small" role="status" hidden></div>
+              <dl class="kv">
+                <dt>Requested mode</dt><dd id="eff-req-mode">—</dd>
+                <dt>Effective mode</dt><dd id="eff-mode">—</dd>
+                <dt>Fallback reason</dt><dd id="eff-fallback">—</dd>
+                <dt>Device status</dt><dd id="eff-status">—</dd>
+                <dt>Preferred device</dt><dd id="eff-preferred">—</dd>
+                <dt>Active device</dt><dd id="eff-active">—</dd>
+                <dt>Recovery intent</dt><dd id="eff-recovery">—</dd>
+                <dt>Requested latency</dt><dd id="eff-req-latency">—</dd>
+                <dt>Effective latency</dt><dd id="eff-latency">—</dd>
+              </dl>
+              <p class="form-text mb-0">Effective latency is the backend value from the most recent configuration event; it shows as unavailable until one is received.</p>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">Manual checklist</h2></div>
+            <div class="panel-body" id="output-checklist"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- DSP ---------- -->
+    <section id="section-dsp" class="app-section" aria-label="DSP and effects" hidden>
+      <div class="row g-3">
+        <div class="col-12">
+          <div class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">Effects rack <span class="text-body-secondary fw-normal small ms-2">Preamp → 6-band Equalizer → Limiter</span></h2>
+              <div class="panel-tools">
+                <div class="form-check form-switch mb-0 me-2">
+                  <input id="dsp-bypass" class="form-check-input" type="checkbox" role="switch">
+                  <label class="form-check-label" for="dsp-bypass">Bypass entire rack</label>
+                </div>
+                <button id="btn-dsp-reset" type="button" class="btn btn-sm btn-outline-secondary" title="Flat preset and 0 dB preamp">
+                  <i class="bi bi-arrow-counterclockwise" aria-hidden="true"></i> Reset
+                </button>
+              </div>
+            </div>
+            <div class="panel-body">
+              <div id="dsp-bypass-note" class="alert alert-warning py-2 small mb-3" role="status" hidden>
+                The whole rack is bypassed: preamp, equalizer and limiter are all skipped regardless of their own switches.
+              </div>
+              <div class="d-flex flex-wrap align-items-center gap-2">
+                <span class="small text-body-secondary me-1">Presets</span>
+                <div id="dsp-presets" class="d-flex flex-wrap gap-1" role="group" aria-label="Equalizer presets"></div>
+                <span class="ms-auto small text-body-secondary">Active: <span id="dsp-active-preset" class="text-body">—</span></span>
+              </div>
+              <p class="form-text mb-0 mt-2">Applying a preset may also set the preamp gain if the preset defines one. Editing any band clears the active preset name.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12 col-xl-3">
+          <div class="panel h-100">
+            <div class="panel-header">
+              <h2 class="panel-title">Preamp</h2>
+              <div class="form-check form-switch mb-0">
+                <input id="dsp-preamp-enabled" class="form-check-input" type="checkbox" role="switch" aria-label="Preamp enabled">
+              </div>
+            </div>
+            <div class="panel-body">
+              <div class="d-flex justify-content-between align-items-baseline mb-1">
+                <label for="dsp-preamp-gain" class="form-label mb-0">Gain</label>
+                <output id="dsp-preamp-value" class="value-readout" for="dsp-preamp-gain">0.0 dB</output>
+              </div>
+              <input id="dsp-preamp-gain" type="range" class="tp-range" min="-24" max="24" step="0.5" value="0" aria-label="Preamp gain in dB">
+              <div class="range-ticks"><span>−24</span><span>0</span><span>+24</span></div>
+              <p class="form-text mb-0 mt-2">Double-click the slider to return to 0 dB. Positive gain can clip downstream if the limiter is off.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12 col-xl-9">
+          <div class="panel h-100">
+            <div class="panel-header">
+              <h2 class="panel-title">Equalizer</h2>
+              <div class="form-check form-switch mb-0">
+                <input id="dsp-eq-enabled" class="form-check-input" type="checkbox" role="switch" aria-label="Equalizer enabled">
+              </div>
+            </div>
+            <div class="panel-body">
+              <div id="dsp-bands" class="eq-bands" role="group" aria-label="Equalizer bands"></div>
+              <p class="form-text mb-0 mt-2">Range ±24 dB per band. Double-click a slider to zero it. Disabled bands act as 0 dB.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12 col-xl-7">
+          <div class="panel h-100">
+            <div class="panel-header">
+              <h2 class="panel-title">Limiter</h2>
+              <div class="form-check form-switch mb-0">
+                <input id="dsp-limiter-enabled" class="form-check-input" type="checkbox" role="switch" aria-label="Limiter enabled">
+              </div>
+            </div>
+            <div class="panel-body">
+              <div class="row g-3">
+                <div class="col-md-6">
+                  <div class="d-flex justify-content-between align-items-baseline mb-1">
+                    <label for="dsp-ceiling" class="form-label mb-0">Ceiling</label>
+                    <output id="dsp-ceiling-value" class="value-readout" for="dsp-ceiling">0.0 dBFS</output>
+                  </div>
+                  <input id="dsp-ceiling" type="range" class="tp-range" min="-60" max="0" step="0.5" value="0" aria-label="Limiter ceiling in dBFS">
+                  <div class="range-ticks"><span>−60</span><span>−30</span><span>0</span></div>
+                </div>
+                <div class="col-md-6">
+                  <div class="d-flex justify-content-between align-items-baseline mb-1">
+                    <label for="dsp-release" class="form-label mb-0">Release</label>
+                    <output id="dsp-release-value" class="value-readout" for="dsp-release">100 ms</output>
+                  </div>
+                  <input id="dsp-release" type="range" class="tp-range" min="0" max="1000" step="1" value="0" aria-label="Limiter release in milliseconds (logarithmic)">
+                  <div class="range-ticks"><span>1 ms</span><span>log scale</span><span>5000 ms</span></div>
+                </div>
+                <div class="col-12">
+                  <dl class="kv kv-tight mb-0">
+                    <dt>Look-ahead</dt>
+                    <dd><span id="dsp-lookahead">—</span> <span class="badge text-bg-secondary ms-1">fixed at construction</span></dd>
+                  </dl>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12 col-xl-5">
+          <div class="panel h-100">
+            <div class="panel-header"><h2 class="panel-title">What to know</h2></div>
+            <div class="panel-body">
+              <ul class="note-list">
+                <li><strong>Sample-peak limiter.</strong> The ceiling is applied to sample values. It does not measure inter-sample (true) peaks, which can exceed the ceiling after D/A conversion or lossy re-encoding.</li>
+                <li><strong>Look-ahead is construction-time.</strong> It is set when the limiter is created and cannot be changed here. Only ceiling and release are adjustable at runtime. The value shown is what the controller reports.</li>
+                <li><strong>No metering.</strong> This test player does not expose level meters or gain-reduction, so audible checks are manual.</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12">
+          <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">Manual checklist</h2></div>
+            <div class="panel-body" id="dsp-checklist"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- Streaming ---------- -->
+    <section id="section-streaming" class="app-section" aria-label="Streaming" hidden>
+      <div class="alert alert-warning d-flex gap-2 align-items-start" role="alert" id="stream-limitation-banner">
+        <i class="bi bi-exclamation-triangle-fill mt-1" aria-hidden="true"></i>
+        <div>
+          <strong>URL checks are not SSRF protection.</strong>
+          <span id="stream-limitation">URL checks are best-effort only. Host names that resolve to private addresses and redirects to local hosts are not detected.</span>
+        </div>
+      </div>
+
+      <div class="row g-3">
+        <div class="col-12 col-xl-7 d-flex flex-column gap-3">
+          <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">Load a stream</h2></div>
+            <div class="panel-body">
+              <form id="stream-form" novalidate>
+                <label for="stream-url" class="form-label">HTTP / HTTPS audio URL</label>
+                <input id="stream-url" type="url" class="form-control form-control-sm mb-2" placeholder="https://example.com/audio.mp3" autocomplete="off" spellcheck="false">
+                <div class="d-flex flex-wrap gap-1 mb-3" role="group" aria-label="URLs for validation tests">
+                  <span class="small text-body-secondary me-1 align-self-center">Fill validation test:</span>
+                  <button type="button" class="btn btn-xs btn-chip" data-sample-url="http://127.0.0.1/test.mp3">127.0.0.1</button>
+                  <button type="button" class="btn btn-xs btn-chip" data-sample-url="http://localhost/test.mp3">localhost</button>
+                  <button type="button" class="btn btn-xs btn-chip" data-sample-url="http://192.168.1.10/test.mp3">192.168.x.x</button>
+                  <button type="button" class="btn btn-xs btn-chip" data-sample-url="file:///C:/test.mp3">file://</button>
+                </div>
+
+                <div class="form-check mb-2">
+                  <input id="stream-play" class="form-check-input" type="checkbox" checked>
+                  <label class="form-check-label" for="stream-play">Start playback after loading</label>
+                </div>
+
+                <div class="danger-zone mb-3">
+                  <div class="form-check form-switch">
+                    <input id="stream-allow-local" class="form-check-input" type="checkbox" role="switch" aria-describedby="stream-local-warning">
+                    <label class="form-check-label" for="stream-allow-local">
+                      <i class="bi bi-shield-exclamation text-danger" aria-hidden="true"></i>
+                      Developer override: allow local / private hosts
+                    </label>
+                  </div>
+                  <div id="stream-local-warning" class="small text-danger mt-1" hidden>
+                    <strong>Override is ON.</strong> Loopback, link-local and private-network URLs will be requested. This disables the only pre-flight host check and must never be enabled for untrusted input.
+                  </div>
+                </div>
+
+                <div class="d-flex gap-2 align-items-center">
+                  <button id="btn-stream-load" type="submit" class="btn btn-sm btn-accent">
+                    <span class="spinner-border spinner-border-sm me-1" id="stream-spinner" aria-hidden="true" hidden></span>
+                    <i class="bi bi-cloud-arrow-down" id="stream-load-icon" aria-hidden="true"></i>
+                    <span id="stream-load-label">Load stream</span>
+                  </button>
+                  <button id="btn-stream-cancel" type="button" class="btn btn-sm btn-outline-secondary" disabled>
+                    <i class="bi bi-x-octagon" aria-hidden="true"></i> Cancel load
+                  </button>
+                </div>
+              </form>
+              <div id="stream-result" class="mt-3" aria-live="polite"></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">Streaming checklist</h2>
+              <div class="panel-tools">
+                <button id="btn-stream-to-scenarios" type="button" class="btn btn-sm btn-outline-secondary">
+                  Record verdicts <i class="bi bi-arrow-right-short" aria-hidden="true"></i>
+                </button>
+              </div>
+            </div>
+            <div class="panel-body" id="stream-checklist"></div>
+          </div>
+        </div>
+
+        <div class="col-12 col-xl-5">
+          <div class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">Streaming status</h2>
+              <div class="panel-tools">
+                <button id="btn-stream-refresh" type="button" class="btn btn-sm btn-outline-secondary">
+                  <i class="bi bi-arrow-clockwise" aria-hidden="true"></i> Refresh
+                </button>
+              </div>
+            </div>
+            <div class="panel-body">
+              <dl class="kv">
+                <dt>Safety mode</dt><dd id="st-safety">—</dd>
+                <dt>Local override</dt><dd id="st-override">—</dd>
+                <dt>SSRF protection complete</dt><dd id="st-ssrf">—</dd>
+                <dt>Load in flight</dt><dd id="st-loading">—</dd>
+                <dt>Active stream</dt><dd id="st-active" class="text-break">—</dd>
+                <dt>Network transport</dt><dd id="st-network">—</dd>
+                <dt>Bytes buffered</dt><dd id="st-bytes">—</dd>
+                <dt>Last load error</dt><dd id="st-error" class="text-break">—</dd>
+              </dl>
+              <p class="form-text mb-0">The active URL may contain credentials or tokens. Diagnostic exports redact URL queries unless you opt in to sensitive data.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- Diagnostics ---------- -->
+    <section id="section-diagnostics" class="app-section" aria-label="Diagnostics" hidden>
+      <div class="row g-3">
+        <div class="col-12 col-xl-7">
+          <div class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">Live state</h2>
+              <div class="panel-tools">
+                <label class="visually-hidden" for="diag-filter-source">Filter by source</label>
+                <select id="diag-filter-source" class="form-select form-select-sm w-auto">
+                  <option value="all">All sources</option>
+                  <option value="sonora">Sonora-reported</option>
+                  <option value="derived">Derived by app</option>
+                  <option value="host">Host</option>
+                  <option value="unavailable">Unavailable</option>
+                </select>
+                <button id="btn-diag-refresh" type="button" class="btn btn-sm btn-outline-secondary" title="Re-read the engine snapshot">
+                  <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
+                </button>
+              </div>
+            </div>
+            <div class="panel-body p-0">
+              <div class="source-legend px-3 py-2">
+                <span class="src-badge" data-source="sonora">Sonora</span> reported by the engine
+                <span class="src-badge ms-2" data-source="derived">Derived</span> computed by this app
+                <span class="src-badge ms-2" data-source="host">Host</span> environment info
+                <span class="src-badge ms-2" data-source="unavailable">Unavailable</span> not provided / unknown now
+              </div>
+              <div class="table-wrap">
+                <table class="table table-sm table-borderless diag-table mb-0">
+                  <thead><tr><th scope="col">Metric</th><th scope="col">Value</th><th scope="col" class="text-end">Source</th></tr></thead>
+                  <tbody id="diag-state-body"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12 col-xl-5 d-flex flex-column gap-3">
+          <div class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">Process resources</h2>
+              <span class="badge text-bg-secondary" title="These numbers cover the entire test player process">Process-level</span>
+            </div>
+            <div class="panel-body">
+              <div class="alert alert-secondary py-2 small" role="note">
+                Whole-process values: WinForms, the WebView2 host, the managed heap and Sonora together. They cannot be attributed to Sonora alone; look at trends, not absolute numbers.
+              </div>
+              <dl class="kv kv-tight" id="res-body">
+                <dt>Working set</dt><dd data-res="workingSetBytes">—</dd>
+                <dt>Private bytes</dt><dd data-res="privateBytes">—</dd>
+                <dt>Managed heap (GC)</dt><dd data-res="gcTotalMemoryBytes">—</dd>
+                <dt>GC collections (0 / 1 / 2)</dt><dd data-res="gc">—</dd>
+                <dt>OS handles</dt><dd data-res="handleCount">—</dd>
+                <dt>Threads</dt><dd data-res="threadCount">—</dd>
+                <dt>App uptime</dt><dd data-res="uptimeSeconds">—</dd>
+              </dl>
+              <div class="d-flex justify-content-between small text-body-secondary mt-2">
+                <span>Working set trend</span><span id="res-range">—</span>
+              </div>
+              <svg id="res-spark" class="sparkline" viewBox="0 0 200 40" preserveAspectRatio="none" role="img" aria-label="Process working set trend"></svg>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">Export</h2></div>
+            <div class="panel-body">
+              <div class="d-flex flex-wrap gap-3 mb-2">
+                <div class="form-check">
+                  <input class="form-check-input" type="radio" name="export-format" id="export-format-json" value="json" checked>
+                  <label class="form-check-label" for="export-format-json">JSON</label>
+                </div>
+                <div class="form-check">
+                  <input class="form-check-input" type="radio" name="export-format" id="export-format-text" value="text">
+                  <label class="form-check-label" for="export-format-text">Text summary</label>
+                </div>
+              </div>
+              <div class="danger-zone mb-3">
+                <div class="form-check form-switch">
+                  <input id="export-sensitive" class="form-check-input" type="checkbox" role="switch" aria-describedby="export-sensitive-note">
+                  <label class="form-check-label" for="export-sensitive">Include sensitive data (unredacted)</label>
+                </div>
+                <div id="export-sensitive-note" class="form-text">
+                  By default paths are reduced to file names and URL queries, credentials and your profile folder are removed (best-effort). Unredacted exports contain full paths and URLs; review before sharing.
+                </div>
+              </div>
+              <div class="d-flex flex-wrap gap-2 mb-2">
+                <button id="btn-export-preview" type="button" class="btn btn-sm btn-accent"><i class="bi bi-eye" aria-hidden="true"></i> Preview</button>
+                <button id="btn-export-copy" type="button" class="btn btn-sm btn-outline-secondary"><i class="bi bi-clipboard" aria-hidden="true"></i> Copy</button>
+                <button id="btn-export-save" type="button" class="btn btn-sm btn-outline-secondary"><i class="bi bi-save" aria-hidden="true"></i> Save to file…</button>
+              </div>
+              <div id="export-path-wrap" class="input-group input-group-sm mb-2" hidden>
+                <label class="input-group-text" for="export-path">Path</label>
+                <input id="export-path" type="text" class="form-control" placeholder="Full path to write (dialogs unavailable)" spellcheck="false">
+              </div>
+              <div id="export-status" class="small text-body-secondary mb-2" aria-live="polite"></div>
+              <label class="visually-hidden" for="export-preview">Export preview</label>
+              <textarea id="export-preview" class="form-control export-preview" rows="8" readonly spellcheck="false" placeholder="Preview appears here."></textarea>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12">
+          <div class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">Event log <span id="log-count" class="badge badge-soft ms-1">0</span></h2>
+              <div class="panel-tools flex-wrap">
+                <label class="visually-hidden" for="log-level">Minimum level</label>
+                <select id="log-level" class="form-select form-select-sm w-auto">
+                  <option value="0">Debug+</option>
+                  <option value="1" selected>Info+</option>
+                  <option value="2">Warning+</option>
+                  <option value="3">Error</option>
+                </select>
+                <label class="visually-hidden" for="log-category">Category</label>
+                <select id="log-category" class="form-select form-select-sm w-auto">
+                  <option value="">All categories</option>
+                </select>
+                <label class="visually-hidden" for="log-search">Search log</label>
+                <input id="log-search" type="search" class="form-control form-control-sm w-auto" placeholder="Search name / message" autocomplete="off">
+                <div class="form-check mb-0">
+                  <input id="log-autoscroll" class="form-check-input" type="checkbox" checked>
+                  <label class="form-check-label" for="log-autoscroll">Auto-scroll</label>
+                </div>
+                <button id="btn-log-pause" type="button" class="btn btn-sm btn-outline-secondary" aria-pressed="false">
+                  <i class="bi bi-pause-fill" aria-hidden="true"></i> <span>Pause</span>
+                </button>
+                <button id="btn-log-clear" type="button" class="btn btn-sm btn-outline-secondary">
+                  <i class="bi bi-trash3" aria-hidden="true"></i> Clear
+                </button>
+              </div>
+            </div>
+            <div class="panel-body p-0">
+              <div id="log-list" class="log-list" role="log" aria-live="off" tabindex="0" aria-label="Diagnostic event log"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- Scenarios ---------- -->
+    <section id="section-scenarios" class="app-section" aria-label="Test scenarios" hidden>
+      <div class="alert alert-secondary py-2 small d-flex gap-2 align-items-start" role="note">
+        <i class="bi bi-person-check mt-1" aria-hidden="true"></i>
+        <div>Verdicts are recorded <strong>manually</strong> by you. Nothing in this app marks a scenario as passed, and observed counters or soak numbers are never graded automatically.</div>
+      </div>
+
+      <div class="panel mb-3">
+        <div class="panel-body">
+          <div class="d-flex flex-wrap align-items-center gap-3">
+            <div id="scn-summary" class="d-flex flex-wrap gap-2" aria-live="polite"></div>
+            <div class="ms-auto d-flex flex-wrap gap-2 align-items-center">
+              <label class="visually-hidden" for="scn-status-filter">Filter by status</label>
+              <select id="scn-status-filter" class="form-select form-select-sm w-auto">
+                <option value="">All statuses</option>
+                <option value="notRun">Not run</option>
+                <option value="pass">Pass</option>
+                <option value="fail">Fail</option>
+                <option value="inconclusive">Inconclusive</option>
+              </select>
+              <button id="btn-scn-reset" type="button" class="btn btn-sm btn-outline-danger">
+                <i class="bi bi-arrow-counterclockwise" aria-hidden="true"></i> Reset all results
+              </button>
+            </div>
+          </div>
+          <div class="progress stacked-progress mt-3" role="img" aria-label="Scenario results breakdown">
+            <div class="progress-bar seg-pass" id="scn-bar-pass"></div>
+            <div class="progress-bar seg-fail" id="scn-bar-fail"></div>
+            <div class="progress-bar seg-inconclusive" id="scn-bar-inconclusive"></div>
+          </div>
+          <div id="scn-category-pills" class="d-flex flex-wrap gap-1 mt-3" role="group" aria-label="Scenario categories"></div>
+        </div>
+      </div>
+
+      <div class="row g-3">
+        <div class="col-12 col-xxl-8">
+          <div id="scn-list" class="d-flex flex-column gap-3"></div>
+        </div>
+        <div class="col-12 col-xxl-4">
+          <div class="panel sticky-panel">
+            <div class="panel-header">
+              <h2 class="panel-title">Soak session</h2>
+              <span id="soak-state" class="badge text-bg-secondary">Not started</span>
+            </div>
+            <div class="panel-body">
+              <div class="d-flex gap-2 mb-3">
+                <button id="btn-soak-start" type="button" class="btn btn-sm btn-accent"><i class="bi bi-play-circle" aria-hidden="true"></i> Start</button>
+                <button id="btn-soak-stop" type="button" class="btn btn-sm btn-outline-secondary" disabled><i class="bi bi-stop-circle" aria-hidden="true"></i> Stop</button>
+              </div>
+              <dl class="kv kv-tight">
+                <dt>Elapsed</dt><dd id="soak-elapsed">—</dd>
+                <dt>Started (local)</dt><dd id="soak-started">—</dd>
+                <dt>Errors recorded</dt><dd id="soak-errors">—</dd>
+                <dt>Underruns recorded</dt><dd id="soak-underruns">—</dd>
+                <dt>Working set at start</dt><dd id="soak-ws-start">—</dd>
+                <dt>Working set latest</dt><dd id="soak-ws-latest">—</dd>
+                <dt>Working set peak</dt><dd id="soak-ws-peak">—</dd>
+                <dt>Latest − start</dt><dd id="soak-ws-delta">—</dd>
+              </dl>
+              <p class="form-text">Memory figures are process-level (host, WebView2 and Sonora together). The soak only collects numbers; you decide the verdict.</p>
+              <div class="input-group input-group-sm mb-2">
+                <label class="visually-hidden" for="soak-note-input">Soak note</label>
+                <input id="soak-note-input" type="text" class="form-control" placeholder="Add a timestamped note" autocomplete="off">
+                <button id="btn-soak-note" type="button" class="btn btn-outline-secondary">Add</button>
+              </div>
+              <ul id="soak-notes" class="soak-notes"></ul>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============================== Playback bar ============================== -->
+  <footer class="playbar" aria-label="Playback controls">
+    <div class="pb-track">
+      <div class="art art-sm" aria-hidden="true">
+        <i class="bi bi-music-note-beamed art-ph" id="pb-art-ph"></i>
+        <img id="pb-art-img" alt="" hidden>
+      </div>
+      <div class="pb-meta">
+        <div id="pb-title" class="pb-title">Nothing loaded</div>
+        <div id="pb-artist" class="pb-artist">&nbsp;</div>
+      </div>
+    </div>
+
+    <div class="pb-center">
+      <div class="pb-buttons">
+        <button id="pb-prev" type="button" class="icon-btn" title="Previous" aria-label="Previous track"><i class="bi bi-skip-start-fill" aria-hidden="true"></i></button>
+        <button id="pb-stop" type="button" class="icon-btn" title="Stop" aria-label="Stop"><i class="bi bi-stop-fill" aria-hidden="true"></i></button>
+        <button id="pb-play" type="button" class="icon-btn icon-btn-primary" title="Play" aria-label="Play"><i id="pb-play-icon" class="bi bi-play-fill" aria-hidden="true"></i></button>
+        <button id="pb-next" type="button" class="icon-btn" title="Next" aria-label="Next track"><i class="bi bi-skip-end-fill" aria-hidden="true"></i></button>
+      </div>
+      <div class="pb-seek-row">
+        <span id="pb-elapsed" class="time-label">0:00</span>
+        <input id="pb-seek" type="range" class="tp-range" min="0" max="0" step="1" value="0" disabled aria-label="Seek position">
+        <span id="pb-duration" class="time-label">—:—</span>
+      </div>
+    </div>
+
+    <div class="pb-right">
+      <div class="pb-status">
+        <span id="pb-state" class="state-chip" data-state="stopped">Stopped</span>
+        <span id="pb-device" class="pb-device text-truncate" title="Output device"><i class="bi bi-speaker" aria-hidden="true"></i> <span id="pb-device-text">—</span></span>
+      </div>
+      <div class="pb-volume">
+        <button id="pb-mute" type="button" class="icon-btn icon-btn-sm" title="Mute / restore volume" aria-label="Mute"><i id="pb-mute-icon" class="bi bi-volume-up-fill" aria-hidden="true"></i></button>
+        <input id="pb-volume" type="range" class="tp-range" min="0" max="100" step="1" value="100" aria-label="Volume">
+        <span id="pb-volume-value" class="time-label">100%</span>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Toasts -->
+<div id="toast-host" class="toast-container position-fixed top-0 end-0 p-3 tp-toast-host" aria-live="polite" aria-atomic="false"></div>
+
+<!-- Confirm modal -->
+<div class="modal fade" id="confirm-modal" tabindex="-1" aria-labelledby="confirm-title" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 class="modal-title fs-6" id="confirm-title">Confirm</h2>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body"><p id="confirm-message" class="mb-0"></p></div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-sm btn-accent" id="confirm-ok">Confirm</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="vendor/bootstrap-5.3.8/js/bootstrap.bundle.min.js"></script>
+<script src="js/bridge.js"></script>
+<script src="js/player.js"></script>
+<script src="js/output.js"></script>
+<script src="js/dsp.js"></script>
+<script src="js/streaming.js"></script>
+<script src="js/diagnostics.js"></script>
+<script src="js/scenarios.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

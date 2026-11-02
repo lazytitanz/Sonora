@@ -7,13 +7,14 @@ namespace Sonora.Audio.Playback;
 
 /// <summary>
 /// Background worker that decodes PCM into a ring buffer. Never runs on the audio output callback.
+/// Master volume is applied on the output pull path (<see cref="PcmVolume"/>), not here, so volume
+/// changes are not delayed by ring buffering.
 /// </summary>
 internal sealed class DecodePump : IDisposable
 {
     private readonly IAudioDecoder _decoder;
     private readonly PcmRingBuffer _ring;
     private readonly IReadOnlyList<IAudioProcessor> _processors;
-    private readonly Func<float> _getVolume;
     private readonly Action<int> _onSamplesWritten;
     private readonly Action<Exception>? _onError;
     private readonly float[] _scratch;
@@ -25,7 +26,6 @@ internal sealed class DecodePump : IDisposable
         IAudioDecoder decoder,
         PcmRingBuffer ring,
         IReadOnlyList<IAudioProcessor> processors,
-        Func<float> getVolume,
         Action<int> onSamplesWritten,
         Action<Exception>? onError = null,
         int scratchSamples = 4096)
@@ -33,7 +33,6 @@ internal sealed class DecodePump : IDisposable
         _decoder = decoder;
         _ring = ring;
         _processors = processors;
-        _getVolume = getVolume;
         _onSamplesWritten = onSamplesWritten;
         _onError = onError;
         _scratch = new float[Math.Max(256, scratchSamples)];
@@ -132,8 +131,6 @@ internal sealed class DecodePump : IDisposable
                     processor.Process(slice, format);
                 }
 
-                ApplyVolume(slice, _getVolume());
-
                 var written = _ring.Write(slice, cancellationToken);
                 if (written > 0)
                 {
@@ -157,25 +154,6 @@ internal sealed class DecodePump : IDisposable
         catch (Exception ex)
         {
             _onError?.Invoke(ex);
-        }
-    }
-
-    private static void ApplyVolume(Span<float> buffer, float volume)
-    {
-        if (Math.Abs(volume - 1f) < 0.0001f)
-        {
-            return;
-        }
-
-        if (volume <= 0f)
-        {
-            buffer.Clear();
-            return;
-        }
-
-        for (var i = 0; i < buffer.Length; i++)
-        {
-            buffer[i] *= volume;
         }
     }
 }

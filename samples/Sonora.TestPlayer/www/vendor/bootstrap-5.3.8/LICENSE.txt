@@ -1,0 +1,4 @@
+﻿Bootstrap v5.3.8
+https://getbootstrap.com/
+Copyright (c) 2011-2025 The Bootstrap Authors
+Licensed under the MIT License: https://github.com/twbs/bootstrap/blob/v5.3.8/LICENSE

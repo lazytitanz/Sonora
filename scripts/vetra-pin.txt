@@ -1,0 +1,2 @@
+# Pinned Vetra commit (lazytitanz/Vetra). Update this SHA and re-run scripts/pack-vetra.ps1 when upgrading.
+e09f552eb4ed0c6f995abf196395b5e32fc9caf6

@@ -1,0 +1,4 @@
+﻿Bootstrap Icons v1.13.2
+https://icons.getbootstrap.com/
+Copyright (c) 2019-2025 The Bootstrap Authors
+Licensed under the MIT License: https://github.com/twbs/icons/blob/v1.13.2/LICENSE.md

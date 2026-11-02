@@ -12,6 +12,7 @@ All notable changes to Sonora will be documented in this file.
 - `SECURITY.md` and `THIRD-PARTY-NOTICES.md`
 - SourceLink (`Microsoft.SourceLink.GitHub`), NuGet audit props, CI upload of `*.snupkg`
 - Hardware test gate (`SONORA_RUN_HARDWARE_TESTS=1`) shared helper; Soak category placeholder excluded from CI
+- Sample: **Sonora Test Player** (`samples/Sonora.TestPlayer`) — Vetra + Bootstrap Windows validation UI; local Vetra feed via `scripts/pack-vetra.ps1`; hardware-independent controller tests
 
 ### Changed
 
@@ -19,12 +20,16 @@ All notable changes to Sonora will be documented in this file.
 - Limiter default `LookaheadMs = 5` guaranteeing sample-peak ceiling; documented contract (LA=0 measured ≥1 sample delay, not true-peak)
 - Recommended DSP order **Preamp → EQ → Limiter**
 - CI: `fetch-depth: 0`, test filter `Category!=Hardware&Category!=Soak`, vulnerability listing, package-consumer smoke
+- `AudioPlayer.Volume` applies on the **output pull path** (after the PCM ring, before the effect rack) so loudness changes are not delayed by `BufferDuration`
+- WASAPI exclusive end-of-stream: pad the final render period; stop WasapiPlayer off the render thread after EOS so `AUDCLNT_E_BUFFER_SIZE_ERROR` (0x88890016) is avoided; do not auto-recover exclusive init/format/busy failures in a tight device-loss loop
 
 ### Fixed
 
 - `AudioPlayer` / `AudioEngine` disposal: detach session under the command gate, complete output shutdown and decode-pump stop **off-gate** (eliminates sync-over-async wait while holding `_gate`); additive `IAsyncDisposable`
 - Engine unregisters players on dispose (avoids double-dispose list growth)
 - Limiter sanitizes non-finite PCM samples; default look-ahead raised to 5 ms after measurement (explicit `LookaheadMs=0` still available)
+- WASAPI exclusive: wrong `AUDCLNT_E_BUFFER_SIZE_ERROR` HRESULT constant (`0x88890018` → `0x88890016`) caused end-of-stream to be misclassified as device failure; Shared→Exclusive with `ExclusiveModeFallback.None` could crash/hang Test Player via recovery storm
+- Test Player: serialize output configure commands; surface configure failures as nonfatal UI errors and resync effective mode after success or failure
 
 ### Notes
 

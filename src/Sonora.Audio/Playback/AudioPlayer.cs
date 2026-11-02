@@ -283,7 +283,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         }
     }
 
-    /// <summary>Linear gain in the range [0, 1].</summary>
+    /// <summary>
+    /// Linear master gain in the range [0, 1]. Applied on the output pull path (after the PCM ring,
+    /// before the effect rack) so changes are audible on the next device callback rather than after
+    /// the ring drains. Distinct from <see cref="Effects"/> preamp gain (dB).
+    /// </summary>
     public float Volume
     {
         get => Volatile.Read(ref _volume);
@@ -858,7 +862,6 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             pipeline = TrackDecodePipeline.Create(source, converted, _options, networkInfo);
             pipeline.StartPump(
                 _options.Processors,
-                () => Volatile.Read(ref _volume),
                 onSamplesWritten: _ => { },
                 onError: ex =>
                 {
@@ -1669,7 +1672,6 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
         active.StartPump(
             _options.Processors,
-            () => Volatile.Read(ref _volume),
             onSamplesWritten: n => Interlocked.Add(ref _samplesDecoded, n),
             onError: ex => RaiseError(ex));
     }
@@ -1876,11 +1878,9 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
     private void OnOutputStopped(object? sender, AudioOutputStoppedEventArgs e)
     {
-        if (e.Exception is not null)
-        {
-            RaiseError(e.Exception);
-        }
-
+        // Never invoke ErrorOccurred on the output callback / Stopped thread while also taking the
+        // command gate: Post handling onto a worker and raise errors from HandleOutputStopped after
+        // classifying EOS vs failure (EOS must not RaiseError).
         if (!_gate.Wait(0))
         {
             _ = Task.Run(() => HandleOutputStopped(e));
@@ -1950,6 +1950,8 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             return;
         }
 
+        RaiseError(e.Exception);
+
         // Device loss / output failure during playback or pause.
         if (_state is PlaybackState.Playing or PlaybackState.Paused)
         {
@@ -1965,7 +1967,25 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
             Volatile.Write(ref _acceptEndOfStreamCompletion, 0);
             var lostOutput = DetachOutput_NoLock();
-            _outputDeviceStatus = OutputDeviceStatus.Switching;
+            var failureKind = OutputFailureHelpers.KindOf(e.Exception);
+            // Exclusive init/format/busy failures are not "device lost": auto-recovering with the
+            // same Exclusive configuration recreates the failure in a tight loop. Leave the player
+            // Unavailable with recovery intent so the app can reconfigure or retry deliberately.
+            var autoRecover = failureKind is AudioOutputFailureKind.DeviceUnavailable
+                or AudioOutputFailureKind.Unspecified
+                or AudioOutputFailureKind.ShutdownFailed;
+
+            _outputDeviceStatus = autoRecover
+                ? OutputDeviceStatus.Switching
+                : OutputDeviceStatus.Unavailable;
+            if (!autoRecover
+                && failureKind != AudioOutputFailureKind.Unspecified
+                && failureKind != AudioOutputFailureKind.ShutdownFailed)
+            {
+                _outputFallbackReason = OutputFailureHelpers.ToFallbackReason(failureKind);
+                _effectiveOutputMode = null;
+            }
+
             SetState_NoLock(PlaybackState.Stopped);
             // Shutdown off the gate path: schedule after release via recovery / background.
             _ = Task.Run(() =>
@@ -1979,7 +1999,15 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                     RaiseError(ex);
                 }
             });
-            ScheduleDeviceRecovery(OutputDeviceChangeReason.DeviceLostFallback);
+
+            if (autoRecover)
+            {
+                ScheduleDeviceRecovery(OutputDeviceChangeReason.DeviceLostFallback);
+            }
+            else
+            {
+                RaiseOutputDeviceChanged(OutputDeviceChangeReason.Unavailable);
+            }
         }
     }
 
@@ -2395,6 +2423,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         new(
             format,
             _effects,
+            getVolume: () => Volatile.Read(ref _volume),
             onSamplesConsumed: OnSamplesConsumedFromCallback,
             onUnderrun: HandleUnderrunFromCallback,
             isPlaying: () => _state == PlaybackState.Playing,
@@ -3132,7 +3161,6 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 nextPipeline = TrackDecodePipeline.Create(rebuildSource, nextConverted, _options, nextNetwork);
                 nextPipeline.StartPump(
                     _options.Processors,
-                    () => Volatile.Read(ref _volume),
                     onSamplesWritten: _ => { },
                     onError: ex =>
                     {

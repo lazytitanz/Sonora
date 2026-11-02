@@ -86,7 +86,6 @@ internal sealed class TrackDecodePipeline : IDisposable
 
     public void StartPump(
         IReadOnlyList<IAudioProcessor> processors,
-        Func<float> getVolume,
         Action<int> onSamplesWritten,
         Action<Exception>? onError)
     {
@@ -101,7 +100,6 @@ internal sealed class TrackDecodePipeline : IDisposable
             Decoder,
             Ring,
             processors,
-            getVolume,
             onSamplesWritten,
             onError);
         _pump.Start();

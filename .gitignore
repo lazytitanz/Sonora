@@ -21,6 +21,11 @@ project.lock.json
 project.fragment.lock.json
 artifacts/
 
+## Local dependency feed / caches (scripts/pack-vetra.ps1, scripts/sync-frontend-vendor.ps1)
+/deps/nuget/*.nupkg
+/deps/nuget/*.snupkg
+/deps/cache/
+
 ## Test / coverage
 TestResults/
 coverage*

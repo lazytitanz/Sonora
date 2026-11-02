@@ -40,7 +40,7 @@ It is built for apps like [EMP](https://github.com/lazytitanz/EMP) but stays com
 - **Wide format coverage** — WAV, AIFF, MP3, AAC, M4A, FLAC, WMA, ALAC, Ogg Vorbis, Ogg Opus, WebM Opus
 - **Gapless playback** — `PreloadNextAsync` + seamless hard-cut transition on one WASAPI session
 - **Dual position tracking** — `Position` (audible estimate) and `BufferedPosition` (decode frontier)
-- **Live DSP** — EQ/preamp changes apply on the output path without waiting for the PCM buffer to drain
+- **Live volume and DSP** — `Volume`, EQ, and preamp apply on the output path without waiting for the PCM buffer to drain
 - **Metadata** — read tags and optional embedded artwork without creating a player or opening WASAPI
 - **HTTP streaming** — play `http`/`https` URLs with bounded buffering, cancellation, and honest seek reporting
 - **MIT licensed** — packages prepared for NuGet (`Sonora.Audio`, `Sonora.Audio.Windows`)
@@ -116,7 +116,7 @@ Metadata uses managed [ATL.NET](https://github.com/Zeugma440/atldotnet) (`z440.a
 | `Stop` | Stops and resets to the beginning (does not raise completion) |
 | `Seek` | Seeks when the decoder supports it (preserves a safe next track) |
 | `SeekWithResult` | Same as `Seek`, returns `AudioSeekResult` (requested / actual / accuracy) |
-| `Volume` | Linear gain in `[0, 1]` |
+| `Volume` | Linear gain in `[0, 1]` (applied post-ring on the output path; immediate) |
 
 **Events:** `StateChanged`, `PlaybackCompleted`, `TrackTransitioned`, `OutputDeviceChanged`, `OutputConfigurationChanged`, `ErrorOccurred`, `Underrun`. Raised on worker threads (not marshaled to a UI sync context). `TrackTransitioned` is never raised on the WASAPI callback and may fire after the next track’s samples have already entered the output pipeline.
 
@@ -324,8 +324,8 @@ Sample-peak only (not true-peak / inter-sample; no soft clip). Default `Lookahea
 
 ```text
 LoadAsync → decoder factory → format sniff → IAudioDecoder
-  → decode pump → [optional IAudioProcessor] → Volume → PCM ring
-  → output pull → player EffectRack → WASAPI (shared mode)
+  → decode pump → [optional IAudioProcessor] → PCM ring
+  → output pull → Volume → player EffectRack → WASAPI (shared mode)
 ```
 
 | Layer | Role |
@@ -361,7 +361,8 @@ Sonora/
 ├── src/Sonora.Audio              # Platform-independent core
 ├── src/Sonora.Audio.Windows      # NAudio / WASAPI backend
 ├── tests/                        # Unit, Windows, and package-consumer tests
-├── samples/Sonora.ConsolePlayer  # Interactive demo
+├── samples/Sonora.ConsolePlayer  # Interactive console demo
+├── samples/Sonora.TestPlayer     # Vetra + Bootstrap Windows validation UI (see its README)
 └── docs/                         # Architecture, versioning, portability, limiter
 ```
 
@@ -370,13 +371,16 @@ Sonora/
 ## Build and test
 
 ```bash
+# Windows: pack Vetra into deps/nuget first (pinned script; required for Sonora.TestPlayer)
+./scripts/pack-vetra.ps1
+
 dotnet build Sonora.slnx -c Release
 dotnet test Sonora.slnx -c Release --filter "Category!=Hardware&Category!=Soak"
 dotnet pack src/Sonora.Audio/Sonora.Audio.csproj -c Release
 dotnet pack src/Sonora.Audio.Windows/Sonora.Audio.Windows.csproj -c Release
 ```
 
-Hardware-dependent tests run only when `SONORA_RUN_HARDWARE_TESTS=1` (see [docs/hardware-testing.md](docs/hardware-testing.md)).
+The graphical Test Player is documented in [samples/Sonora.TestPlayer/README.md](samples/Sonora.TestPlayer/README.md). CI builds it but does not launch the UI. Hardware-dependent engine tests run only when `SONORA_RUN_HARDWARE_TESTS=1` (see [docs/hardware-testing.md](docs/hardware-testing.md)).
 
 ### Installation (local packages)
 

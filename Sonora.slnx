@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/samples/">
     <Project Path="samples/Sonora.ConsolePlayer/Sonora.ConsolePlayer.csproj" />
+    <Project Path="samples/Sonora.TestPlayer/Sonora.TestPlayer.csproj" />
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/Sonora.Audio.Windows/Sonora.Audio.Windows.csproj" />
@@ -9,5 +10,6 @@
   <Folder Name="/tests/">
     <Project Path="tests/Sonora.Audio.Tests/Sonora.Audio.Tests.csproj" />
     <Project Path="tests/Sonora.Audio.Windows.Tests/Sonora.Audio.Windows.Tests.csproj" />
+    <Project Path="tests/Sonora.TestPlayer.Tests/Sonora.TestPlayer.Tests.csproj" />
   </Folder>
 </Solution>

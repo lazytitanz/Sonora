@@ -7,14 +7,15 @@ namespace Sonora.Audio.Playback;
 
 /// <summary>
 /// Non-blocking PCM source backed by a ring buffer. Safe for audio output callbacks.
-/// Applies the player effect rack after reading dry (volume-scaled) PCM from the ring
-/// so live parameter changes are audible without waiting for the buffer to drain.
+/// Applies master volume then the player effect rack after reading dry PCM from the ring
+/// so live volume and DSP parameter changes are audible without waiting for the buffer to drain.
 /// </summary>
 internal sealed class BufferedSampleSource : IPcmSampleSource
 {
     private readonly PcmRingBuffer _ring;
     private readonly AudioFormat _format;
     private readonly AudioEffectRack _effects;
+    private readonly Func<float> _getVolume;
     private readonly Action<int> _onSamplesConsumed;
     private readonly Action _onUnderrun;
     private readonly Func<bool> _isPlaying;
@@ -24,6 +25,7 @@ internal sealed class BufferedSampleSource : IPcmSampleSource
         PcmRingBuffer ring,
         AudioFormat format,
         AudioEffectRack effects,
+        Func<float> getVolume,
         Action<int> onSamplesConsumed,
         Action onUnderrun,
         Func<bool> isPlaying)
@@ -31,6 +33,7 @@ internal sealed class BufferedSampleSource : IPcmSampleSource
         _ring = ring;
         _format = format;
         _effects = effects;
+        _getVolume = getVolume;
         _onSamplesConsumed = onSamplesConsumed;
         _onUnderrun = onUnderrun;
         _isPlaying = isPlaying;
@@ -51,7 +54,9 @@ internal sealed class BufferedSampleSource : IPcmSampleSource
         if (read > 0)
         {
             _onSamplesConsumed(read);
-            _effects.Process(destination[..read], _format);
+            var wet = destination[..read];
+            PcmVolume.Apply(wet, _getVolume());
+            _effects.Process(wet, _format);
         }
 
         if (read == destination.Length)

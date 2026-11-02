@@ -175,4 +175,89 @@ public sealed class WindowsPlaybackTests
         Assert.Equal(AudioOutputMode.Shared, player.EffectiveOutputMode);
         Assert.Equal(PlaybackState.Paused, player.State);
     }
+
+    [HardwareFact]
+    [Trait("Category", "Hardware")]
+    public async Task Hardware_SharedToExclusive_WhilePlaying_FallbackNone()
+    {
+        var path = FixtureHelper.EnsureToneWav(TimeSpan.FromMilliseconds(1500));
+        using var engine = SonoraWindows.CreateEngine();
+        await using var player = engine.CreatePlayer();
+
+        Exception? error = null;
+        player.ErrorOccurred += (_, ex) => Interlocked.Exchange(ref error, ex);
+
+        await player.LoadAsync(path);
+        player.Volume = 0.05f;
+        player.Play();
+        await Task.Delay(200);
+        Assert.Equal(PlaybackState.Playing, player.State);
+        Assert.Equal(AudioOutputMode.Shared, player.EffectiveOutputMode);
+
+        try
+        {
+            await player.ConfigureOutputAsync(new AudioOutputConfiguration
+            {
+                Mode = AudioOutputMode.Exclusive,
+                ExclusiveFallback = ExclusiveModeFallback.None,
+            });
+        }
+        catch (AudioOutputException)
+        {
+            // Device may reject exclusive; must not crash and must leave a recoverable state.
+            Assert.True(player.HasSource);
+            Assert.NotEqual(PlaybackState.Playing, player.State); // transport stopped on strict fail
+            return;
+        }
+
+        Assert.Equal(AudioOutputMode.Exclusive, player.EffectiveOutputMode);
+        Assert.Equal(PlaybackState.Playing, player.State);
+
+        // Continue for a bit — must not raise AUDCLNT_E_BUFFER_SIZE / recovery storm mid-stream.
+        await Task.Delay(400);
+        Assert.Null(error);
+        Assert.True(
+            player.State is PlaybackState.Playing or PlaybackState.Stopped,
+            $"Unexpected state after exclusive switch: {player.State}");
+    }
+
+    [HardwareFact]
+    [Trait("Category", "Hardware")]
+    public async Task Hardware_Exclusive_NaturalEos_DoesNotRaiseBufferSizeError()
+    {
+        var path = FixtureHelper.EnsureToneWav(TimeSpan.FromMilliseconds(350));
+        using var engine = SonoraWindows.CreateEngine();
+        await using var player = engine.CreatePlayer();
+
+        Exception? error = null;
+        var completed = 0;
+        player.ErrorOccurred += (_, ex) => Interlocked.Exchange(ref error, ex);
+        player.PlaybackCompleted += (_, _) => Interlocked.Increment(ref completed);
+
+        await player.LoadAsync(path);
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration
+        {
+            Mode = AudioOutputMode.Exclusive,
+            ExclusiveFallback = ExclusiveModeFallback.None,
+        });
+
+        if (player.EffectiveOutputMode != AudioOutputMode.Exclusive)
+        {
+            // Host rejected exclusive with fallback None — skip EOS assertion.
+            return;
+        }
+
+        player.Volume = 0.05f;
+        player.Play();
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (Volatile.Read(ref completed) == 0 && sw.Elapsed < TimeSpan.FromSeconds(8))
+        {
+            await Task.Delay(40);
+        }
+
+        Assert.Equal(1, Volatile.Read(ref completed));
+        Assert.Null(error);
+        Assert.Equal(PlaybackState.Stopped, player.State);
+    }
 }

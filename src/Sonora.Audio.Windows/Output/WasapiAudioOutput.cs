@@ -153,7 +153,9 @@ internal sealed class WasapiAudioOutput : IAudioOutput
 
         _source = source;
         _format = source.Format;
-        _adapter = new PcmSampleProviderAdapter(source);
+        // When the PCM source ends, stop WasapiPlayer off the render thread so exclusive mode
+        // does not ReleaseBuffer(0) → AUDCLNT_E_BUFFER_SIZE_ERROR (0x88890016).
+        _adapter = new PcmSampleProviderAdapter(source, RequestStopAfterEndOfStream);
 
         var latencyMs = _requestedLatencyMs;
         Exception? last = null;
@@ -393,6 +395,35 @@ internal sealed class WasapiAudioOutput : IAudioOutput
         return device;
     }
 
+    private int _stoppedRaised;
+    private int _eosStopRequested;
+
+    private void RequestStopAfterEndOfStream()
+    {
+        if (Interlocked.Exchange(ref _eosStopRequested, 1) == 1)
+        {
+            return;
+        }
+
+        // Never Stop() on the WASAPI render thread — queue a worker.
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                if (_shutdown || _disposed)
+                {
+                    return;
+                }
+
+                _player.Stop();
+            }
+            catch
+            {
+                // Stop races with an already-faulted PlayThread are benign.
+            }
+        });
+    }
+
     private void OnPlaybackStopped(object? sender, StoppedEventArgs e)
     {
         if (_shutdown || _disposed)
@@ -400,8 +431,25 @@ internal sealed class WasapiAudioOutput : IAudioOutput
             return;
         }
 
+        // NAudio may raise PlaybackStopped more than once for the same failure; deliver one event.
+        if (Interlocked.Exchange(ref _stoppedRaised, 1) == 1)
+        {
+            return;
+        }
+
         if (e.Exception is not null)
         {
+            // Exclusive event-driven mode can surface AUDCLNT_E_BUFFER_SIZE_ERROR (0x88890016) when
+            // the final period is short or zero. If the PCM source has already ended (or we already
+            // requested a clean stop after EOS padding), treat that as clean EOS rather than a
+            // device-loss recovery loop.
+            var ended = _source?.IsEndOfStream == true || Volatile.Read(ref _eosStopRequested) == 1;
+            if (ended && WasapiErrorMapper.IsRecoverableBufferAlignmentFailure(e.Exception))
+            {
+                RaiseStopped(new AudioOutputStoppedEventArgs(reachedEndOfStream: true));
+                return;
+            }
+
             RaiseStopped(new AudioOutputStoppedEventArgs(
                 reachedEndOfStream: false,
                 exception: e.Exception is AudioOutputException
@@ -410,8 +458,8 @@ internal sealed class WasapiAudioOutput : IAudioOutput
             return;
         }
 
-        var ended = _source?.IsEndOfStream == true;
-        RaiseStopped(new AudioOutputStoppedEventArgs(reachedEndOfStream: ended));
+        var naturalEnd = _source?.IsEndOfStream == true || Volatile.Read(ref _eosStopRequested) == 1;
+        RaiseStopped(new AudioOutputStoppedEventArgs(reachedEndOfStream: naturalEnd));
     }
 
     private void RaiseStopped(AudioOutputStoppedEventArgs args)

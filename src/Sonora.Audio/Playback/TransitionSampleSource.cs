@@ -7,12 +7,15 @@ namespace Sonora.Audio.Playback;
 /// <summary>
 /// Pulls from the active ring and, when it drains at EOF with a ready next pipeline,
 /// promotes next and continues filling the same destination (spanning A|B).
-/// Schedules transition notifications off the calling (audio) thread.
+/// Applies master volume then the effect rack on the pull path so live volume and DSP
+/// changes are not delayed by ring buffering. Schedules transition notifications off the
+/// calling (audio) thread.
 /// </summary>
 internal sealed class TransitionSampleSource : IPcmSampleSource
 {
     private readonly AudioFormat _format;
     private readonly AudioEffectRack _effects;
+    private readonly Func<float> _getVolume;
     private readonly Action<int> _onSamplesConsumed;
     private readonly Action _onUnderrun;
     private readonly Func<bool> _isPlaying;
@@ -27,6 +30,7 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
     public TransitionSampleSource(
         AudioFormat format,
         AudioEffectRack effects,
+        Func<float> getVolume,
         Action<int> onSamplesConsumed,
         Action onUnderrun,
         Func<bool> isPlaying,
@@ -37,6 +41,7 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
     {
         _format = format;
         _effects = effects;
+        _getVolume = getVolume;
         _onSamplesConsumed = onSamplesConsumed;
         _onUnderrun = onUnderrun;
         _isPlaying = isPlaying;
@@ -149,7 +154,11 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
                     return destination.Length;
                 }
 
-                _effects.Process(destination[..filled], _format);
+                // Volume then DSP: preserves prior ordering (volume was pre-effects) while applying
+                // after the ring so changes take effect on the next output callback.
+                var wet = destination[..filled];
+                PcmVolume.Apply(wet, _getVolume());
+                _effects.Process(wet, _format);
             }
 
             if (filled < destination.Length && Volatile.Read(ref _endOfStream) == 1)

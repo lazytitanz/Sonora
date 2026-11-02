@@ -26,6 +26,10 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
+      - name: Prepare Vetra local NuGet packages
+        run: ./scripts/pack-vetra.ps1
+        shell: pwsh
+
       - name: Restore
         run: dotnet restore Sonora.slnx
 

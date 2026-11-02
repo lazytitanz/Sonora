@@ -10,6 +10,7 @@ public class WasapiErrorMapperTests
     private const int AudClntEExclusiveModeNotAllowed = unchecked((int)0x8889000E);
     private const int AudClntEUnsupportedFormat = unchecked((int)0x88890008);
     private const int AudClntEBufferSizeNotAligned = unchecked((int)0x88890019);
+    private const int AudClntEBufferSizeError = unchecked((int)0x88890016);
 
     [Fact]
     public void Classify_DeviceInUse_IsBusy()
@@ -36,6 +37,14 @@ public class WasapiErrorMapperTests
     public void BufferAlignment_IsRecoverable()
     {
         var ex = new COMException("align", AudClntEBufferSizeNotAligned);
+        Assert.True(WasapiErrorMapper.IsRecoverableBufferAlignmentFailure(ex));
+        Assert.Equal(AudioOutputFailureKind.InitializationFailed, WasapiErrorMapper.Classify(ex));
+    }
+
+    [Fact]
+    public void BufferSizeError_0x88890016_IsRecoverable()
+    {
+        var ex = new COMException("A buffer size error occurred.", AudClntEBufferSizeError);
         Assert.True(WasapiErrorMapper.IsRecoverableBufferAlignmentFailure(ex));
         Assert.Equal(AudioOutputFailureKind.InitializationFailed, WasapiErrorMapper.Classify(ex));
     }

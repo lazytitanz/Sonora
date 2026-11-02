@@ -199,6 +199,237 @@ public class OutputModeTests
     }
 
     [Fact]
+    public async Task SharedToExclusive_WhilePlaying_Succeeds()
+    {
+        using var engine = CreateEngine();
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync("track.wav");
+        player.Play();
+
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration
+        {
+            Mode = AudioOutputMode.Exclusive,
+            ExclusiveFallback = ExclusiveModeFallback.None,
+        });
+
+        Assert.Equal(AudioOutputMode.Exclusive, player.EffectiveOutputMode);
+        Assert.Equal(PlaybackState.Playing, player.State);
+        Assert.True(player.HasSource);
+    }
+
+    [Fact]
+    public async Task SharedToExclusive_WhilePaused_Succeeds()
+    {
+        using var engine = CreateEngine();
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync("track.wav");
+        player.Play();
+        player.Pause();
+
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration
+        {
+            Mode = AudioOutputMode.Exclusive,
+            ExclusiveFallback = ExclusiveModeFallback.None,
+        });
+
+        Assert.Equal(AudioOutputMode.Exclusive, player.EffectiveOutputMode);
+        Assert.Equal(PlaybackState.Paused, player.State);
+    }
+
+    [Fact]
+    public async Task StrictExclusive_CreateFailure_WhilePlaying_LeavesRecoverableState()
+    {
+        var outputs = new FakeAudioOutputFactory((req, _) =>
+        {
+            if (req.Mode == AudioOutputMode.Exclusive)
+            {
+                throw new AudioOutputException("busy", AudioOutputFailureKind.DeviceBusy);
+            }
+
+            return new FakeAudioOutput(endpointId: req.DeviceId ?? "a");
+        });
+
+        using var engine = CreateEngine(outputs: outputs);
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync("track.wav");
+        player.Play();
+
+        var ex = await Assert.ThrowsAsync<AudioOutputException>(() => player.ConfigureOutputAsync(
+            new AudioOutputConfiguration
+            {
+                Mode = AudioOutputMode.Exclusive,
+                ExclusiveFallback = ExclusiveModeFallback.None,
+            }));
+
+        Assert.Equal(AudioOutputFailureKind.DeviceBusy, ex.FailureKind);
+        Assert.True(player.HasSource);
+        Assert.Equal(PlaybackState.Stopped, player.State);
+        Assert.Equal(OutputRecoveryIntent.ResumePlaying, player.OutputRecoveryIntent);
+        Assert.Null(player.EffectiveOutputMode);
+        Assert.Equal(OutputDeviceStatus.Unavailable, player.OutputDeviceStatus);
+        Assert.Equal(AudioOutputMode.Exclusive, player.OutputConfiguration.Mode);
+    }
+
+    [Fact]
+    public async Task ExclusiveCreateFailure_WithSharedFallback_WhilePlaying_ResumesOnShared()
+    {
+        var outputs = new FakeAudioOutputFactory((req, _) =>
+        {
+            if (req.Mode == AudioOutputMode.Exclusive)
+            {
+                throw new AudioOutputException("busy", AudioOutputFailureKind.DeviceBusy);
+            }
+
+            return new FakeAudioOutput(endpointId: req.DeviceId ?? "a");
+        });
+
+        using var engine = CreateEngine(outputs: outputs);
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync("track.wav");
+        player.Play();
+
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration
+        {
+            Mode = AudioOutputMode.Exclusive,
+            ExclusiveFallback = ExclusiveModeFallback.Shared,
+        });
+
+        Assert.Equal(AudioOutputMode.Shared, player.EffectiveOutputMode);
+        Assert.Equal(ExclusiveFallbackReason.DeviceBusy, player.OutputFallbackReason);
+        Assert.Equal(PlaybackState.Playing, player.State);
+    }
+
+    [Fact]
+    public async Task ExclusiveToShared_WhilePlaying_Succeeds()
+    {
+        using var engine = CreateEngine();
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync("track.wav");
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration { Mode = AudioOutputMode.Exclusive });
+        player.Play();
+
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration { Mode = AudioOutputMode.Shared });
+
+        Assert.Equal(AudioOutputMode.Shared, player.EffectiveOutputMode);
+        Assert.Equal(PlaybackState.Playing, player.State);
+    }
+
+    [Fact]
+    public async Task RapidModeChanges_SettleOnLastRequest()
+    {
+        using var engine = CreateEngine();
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync("track.wav");
+        player.Play();
+
+        var tasks = new List<Task>();
+        for (var i = 0; i < 8; i++)
+        {
+            var exclusive = i % 2 == 0;
+            tasks.Add(player.ConfigureOutputAsync(new AudioOutputConfiguration
+            {
+                Mode = exclusive ? AudioOutputMode.Exclusive : AudioOutputMode.Shared,
+                ExclusiveFallback = ExclusiveModeFallback.None,
+            }));
+        }
+
+        // Intermediate requests are cancelled when a newer switch supersedes them.
+        var results = await Task.WhenAll(tasks.Select(async t =>
+        {
+            try
+            {
+                await t.ConfigureAwait(false);
+                return "ok";
+            }
+            catch (OperationCanceledException)
+            {
+                return "cancelled";
+            }
+        }));
+
+        Assert.Contains("ok", results);
+        Assert.True(player.HasSource);
+        Assert.Equal(AudioOutputMode.Shared, player.EffectiveOutputMode); // last request (i=7)
+        Assert.Equal(PlaybackState.Playing, player.State);
+    }
+
+    [Fact]
+    public async Task StrictFailure_ThenSharedRecovery_RestoresPlayback()
+    {
+        var failExclusive = true;
+        var outputs = new FakeAudioOutputFactory((req, _) =>
+        {
+            if (req.Mode == AudioOutputMode.Exclusive && failExclusive)
+            {
+                throw new AudioOutputException("busy", AudioOutputFailureKind.DeviceBusy);
+            }
+
+            return new FakeAudioOutput(endpointId: req.DeviceId ?? "a");
+        });
+
+        using var engine = CreateEngine(outputs: outputs);
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync("track.wav");
+        player.Play();
+
+        await Assert.ThrowsAsync<AudioOutputException>(() => player.ConfigureOutputAsync(
+            new AudioOutputConfiguration
+            {
+                Mode = AudioOutputMode.Exclusive,
+                ExclusiveFallback = ExclusiveModeFallback.None,
+            }));
+
+        failExclusive = false;
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration
+        {
+            Mode = AudioOutputMode.Shared,
+        });
+
+        Assert.Equal(AudioOutputMode.Shared, player.EffectiveOutputMode);
+        Assert.Equal(PlaybackState.Playing, player.State);
+        Assert.Equal(OutputDeviceStatus.Available, player.OutputDeviceStatus);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_DuringConfigure_DoesNotHang()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var outputs = new FakeAudioOutputFactory((req, ct) =>
+        {
+            if (req.Mode == AudioOutputMode.Exclusive)
+            {
+                started.TrySetResult();
+                // Block until disposal cancels the switch token.
+                if (!ct.WaitHandle.WaitOne(TimeSpan.FromSeconds(5)))
+                {
+                    throw new TimeoutException("Configure was not cancelled by DisposeAsync.");
+                }
+
+                ct.ThrowIfCancellationRequested();
+            }
+
+            return new FakeAudioOutput(endpointId: req.DeviceId ?? "a");
+        });
+
+        var engine = CreateEngine(outputs: outputs);
+        var player = engine.CreatePlayer();
+        await player.LoadAsync("track.wav");
+        player.Play();
+
+        var configure = player.ConfigureOutputAsync(new AudioOutputConfiguration
+        {
+            Mode = AudioOutputMode.Exclusive,
+            ExclusiveFallback = ExclusiveModeFallback.None,
+        });
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        await player.DisposeAsync();
+        await engine.DisposeAsync();
+
+        await Assert.ThrowsAnyAsync<Exception>(async () => await configure);
+    }
+
+    [Fact]
     public async Task ProbeFailure_Unsupported_StrictThrows()
     {
         var outputs = new FakeAudioOutputFactory(
