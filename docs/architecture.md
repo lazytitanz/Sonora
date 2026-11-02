@@ -31,13 +31,15 @@ Metadata (`IAudioMetadataReader` / `AudioMetadataReader`) lives in `Sonora.Audio
 
 | Concern | Strategy |
 |---|---|
-| Play / Pause / Stop / Seek / Load / Dispose | Serialized with `SemaphoreSlim(1,1)` |
+| Play / Pause / Stop / Seek / Load / Dispose | Command phases serialized with `SemaphoreSlim(1,1)` (`_gate`) |
+| Decoder seek / pump stop / prime | Run **off** `_gate` (and serialized with `_decoderSeekGate`) so a slow Media Foundation seek cannot freeze Pause/Stop/Dispose |
 | Overlapping loads | Generation counter + cancellation; stale work discarded |
 | Ring buffer | Short critical section; consumer path is non-blocking |
 | Output callback | Never waits on the command gate; never opens files |
 | Events | May fire under the command gate; re-entering player commands from handlers is unsupported |
+| Output Stop / Shutdown / Dispose | Concurrent callers await the **same** shared completion (not merely skip duplicate work) |
 
-Ordered teardown: stop output → stop pump → dispose decoder/output.
+Ordered teardown: stop output → stop pump → dispose decoder/output (pump/output shutdown complete **off** the command gate).
 
 ## Position model
 
@@ -46,7 +48,13 @@ Ordered teardown: stop output → stop pump → dispose decoder/output.
 - `SeekWithResult` — requested vs actual source-frame landing (`AudioSeekResult`); `Unknown` ⇒ null `ActualPosition`.
 - Frame indices are authoritative inside converters (`TimeToFrames` / `FramesToTime`); `TimeSpan` is used at API boundaries.
 
-Seek path: pause output → enter effects barrier (silence pull; wait for in-flight Read) → stop pump / clear ring → `IAudioDecoder.Seek` → reset DSP → rebase timeline → exit barrier → resume if playing. Does not `Shutdown` WASAPI per seek.
+Seek path (command gate released around long work):
+
+1. Under `_gate`: pause output, enter effects barrier, bump seek generation.
+2. Off `_gate`: stop pump / clear ring → `IAudioDecoder.Seek` (may block on Media Foundation) → optional ring prime.
+3. Under `_gate`: reset DSP, rebase timeline, exit barrier; resume only if still playing (Pause mid-seek is honored; Stop supersedes via generation).
+
+`Stop` / natural EOS rewind the decoder to zero the same way (off `_gate`). Does not `Shutdown` WASAPI per seek.
 
 Accuracy limits are documented in the README.
 
@@ -104,7 +112,7 @@ WasapiAudioOutput (shared WithSharedMode or exclusive WithExclusiveMode)
 | Strict exclusive fail | `Unavailable` + preserve track / position intent / DSP / next for retry |
 | Recovery intent | Separate from `PlaybackState`; cleared by `Stop` / `LoadAsync` / `Dispose` |
 | Rebind | Detach under gate → `Shutdown` join off-gate → attach with generation check |
-| Shutdown | Old output must not read `TransitionSampleSource` after successful `Shutdown`; failure → Unavailable, no replacement |
+| Shutdown | Old output must not read `TransitionSampleSource` after successful `Shutdown`; failure → Unavailable, no replacement; concurrent Stop/Shutdown/Dispose share one completion |
 | Status | `Switching` while detached mid-rebind; independent of `PlaybackState` |
 | Superseded | Concurrent Stop/Load/Dispose/newer switch cancels in-flight switch (`OperationCanceledException`) |
 | Clock / PCM | Ring preserved when format unchanged; old endpoint padding skipped (~`CurrentLatency`); brief gap expected |

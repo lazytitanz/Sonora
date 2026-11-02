@@ -64,6 +64,43 @@ public sealed class ConcurrentLifecycleTests
     }
 
     [Fact]
+    public async Task Seek_WhileDecoderSeekHeld_DoesNotBlockPauseOrStop()
+    {
+        // Regression: Seek used to hold the command gate across Decoder.Seek. A slow MF seek
+        // froze Pause/Stop/Dispose (TestPlayer AppHang). Commands must complete while Seek is mid-decoder.
+        var hold = new HoldableFakeDecoder(FakeAudioDecoder.CreateTone(Format, TimeSpan.FromSeconds(3)));
+        hold.Release();
+        using var engine = new AudioEngine(
+            new FakeAudioDecoderFactory(hold),
+            new FakeAudioOutputFactory(),
+            new AudioEngineOptions { PrimeDuration = TimeSpan.Zero });
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync("a.wav");
+        player.Play();
+
+        hold.HoldSeek();
+        var seekTask = Task.Run(() => player.Seek(TimeSpan.FromMilliseconds(200)));
+        Assert.True(hold.WaitUntilSeekHeld(TimeSpan.FromSeconds(2)));
+
+        // Pause must return without waiting for Decoder.Seek.
+        var paused = Task.Run(player.Pause);
+        await paused.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(PlaybackState.Paused, player.State);
+
+        // Stop's gate section must finish; decoder rewind may still be waiting on HoldSeek.
+        var stopTask = Task.Run(player.Stop);
+        await Task.Delay(100);
+        Assert.Equal(PlaybackState.Stopped, player.State);
+
+        hold.ReleaseSeek();
+        await stopTask.WaitAsync(TimeSpan.FromSeconds(5));
+        // Seek may succeed or fault (superseded); it must not hang.
+        var finished = await Task.WhenAny(seekTask, Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.Same(seekTask, finished);
+        _ = await Record.ExceptionAsync(() => seekTask);
+    }
+
+    [Fact]
     public async Task Seek_ThenLoad_SupersedesSession()
     {
         using var engine = new AudioEngine(

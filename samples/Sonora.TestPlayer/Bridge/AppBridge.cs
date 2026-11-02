@@ -2,6 +2,7 @@ using System.Diagnostics;
 using Sonora.TestPlayer.Controllers;
 using Sonora.TestPlayer.Diagnostics;
 using Sonora.TestPlayer.Models;
+using Sonora.TestPlayer.Services;
 using Vetra.Bridge;
 
 namespace Sonora.TestPlayer.Bridge;
@@ -32,6 +33,7 @@ public sealed class AppBridge : IDisposable
     private readonly ScenarioController _scenarios;
     private readonly DiagnosticEventStore _store;
     private readonly ProcessResourceSampler _sampler;
+    private readonly MusicFolderPicker? _folderPicker;
     private int _disposed;
 
     /// <summary>Creates the bridge adapter. Call <see cref="Register"/> to expose commands and start event forwarding.</summary>
@@ -44,7 +46,8 @@ public sealed class AppBridge : IDisposable
         StreamingController streaming,
         ScenarioController scenarios,
         DiagnosticEventStore store,
-        ProcessResourceSampler sampler)
+        ProcessResourceSampler sampler,
+        MusicFolderPicker? folderPicker = null)
     {
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
         _context = context ?? throw new ArgumentNullException(nameof(context));
@@ -55,6 +58,7 @@ public sealed class AppBridge : IDisposable
         _scenarios = scenarios ?? throw new ArgumentNullException(nameof(scenarios));
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _sampler = sampler ?? throw new ArgumentNullException(nameof(sampler));
+        _folderPicker = folderPicker;
     }
 
     /// <summary>Registers every bridge command and subscribes to controller events.</summary>
@@ -135,6 +139,7 @@ public sealed class AppBridge : IDisposable
         {
             environment = EnvironmentInfoDto.Capture(),
             urlSafetyLimitation = StreamingLimitations.Text,
+            musicFolder = _folderPicker?.InitialDirectory ?? MusicFolderPicker.ResolveDefaultMusicFolder(),
         });
     }
 
@@ -147,8 +152,13 @@ public sealed class AppBridge : IDisposable
         _bridge.Register("playback.stop", () => Run(_playback.Stop));
         _bridge.RegisterAsync("playback.next", ct => Box(_playback.NextAsync(ct)));
         _bridge.RegisterAsync("playback.previous", ct => Box(_playback.PreviousAsync(ct)));
-        _bridge.Register<double>("playback.seek", positionMs => Run(() => _playback.Seek(positionMs)));
-        _bridge.Register<double>("playback.seekWithResult", positionMs => _playback.SeekWithResult(positionMs));
+        // Off the UI/bridge thread: Media Foundation seeks can block long enough to AppHang the host.
+        _bridge.RegisterAsync<double>(
+            "playback.seek",
+            (positionMs, ct) => Done(Task.Run(() => _playback.Seek(positionMs), ct)));
+        _bridge.RegisterAsync<double>(
+            "playback.seekWithResult",
+            (positionMs, ct) => Box(Task.Run(() => _playback.SeekWithResult(positionMs), ct)));
         _bridge.Register<float>("playback.setVolume", volume => _playback.SetVolume(volume));
         _bridge.Register<bool>("playback.setGapless", enabled => Run(() => _playback.SetGaplessEnabled(enabled)));
         _bridge.RegisterAsync("playback.preloadNext", ct => Done(_playback.PreloadNextAsync(ct)));
@@ -160,10 +170,48 @@ public sealed class AppBridge : IDisposable
     {
         _bridge.Register("queue.get", () => _playback.GetQueue());
         _bridge.RegisterAsync<string[]>("queue.addFiles", (paths, ct) => Box(_playback.AddFilesAsync(paths, ct)));
+        _bridge.RegisterAsync<string>("queue.addFolder", (path, ct) => Box(_playback.AddFolderAsync(path, ct)));
+        _bridge.RegisterAsync("queue.pickAndAddFolder", PickAndAddFolderAsync);
         _bridge.Register<string>("queue.remove", id => _playback.RemoveFromQueue(id));
         _bridge.Register<string, int>("queue.move", (id, newIndex) => _playback.MoveInQueue(id, newIndex));
         _bridge.Register("queue.clear", () => Run(_playback.ClearQueue));
         _bridge.RegisterAsync<string>("queue.play", (id, ct) => Done(_playback.PlayQueueItemAsync(id, ct)));
+    }
+
+    private async Task<object?> PickAndAddFolderAsync(CancellationToken cancellationToken)
+    {
+        if (_folderPicker is null)
+        {
+            return Array.Empty<object>();
+        }
+
+        var folder = await InvokeOnUiAsync(_folderPicker.PickFolder).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(folder))
+        {
+            return null; // cancelled
+        }
+
+        var items = await _playback.AddFolderAsync(folder, cancellationToken).ConfigureAwait(false);
+        return items;
+    }
+
+    private Task<T> InvokeOnUiAsync<T>(Func<T> action)
+    {
+        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _context.Post(
+            _ =>
+            {
+                try
+                {
+                    tcs.TrySetResult(action());
+                }
+                catch (Exception ex)
+                {
+                    tcs.TrySetException(ex);
+                }
+            },
+            null);
+        return tcs.Task;
     }
 
     private void RegisterDevices()

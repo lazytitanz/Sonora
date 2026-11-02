@@ -46,7 +46,7 @@ Startup failures (missing WebView2, missing `www`, Vetra init errors) show a **n
 
 | Section | Purpose |
 | --- | --- |
-| Player | File queue, transport, seek/`SeekWithResult`, gapless preload/transition, listening checklists |
+| Player | File queue (add-folder defaults to the Windows Music library, recursive, still changeable), transport, seek/`SeekWithResult` (async off the UI bridge so MF seeks cannot AppHang the host), gapless preload/transition, listening checklists |
 | Audio Output | Device enumeration/selection, shared vs exclusive, fallback, latency request vs effective mode |
 | DSP & Effects | Preamp → six-band EQ → limiter (Sonora rack order) |
 | Streaming | `HttpAudioSource` only (not file `LoadAsync`), network status, restricted URL mode |

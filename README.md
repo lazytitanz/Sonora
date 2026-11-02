@@ -114,7 +114,7 @@ Metadata uses managed [ATL.NET](https://github.com/Zeugma440/atldotnet) (`z440.a
 | `Play` | Starts or resumes |
 | `Pause` | Preserves position |
 | `Stop` | Stops and resets to the beginning (does not raise completion) |
-| `Seek` | Seeks when the decoder supports it (preserves a safe next track) |
+| `Seek` | Seeks when the decoder supports it (preserves a safe next track). Long decoder work runs off the command gate so Pause/Stop/Dispose stay responsive |
 | `SeekWithResult` | Same as `Seek`, returns `AudioSeekResult` (requested / actual / accuracy) |
 | `Volume` | Linear gain in `[0, 1]` (applied post-ring on the output path; immediate) |
 
@@ -407,7 +407,7 @@ dotnet add package Sonora.Audio.Windows
 - FLAC / Media Foundation seeking is reliable for playback; sample-accurate (`Exact`) seeking is not claimed for MF-backed formats
 - Bare Ogg Opus uses managed Concentus (not MF); WebM Opus depends on host Media Foundation codecs (WebM Vorbis is not claimed)
 - The limiter is **sample-peak** only (not true-peak); default `LookaheadMs=5` is the guaranteeing setting. Explicit `LookaheadMs=0` held sample-peak ceilings in measured tests but is not true-peak safe ([docs/limiter.md](docs/limiter.md))
-- Synchronous `Dispose` may still block off-gate while waiting for output quiescence or the decode pump; prefer `DisposeAsync` from async/UI contexts
+- Synchronous `Dispose` may still block off-gate while waiting for output quiescence or the decode pump; prefer `DisposeAsync` from async/UI contexts. Concurrent Dispose/Stop/Shutdown share one completion. Prefer calling `Seek` / `SeekWithResult` off a UI thread when targeting Media Foundation formats (m4a/mp3/flac/…) — the engine will not hold the command gate during the decoder seek, but the calling thread can still block for the seek itself
 - WASAPI hardware tests are tagged `Hardware` (excluded from default CI; require `SONORA_RUN_HARDWARE_TESTS=1`). Hardware/soak results are not claimed unless actually run
 - Host-local ring/DSP/metadata microbenchmarks are recorded in [docs/performance-baseline.md](docs/performance-baseline.md); WASAPI callback latency, underrun soak, and exclusive-mode timings are not yet measured
 

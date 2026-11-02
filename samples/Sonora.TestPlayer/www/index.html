@@ -64,7 +64,10 @@
             <div class="panel-header">
               <h2 class="panel-title">Queue <span id="queue-count" class="badge badge-soft ms-1">0</span></h2>
               <div class="panel-tools">
-                <button id="btn-add-files" type="button" class="btn btn-sm btn-accent">
+                <button id="btn-add-folder" type="button" class="btn btn-sm btn-accent" title="Add a folder of audio files (defaults to Music; includes subfolders)">
+                  <i class="bi bi-folder-plus" aria-hidden="true"></i> Add folder…
+                </button>
+                <button id="btn-add-files" type="button" class="btn btn-sm btn-outline-secondary" title="Pick individual audio files (starts in Music)">
                   <i class="bi bi-plus-lg" aria-hidden="true"></i> Add files…
                 </button>
                 <button id="btn-load-file" type="button" class="btn btn-sm btn-outline-secondary" title="Load a file into the player without starting playback">
@@ -78,7 +81,7 @@
             <div class="panel-body">
               <div class="input-group input-group-sm mb-2">
                 <label class="visually-hidden" for="path-input">Audio file path</label>
-                <input id="path-input" type="text" class="form-control" placeholder="Paste a full file path (works without file dialogs)" autocomplete="off" spellcheck="false">
+                <input id="path-input" type="text" class="form-control" placeholder="Paste a file or folder path (folders include subfolders)" autocomplete="off" spellcheck="false">
                 <button id="btn-add-path" type="button" class="btn btn-outline-secondary">Add path</button>
                 <button id="btn-load-path" type="button" class="btn btn-outline-secondary" title="Load without starting playback">Load</button>
               </div>
@@ -88,7 +91,7 @@
               <div id="queue-empty" class="empty-state">
                 <i class="bi bi-music-note-list" aria-hidden="true"></i>
                 <div>The queue is empty.</div>
-                <div class="small text-body-secondary">Add local audio files to begin. Drag rows to reorder.</div>
+                <div class="small text-body-secondary">Add a Music folder (or any folder) to begin. Subfolders are included. Drag rows to reorder.</div>
               </div>
               <ol id="queue-list" class="queue-list" aria-label="Playback queue"></ol>
             </div>

@@ -35,6 +35,7 @@ Do **not** claim hardware or soak validation passed for `1.0.0-rc.1`.
 - True-peak / inter-sample overs (explicitly out of contract).
 - Media Foundation codec availability variance across Windows SKUs (especially WebM).
 - Sync `Dispose` still blocks off-gate during output quiescence / pump stop (no longer waits under `_gate`; UI apps should prefer `DisposeAsync`).
+- Seek/Stop decoder work no longer holds `_gate`, but the calling thread can still block on Media Foundation seek; UI hosts should keep seek off the UI thread (Test Player does).
 - HTTP SSRF / egress policy remains an application responsibility.
 - Linux: `Sonora.Audio` builds and unit-tests; **playback still requires a platform backend** (Windows today).
 - Performance numbers are one host’s microbenchmarks — not WASAPI callback p99.

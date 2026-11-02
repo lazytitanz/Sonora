@@ -12,6 +12,7 @@ internal class FakeAudioOutput : IAudioOutput
     private readonly int _blockSamples;
     private readonly TimeSpan _latency;
     private readonly TimeSpan _shutdownTimeout;
+    private readonly object _lifecycleSync = new();
     private IPcmSampleSource? _source;
     private CancellationTokenSource? _cts;
     private Thread? _loopThread;
@@ -19,6 +20,8 @@ internal class FakeAudioOutput : IAudioOutput
     private int _playing;
     private bool _shutdown;
     private bool _disposed;
+    private TaskCompletionSource? _shutdownTcs;
+    private TaskCompletionSource? _disposeTcs;
 
     public FakeAudioOutput(
         int blockSamples = 256,
@@ -137,46 +140,90 @@ internal class FakeAudioOutput : IAudioOutput
 
     public virtual void Shutdown()
     {
-        if (_shutdown)
+        TaskCompletionSource? owned;
+        Task toAwait;
+        lock (_lifecycleSync)
         {
+            if (_shutdown)
+            {
+                return;
+            }
+
+            if (_shutdownTcs is not null)
+            {
+                owned = null;
+                toAwait = _shutdownTcs.Task;
+            }
+            else
+            {
+                owned = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _shutdownTcs = owned;
+                toAwait = owned.Task;
+            }
+        }
+
+        if (owned is null)
+        {
+            toAwait.GetAwaiter().GetResult();
             return;
         }
 
-        ShutdownCount++;
-
-        // Sever the PCM source first so no further TransitionSampleSource reads can occur.
-        Volatile.Write(ref _source, null);
-        Interlocked.Exchange(ref _playing, 0);
         try
         {
-            _cts?.Cancel();
+            ShutdownCount++;
+
+            // Sever the PCM source first so no further TransitionSampleSource reads can occur.
+            Volatile.Write(ref _source, null);
+            Interlocked.Exchange(ref _playing, 0);
+            try
+            {
+                _cts?.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // ignored
+            }
+
+            OnShutdownSignaled();
+
+            if (!JoinLoop(_shutdownTimeout))
+            {
+                // Match WasapiAudioOutput: quiescence failure is ShutdownFailed, not Unspecified.
+                var timeout = new AudioOutputException(
+                    "Timed out waiting for the output pull loop to stop; replacement output was not started.",
+                    AudioOutputFailureKind.ShutdownFailed);
+                owned.TrySetException(timeout);
+                throw timeout;
+            }
+
+            var fault = ShutdownFault?.Invoke();
+            if (fault is not null)
+            {
+                // Quiescence of the loop succeeded; surface the injected fault without retrying on Dispose.
+                lock (_lifecycleSync)
+                {
+                    _shutdown = true;
+                }
+
+                var wrapped = fault is AudioOutputException
+                    ? fault
+                    : new AudioOutputException("Output shutdown failed; replacement output was not started.", fault);
+                owned.TrySetException(wrapped);
+                throw wrapped;
+            }
+
+            lock (_lifecycleSync)
+            {
+                _shutdown = true;
+            }
+
+            owned.TrySetResult();
         }
-        catch (ObjectDisposedException)
+        catch (Exception ex) when (ex is not AudioOutputException)
         {
-            // ignored
+            owned.TrySetException(ex);
+            throw;
         }
-
-        OnShutdownSignaled();
-
-        if (!JoinLoop(_shutdownTimeout))
-        {
-            // Match WasapiAudioOutput: quiescence failure is ShutdownFailed, not Unspecified.
-            throw new AudioOutputException(
-                "Timed out waiting for the output pull loop to stop; replacement output was not started.",
-                AudioOutputFailureKind.ShutdownFailed);
-        }
-
-        var fault = ShutdownFault?.Invoke();
-        if (fault is not null)
-        {
-            // Quiescence of the loop succeeded; surface the injected fault without retrying on Dispose.
-            _shutdown = true;
-            throw fault is AudioOutputException
-                ? fault
-                : new AudioOutputException("Output shutdown failed; replacement output was not started.", fault);
-        }
-
-        _shutdown = true;
     }
 
     public TimeSpan? TryGetRenderedPosition()
@@ -191,25 +238,56 @@ internal class FakeAudioOutput : IAudioOutput
 
     public void Dispose()
     {
-        if (_disposed)
+        TaskCompletionSource? owned;
+        Task toAwait;
+        lock (_lifecycleSync)
         {
+            if (_disposeTcs is not null)
+            {
+                owned = null;
+                toAwait = _disposeTcs.Task;
+            }
+            else
+            {
+                owned = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _disposeTcs = owned;
+                toAwait = owned.Task;
+            }
+        }
+
+        if (owned is null)
+        {
+            toAwait.GetAwaiter().GetResult();
             return;
         }
 
-        _disposed = true;
         try
         {
-            if (!_shutdown)
+            try
             {
-                Shutdown();
+                if (!_shutdown)
+                {
+                    Shutdown();
+                }
             }
-        }
-        catch
-        {
-            Volatile.Write(ref _source, null);
-        }
+            catch
+            {
+                Volatile.Write(ref _source, null);
+            }
 
-        _cts?.Dispose();
+            _cts?.Dispose();
+            lock (_lifecycleSync)
+            {
+                _disposed = true;
+            }
+
+            owned.TrySetResult();
+        }
+        catch (Exception ex)
+        {
+            owned.TrySetException(ex);
+            throw;
+        }
     }
 
     /// <summary>Simulates a device-loss / output failure stop.</summary>

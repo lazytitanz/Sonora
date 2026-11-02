@@ -25,6 +25,8 @@ All notable changes to Sonora will be documented in this file.
 
 ### Fixed
 
+- Seek / Stop AppHang: `SeekWithResult` and Stop/EOS decoder rewind no longer hold the command gate across `StopPump` / `IAudioDecoder.Seek` / ring prime (Media Foundation seeks could freeze Pause/Stop/Dispose and hang Test Player); Pause mid-seek is honored; Stop supersedes in-flight seek apply; decoder seeks serialized; Test Player bridge runs seek off the UI thread
+- WASAPI / player lifecycle: concurrent `Stop` / `Shutdown` / `Dispose` await the same shared completion; recovery always shuts down detached outputs; EOS latch resets on Play; stale `Stopped` senders ignored; Pause honored during rebind; player Dispose/DisposeAsync share teardown including queued output shutdown
 - `AudioPlayer` / `AudioEngine` disposal: detach session under the command gate, complete output shutdown and decode-pump stop **off-gate** (eliminates sync-over-async wait while holding `_gate`); additive `IAsyncDisposable`
 - Engine unregisters players on dispose (avoids double-dispose list growth)
 - Limiter sanitizes non-finite PCM samples; default look-ahead raised to 5 ms after measurement (explicit `LookaheadMs=0` still available)

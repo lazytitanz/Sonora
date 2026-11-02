@@ -13,6 +13,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="Sonora.TestPlayer.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Version comes from Central Package Management (Directory.Packages.props); restored from the local feed. -->
     <PackageReference Include="Vetra.WinForms" />
   </ItemGroup>

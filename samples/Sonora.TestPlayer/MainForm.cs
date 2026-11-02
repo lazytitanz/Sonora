@@ -250,7 +250,18 @@ public sealed class MainForm : Form
         _streaming = new StreamingController(playback, _store);
         var scenarios = new ScenarioController(_store, _sampler);
 
-        _appBridge = new AppBridge(_host.Bridge, context, playback, _devices, dsp, _streaming, scenarios, _store, _sampler);
+        var folderPicker = new MusicFolderPicker(this);
+        _appBridge = new AppBridge(
+            _host.Bridge,
+            context,
+            playback,
+            _devices,
+            dsp,
+            _streaming,
+            scenarios,
+            _store,
+            _sampler,
+            folderPicker);
         _appBridge.Register();
     }
 

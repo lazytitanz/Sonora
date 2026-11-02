@@ -127,6 +127,8 @@ var seek = player.SeekWithResult(TimeSpan.FromSeconds(30));
 player.Stop();                         // resets to 00:00; clears next; does not raise PlaybackCompleted
 ```
 
+Seek and Stop’s decoder rewind release the command gate around `IAudioDecoder.Seek`, so other commands are not frozen during a slow Media Foundation seek. The calling thread can still block for the seek itself — from a UI thread, run seek work asynchronously (as the Test Player bridge does).
+
 ## Exclusive output (optional)
 
 Shared mode is the default. To request exclusive WASAPI:

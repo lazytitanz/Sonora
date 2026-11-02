@@ -44,7 +44,7 @@
       'pb-art-img', 'pb-art-ph', 'pb-title', 'pb-artist', 'pb-prev', 'pb-stop', 'pb-play', 'pb-play-icon', 'pb-next',
       'pb-elapsed', 'pb-seek', 'pb-duration', 'pb-mute', 'pb-mute-icon', 'pb-volume', 'pb-volume-value', 'pb-state',
       'pb-device', 'pb-device-text',
-      'queue-count', 'queue-list', 'queue-empty', 'btn-add-files', 'btn-load-file', 'btn-clear-queue', 'path-input',
+      'queue-count', 'queue-list', 'queue-empty', 'btn-add-folder', 'btn-add-files', 'btn-load-file', 'btn-clear-queue', 'path-input',
       'btn-add-path', 'btn-load-path', 'dialogs-note',
       'np-art-img', 'np-art-ph', 'np-title', 'np-artist', 'np-album', 'np-format', 'np-source', 'np-queue-pos', 'np-generation',
       'gapless-switch', 'gapless-next-state', 'gapless-next-path', 'gapless-transitions', 'gapless-completions',
@@ -543,8 +543,7 @@
     const result = await run('queue.addFiles', [cleaned], { label: 'Add files' });
     if (!result.ok) return;
     const added = Array.isArray(result.value) ? result.value.length : 0;
-    if (added === 0) toast('No files were added (not found or unreadable). See the Diagnostics log.', 'warning');
-    else if (added < cleaned.length) toast(`Added ${added} of ${cleaned.length} files. Missing files were skipped.`, 'warning');
+    if (added === 0) toast('No audio files were added (not found, empty folder, or unreadable). See the Diagnostics log.', 'warning');
     else toast(`Added ${added} file${added === 1 ? '' : 's'} to the queue.`, 'success');
   }
 
@@ -556,13 +555,30 @@
     await refreshSnapshot();
   }
 
+  function musicInitialDirectory() {
+    const folder = state.musicFolder;
+    return typeof folder === 'string' && folder.length > 0 ? folder : undefined;
+  }
+
+  async function addFolderViaDialog() {
+    const result = await run('queue.pickAndAddFolder', [], { label: 'Add folder' });
+    if (!result.ok) return;
+    if (result.value == null) return; // cancelled
+    const added = Array.isArray(result.value) ? result.value.length : 0;
+    if (added === 0) toast('No audio files found in that folder (including subfolders).', 'warning');
+    else toast(`Added ${added} file${added === 1 ? '' : 's'} from the folder.`, 'success');
+  }
+
   async function addViaDialog() {
     if (!state.dialogsEnabled) {
       toast('File dialogs are not enabled. Paste a path instead.', 'warning');
       dom['path-input'].focus();
       return;
     }
-    const picked = await TP.bridge.dialogs.openFiles({ title: 'Add audio files', filters: TP.bridge.AUDIO_FILTERS });
+    const options = { title: 'Add audio files', filters: TP.bridge.AUDIO_FILTERS };
+    const initial = musicInitialDirectory();
+    if (initial) options.initialDirectory = initial;
+    const picked = await TP.bridge.dialogs.openFiles(options);
     if (picked.ok && Array.isArray(picked.value) && picked.value.length > 0) await addPaths(picked.value);
   }
 
@@ -572,11 +588,15 @@
       dom['path-input'].focus();
       return;
     }
-    const picked = await TP.bridge.dialogs.openFile({ title: 'Load audio file', filters: TP.bridge.AUDIO_FILTERS });
+    const options = { title: 'Load audio file', filters: TP.bridge.AUDIO_FILTERS };
+    const initial = musicInitialDirectory();
+    if (initial) options.initialDirectory = initial;
+    const picked = await TP.bridge.dialogs.openFile(options);
     if (picked.ok && picked.value) await loadPath(picked.value);
   }
 
   function wireQueueControls() {
+    dom['btn-add-folder'].addEventListener('click', addFolderViaDialog);
     dom['btn-add-files'].addEventListener('click', addViaDialog);
     dom['btn-load-file'].addEventListener('click', loadViaDialog);
     dom['btn-clear-queue'].addEventListener('click', async () => {
@@ -584,7 +604,7 @@
     });
     dom['btn-add-path'].addEventListener('click', async () => {
       const value = dom['path-input'].value;
-      if (!value.trim()) return toast('Enter a file path first.', 'warning');
+      if (!value.trim()) return toast('Enter a file or folder path first.', 'warning');
       await addPaths([value]);
       dom['path-input'].value = '';
     });

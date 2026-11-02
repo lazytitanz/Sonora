@@ -23,12 +23,24 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
     private readonly string? _endpointId;
     private readonly AudioOutputMode _mode;
     private readonly int _requestedLatencyMs;
+    /// <summary>
+    /// Serializes lifecycle decisions only. Never hold across <see cref="WasapiPlayer.Stop"/> Join.
+    /// </summary>
+    private readonly object _lifecycleSync = new();
     private IPcmSampleSource? _source;
     private PcmSampleProviderAdapter? _adapter;
     private AudioFormat? _format;
     private bool _initialized;
     private bool _shutdown;
     private bool _disposed;
+    /// <summary>Shared completion for the in-flight Stop/Join. Concurrent Stop/Shutdown await this.</summary>
+    private Task? _stopCompletion;
+    /// <summary>Shared completion for Dispose. Concurrent Dispose/DisposeAsync await this.</summary>
+    private TaskCompletionSource? _disposeTcs;
+    /// <summary>Thread that owns DisposeCore so nested Shutdown does not wait on itself.</summary>
+    private int _disposeOwnerThreadId;
+    /// <summary>Incremented on each <see cref="Play"/> so a stale EOS stop cannot stop a newer session.</summary>
+    private int _playSession;
 
     private WasapiAudioOutput(WasapiPlayer player, string? endpointId, AudioOutputMode mode, int requestedLatencyMs)
     {
@@ -208,10 +220,21 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         EnsureInitialized();
 
-        // Clear exclusive silence-pause and allow Stopped after a prior EOS stop.
+        // Clear exclusive silence-pause, EOS latch, and allow Stopped after a prior EOS stop.
         _adapter?.SetPaused(false);
+        _adapter?.ResetEndOfStreamLatch();
         Interlocked.Exchange(ref _stoppedRaised, 0);
         Interlocked.Exchange(ref _eosStopRequested, 0);
+        Interlocked.Increment(ref _playSession);
+
+        // A completed prior Stop must not block a new Play session from starting Stop again.
+        lock (_lifecycleSync)
+        {
+            if (_stopCompletion?.IsCompleted == true)
+            {
+                _stopCompletion = null;
+            }
+        }
 
         _player.Play();
     }
@@ -245,13 +268,40 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
             return;
         }
 
-        _adapter?.SetPaused(false);
-        _player.Stop();
+        StopAndJoinShared();
     }
 
     public void Shutdown()
     {
-        if (_disposed || _shutdown)
+        Task? existingDispose;
+        lock (_lifecycleSync)
+        {
+            if (_shutdown)
+            {
+                _source = null;
+                return;
+            }
+
+            // Concurrent Dispose owns full teardown — wait for its shared completion.
+            // Skip when DisposeCore is calling us (dispose TCS exists but we are the owner).
+            existingDispose = _disposeOwnerThreadId == Environment.CurrentManagedThreadId
+                ? null
+                : _disposeTcs?.Task;
+        }
+
+        if (existingDispose is not null)
+        {
+            existingDispose.GetAwaiter().GetResult();
+            _source = null;
+            return;
+        }
+
+        ShutdownCore();
+    }
+
+    private void ShutdownCore()
+    {
+        if (_shutdown)
         {
             _source = null;
             return;
@@ -261,7 +311,7 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
         {
             if (_initialized)
             {
-                _player.Stop();
+                StopAndJoinShared();
             }
         }
         catch (Exception ex)
@@ -276,12 +326,15 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
 
         _adapter?.Disconnect();
         _source = null;
-        _shutdown = true;
+        lock (_lifecycleSync)
+        {
+            _shutdown = true;
+        }
     }
 
     public TimeSpan? TryGetRenderedPosition()
     {
-        if (!_initialized || _format is null || _adapter is null)
+        if (!_initialized || _format is null || _adapter is null || _shutdown || _disposed)
         {
             return null;
         }
@@ -305,25 +358,123 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
 
     public void Dispose()
     {
-        if (_disposed)
+        var tcs = BeginDisposeShared(out var owns);
+        if (!owns)
         {
+            tcs.Task.GetAwaiter().GetResult();
             return;
         }
 
-        _disposed = true;
-        _player.PlaybackStopped -= OnPlaybackStopped;
+        try
+        {
+            DisposeCore();
+            tcs.TrySetResult();
+        }
+        catch (Exception ex)
+        {
+            tcs.TrySetException(ex);
+            // Dispose must not throw for secondary failures after best-effort teardown.
+        }
+    }
 
+    public async ValueTask DisposeAsync()
+    {
+        var tcs = BeginDisposeShared(out var owns);
+        if (!owns)
+        {
+            await tcs.Task.ConfigureAwait(false);
+            return;
+        }
+
+        try
+        {
+            // Stop/Join and COM release must not run on a UI sync context.
+            await Task.Run(DisposeCore).ConfigureAwait(false);
+            tcs.TrySetResult();
+        }
+        catch (Exception ex)
+        {
+            tcs.TrySetException(ex);
+        }
+    }
+
+    /// <summary>
+    /// One Join owner; concurrent Stop/Shutdown/Dispose await the same completion.
+    /// Never call while holding <see cref="_lifecycleSync"/>.
+    /// </summary>
+    private void StopAndJoinShared()
+    {
+        TaskCompletionSource? owned = null;
+        Task toAwait;
+        lock (_lifecycleSync)
+        {
+            if (_stopCompletion is not null)
+            {
+                toAwait = _stopCompletion;
+            }
+            else
+            {
+                owned = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _stopCompletion = owned.Task;
+                toAwait = owned.Task;
+            }
+        }
+
+        if (owned is null)
+        {
+            toAwait.GetAwaiter().GetResult();
+            return;
+        }
+
+        try
+        {
+            _adapter?.SetPaused(false);
+            _player.Stop();
+            owned.TrySetResult();
+        }
+        catch (Exception ex)
+        {
+            owned.TrySetException(ex);
+            throw;
+        }
+    }
+
+    private TaskCompletionSource BeginDisposeShared(out bool owns)
+    {
+        lock (_lifecycleSync)
+        {
+            if (_disposeTcs is not null)
+            {
+                owns = false;
+                return _disposeTcs;
+            }
+
+            _disposeTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _disposeOwnerThreadId = Environment.CurrentManagedThreadId;
+            owns = true;
+            return _disposeTcs;
+        }
+    }
+
+    private void DisposeCore()
+    {
+        // Ensure nested Shutdown sees this thread as the dispose owner (DisposeAsync hops threads).
+        _disposeOwnerThreadId = Environment.CurrentManagedThreadId;
+
+        // Shutdown (Stop+Join+Disconnect) must run before marking disposed so Shutdown is not a no-op.
         try
         {
             if (!_shutdown)
             {
-                Shutdown();
+                ShutdownCore();
             }
         }
         catch
         {
             _source = null;
         }
+
+        _player.PlaybackStopped -= OnPlaybackStopped;
 
         try
         {
@@ -336,48 +487,11 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
         {
             // ignored
         }
-    }
 
-    public async ValueTask DisposeAsync()
-    {
-        if (_disposed)
+        lock (_lifecycleSync)
         {
-            return;
-        }
-
-        _disposed = true;
-        _player.PlaybackStopped -= OnPlaybackStopped;
-
-        try
-        {
-            // Stop/Join and COM release must not run on a UI sync context.
-            await Task.Run(() =>
-            {
-                try
-                {
-                    if (!_shutdown)
-                    {
-                        Shutdown();
-                    }
-                }
-                catch
-                {
-                    _source = null;
-                }
-
-                try
-                {
-                    _player.Dispose();
-                }
-                catch
-                {
-                    // ignored
-                }
-            }).ConfigureAwait(false);
-        }
-        catch
-        {
-            // ignored
+            _disposed = true;
+            _shutdown = true;
         }
     }
 
@@ -476,7 +590,11 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
             return;
         }
 
+        var session = Volatile.Read(ref _playSession);
+
         // Never Stop() on the WASAPI render thread — queue a worker.
+        // Use shared Stop so a concurrent Shutdown/Dispose awaits the same Join instead of
+        // skipping it and releasing COM under a live render thread.
         _ = Task.Run(() =>
         {
             try
@@ -486,7 +604,12 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
                     return;
                 }
 
-                _player.Stop();
+                if (Volatile.Read(ref _playSession) != session)
+                {
+                    return;
+                }
+
+                StopAndJoinShared();
             }
             catch
             {

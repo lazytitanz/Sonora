@@ -289,7 +289,12 @@
         () => ({ ok: false }),
       ),
     ]);
-    if (info.ok) state.appInfo = info.value;
+    if (info.ok) {
+      state.appInfo = info.value;
+      if (info.value && typeof info.value.musicFolder === 'string' && info.value.musicFolder.length > 0) {
+        state.musicFolder = info.value.musicFolder;
+      }
+    }
     // If capabilities cannot be read, assume dialogs work; a failing dialog reports its own error.
     state.capabilities = caps.ok ? caps.value : null;
     state.dialogsEnabled = caps.ok ? Boolean(caps.value && caps.value.dialogs) : true;

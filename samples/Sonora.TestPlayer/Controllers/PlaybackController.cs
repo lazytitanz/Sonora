@@ -140,6 +140,7 @@ public sealed class PlaybackController : IAsyncDisposable
     /// <summary>
     /// Reads metadata for the given files and appends them to the queue. Missing files are skipped and reported
     /// in diagnostics. Metadata I/O is blocking, so it runs on a worker thread to keep the calling (UI) thread free.
+    /// Directory paths are expanded recursively to supported audio files.
     /// </summary>
     /// <returns>The items that were added.</returns>
     public async Task<IReadOnlyList<QueueItem>> AddFilesAsync(
@@ -153,8 +154,9 @@ public sealed class PlaybackController : IAsyncDisposable
         var items = await Task.Run(
             () =>
             {
-                var created = new List<QueueItem>(paths.Count);
-                foreach (var path in paths)
+                var expanded = ExpandPaths(paths);
+                var created = new List<QueueItem>(expanded.Count);
+                foreach (var path in expanded)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
@@ -181,6 +183,52 @@ public sealed class PlaybackController : IAsyncDisposable
         }
 
         return items;
+    }
+
+    /// <summary>
+    /// Recursively finds supported audio files under <paramref name="directory"/> and appends them to the queue.
+    /// </summary>
+    public Task<IReadOnlyList<QueueItem>> AddFolderAsync(
+        string directory,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(directory);
+        return AddFilesAsync([directory], cancellationToken);
+    }
+
+    /// <summary>
+    /// Expands a mixed list of files and directories into distinct audio file paths.
+    /// Directories are scanned recursively.
+    /// </summary>
+    private static List<string> ExpandPaths(IReadOnlyList<string> paths)
+    {
+        var expanded = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var raw in paths)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                continue;
+            }
+
+            var path = raw.Trim().Trim('"');
+            if (Directory.Exists(path))
+            {
+                foreach (var file in AudioFileEnumerator.Enumerate(path, recursive: true))
+                {
+                    if (seen.Add(file))
+                    {
+                        expanded.Add(file);
+                    }
+                }
+            }
+            else if (seen.Add(path))
+            {
+                expanded.Add(path);
+            }
+        }
+
+        return expanded;
     }
 
     /// <summary>Removes an item from the queue. Removing the playing item does not stop playback.</summary>

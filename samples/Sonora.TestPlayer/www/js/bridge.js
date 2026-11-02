@@ -16,6 +16,8 @@
     appInfo: null,
     capabilities: null,
     dialogsEnabled: false,
+    /** User Music folder path from the host; used as the default open location for add/load dialogs. */
+    musicFolder: null,
     snapshot: null,
     queue: [],
     currentItem: null,
