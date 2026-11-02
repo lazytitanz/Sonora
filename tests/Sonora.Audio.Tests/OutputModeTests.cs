@@ -239,6 +239,61 @@ public class OutputModeTests
     }
 
     [Fact]
+    public async Task Exclusive_Stop_ThenReloadInitFailure_DoesNotLeaveDisposedOutputOrBlockShared()
+    {
+        // Reproduces: exclusive play → stop → reload hits DEVICE_IN_USE-style Init failure →
+        // Seek must not throw ObjectDisposedException, and Shared configure/reload must recover.
+        var createCount = 0;
+        var outputs = new FakeAudioOutputFactory((req, _) =>
+        {
+            createCount++;
+            // First successful exclusive session (initial shared load + exclusive configure).
+            if (createCount <= 2)
+            {
+                return new FakeAudioOutput(endpointId: req.DeviceId ?? "a");
+            }
+
+            if (req.Mode == AudioOutputMode.Exclusive)
+            {
+                return new InitFailFakeAudioOutput("busy-ex", () => { });
+            }
+
+            return new FakeAudioOutput(endpointId: "shared-recovery");
+        });
+
+        using var engine = CreateEngine(outputs: outputs);
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync("track.wav");
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration
+        {
+            Mode = AudioOutputMode.Exclusive,
+            ExclusiveFallback = ExclusiveModeFallback.None,
+        });
+        player.Play();
+        player.Stop();
+
+        var loadEx = await Assert.ThrowsAsync<AudioOutputException>(() => player.LoadAsync("track2.wav"));
+        Assert.Equal(AudioOutputFailureKind.InitializationFailed, loadEx.FailureKind);
+        Assert.False(player.HasSource);
+        Assert.Null(player.EffectiveOutputMode);
+
+        // Previously this threw ObjectDisposedException from Pause on a zombie output.
+        var seekEx = Record.Exception(() => player.Seek(TimeSpan.FromMilliseconds(500)));
+        Assert.IsType<InvalidOperationException>(seekEx);
+
+        await player.ConfigureOutputAsync(new AudioOutputConfiguration
+        {
+            Mode = AudioOutputMode.Shared,
+            ExclusiveFallback = ExclusiveModeFallback.None,
+        });
+        Assert.Equal(AudioOutputMode.Shared, player.OutputConfiguration.Mode);
+
+        await player.LoadAsync("track3.wav");
+        Assert.True(player.HasSource);
+        Assert.Equal(AudioOutputMode.Shared, player.EffectiveOutputMode);
+    }
+
+    [Fact]
     public async Task SharedToExclusive_WhilePlaying_Succeeds()
     {
         using var engine = CreateEngine();

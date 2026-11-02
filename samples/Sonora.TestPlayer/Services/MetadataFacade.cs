@@ -1,3 +1,7 @@
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
 using Sonora.Audio;
 using Sonora.Audio.Metadata;
 using Sonora.TestPlayer.Models;
@@ -15,12 +19,19 @@ namespace Sonora.TestPlayer.Services;
 /// </remarks>
 public sealed class MetadataFacade
 {
-    /// <summary>Maximum encoded artwork size forwarded to the UI (2 MiB).</summary>
+    /// <summary>Maximum encoded artwork size accepted from the file (2 MiB).</summary>
     public const int MaxArtworkBytesForUi = 2 * 1024 * 1024;
+
+    /// <summary>Longest edge of the JPEG thumbnail posted to the web UI.</summary>
+    public const int UiArtworkMaxEdgePx = 320;
+
+    /// <summary>JPEG quality for UI thumbnails (bridge messages stay small and reliable).</summary>
+    public const long UiArtworkJpegQuality = 72L;
 
     private const int MaxArtworkCandidates = 4;
 
     private readonly IAudioMetadataReader _reader;
+    private readonly ArtworkFileCache? _artworkFiles;
     private readonly Action<string, Exception>? _onReadFailure;
 
     /// <summary>Creates a facade.</summary>
@@ -29,10 +40,18 @@ public sealed class MetadataFacade
     /// Optional callback invoked with the file path and the exception when metadata cannot be read. The item is
     /// still produced with filename-derived fields so playback can be attempted.
     /// </param>
-    public MetadataFacade(IAudioMetadataReader reader, Action<string, Exception>? onReadFailure = null)
+    /// <param name="artworkFiles">
+    /// Optional web-root artwork cache (full-resolution bytes for diagnostics). The UI URL is always a compact
+    /// JPEG <c>data:</c> thumbnail so Vetra/WebView2 does not have to ferry multi-hundred-kilobyte messages.
+    /// </param>
+    public MetadataFacade(
+        IAudioMetadataReader reader,
+        Action<string, Exception>? onReadFailure = null,
+        ArtworkFileCache? artworkFiles = null)
     {
         _reader = reader ?? throw new ArgumentNullException(nameof(reader));
         _onReadFailure = onReadFailure;
+        _artworkFiles = artworkFiles;
     }
 
     /// <summary>
@@ -75,9 +94,9 @@ public sealed class MetadataFacade
     }
 
     /// <summary>
-    /// Reads embedded artwork and returns a <c>data:</c> URL, preferring a front cover. Returns
-    /// <see langword="null"/> when there is no usable image, it exceeds <see cref="MaxArtworkBytesForUi"/>, or the
-    /// file cannot be read.
+    /// Reads embedded artwork for the UI, preferring a front cover, and returns a compact JPEG <c>data:</c> URL
+    /// thumbnail. Returns <see langword="null"/> when there is no usable image, it exceeds
+    /// <see cref="MaxArtworkBytesForUi"/>, or the file cannot be read.
     /// </summary>
     public string? ReadArtworkDataUrl(string path)
     {
@@ -92,7 +111,22 @@ public sealed class MetadataFacade
             var artwork = _reader.ReadArtwork(Path.GetFullPath(path), options);
             var chosen = artwork.FirstOrDefault(a => a.Kind == AudioArtworkKind.FrontCover && !a.Data.IsEmpty)
                 ?? artwork.FirstOrDefault(a => !a.Data.IsEmpty);
-            return chosen is null ? null : BuildDataUrl(chosen.Data.Span);
+            if (chosen is null)
+            {
+                return null;
+            }
+
+            _ = _artworkFiles?.Store(chosen.Data.Span);
+            try
+            {
+                return BuildUiThumbnailDataUrl(chosen.Data.Span) ?? BuildDataUrl(chosen.Data.Span);
+            }
+            catch (Exception ex) when (ex is ArgumentException or ExternalException or OutOfMemoryException
+                                       or FileNotFoundException or TypeLoadException or DllNotFoundException)
+            {
+                // Thumbnail path is best-effort; fall back to the original embedded bytes.
+                return BuildDataUrl(chosen.Data.Span);
+            }
         }
         catch (Exception ex) when (ex is AudioException or IOException or UnauthorizedAccessException)
         {
@@ -115,6 +149,72 @@ public sealed class MetadataFacade
 
         var mime = SniffImageMime(data);
         return mime is null ? null : $"data:{mime};base64,{Convert.ToBase64String(data)}";
+    }
+
+    /// <summary>
+    /// Decodes embedded artwork and re-encodes a bounded JPEG thumbnail for the web UI. Keeps Vetra result
+    /// payloads small enough for reliable WebView2 delivery.
+    /// </summary>
+    public static string? BuildUiThumbnailDataUrl(ReadOnlySpan<byte> data)
+    {
+        if (data.IsEmpty || data.Length > MaxArtworkBytesForUi || SniffImageMime(data) is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            using var input = new MemoryStream(data.ToArray());
+            using var source = Image.FromStream(input, useEmbeddedColorManagement: false, validateImageData: false);
+            var (width, height) = FitWithin(source.Width, source.Height, UiArtworkMaxEdgePx);
+            using var thumb = new Bitmap(width, height, PixelFormat.Format24bppRgb);
+            thumb.SetResolution(source.HorizontalResolution, source.VerticalResolution);
+            using (var graphics = Graphics.FromImage(thumb))
+            {
+                graphics.Clear(Color.Black);
+                graphics.CompositingMode = CompositingMode.SourceCopy;
+                graphics.CompositingQuality = CompositingQuality.HighQuality;
+                graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                graphics.SmoothingMode = SmoothingMode.HighQuality;
+                graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                graphics.DrawImage(source, 0, 0, width, height);
+            }
+
+            using var output = new MemoryStream();
+            SaveJpeg(thumb, output, UiArtworkJpegQuality);
+            return $"data:image/jpeg;base64,{Convert.ToBase64String(output.ToArray())}";
+        }
+        catch (Exception ex) when (ex is ArgumentException or ExternalException or OutOfMemoryException
+                                   or FileNotFoundException or TypeLoadException or DllNotFoundException)
+        {
+            return null;
+        }
+    }
+
+    private static (int Width, int Height) FitWithin(int width, int height, int maxEdge)
+    {
+        if (width <= 0 || height <= 0)
+        {
+            return (1, 1);
+        }
+
+        var longest = Math.Max(width, height);
+        if (longest <= maxEdge)
+        {
+            return (width, height);
+        }
+
+        var scale = maxEdge / (double)longest;
+        return (Math.Max(1, (int)Math.Round(width * scale)), Math.Max(1, (int)Math.Round(height * scale)));
+    }
+
+    private static void SaveJpeg(Image image, Stream output, long quality)
+    {
+        var codec = ImageCodecInfo.GetImageEncoders().FirstOrDefault(c => c.FormatID == ImageFormat.Jpeg.Guid)
+            ?? throw new InvalidOperationException("JPEG encoder is unavailable.");
+        using var parameters = new EncoderParameters(1);
+        parameters.Param[0] = new EncoderParameter(Encoder.Quality, quality);
+        image.Save(output, codec, parameters);
     }
 
     /// <summary>Title derived from the file name without extension (application-side display fallback).</summary>

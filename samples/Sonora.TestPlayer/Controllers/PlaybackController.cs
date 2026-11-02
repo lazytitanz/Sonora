@@ -647,7 +647,9 @@ public sealed class PlaybackController : IAsyncDisposable
         QueueItem? item;
         lock (_lock)
         {
-            if (_artworkCache is { } cache && cache.Id == id)
+            // Only reuse a successful cache entry. A prior null must not permanently hide artwork
+            // after a transient read failure (for example a short-lived file share conflict).
+            if (_artworkCache is { } cache && cache.Id == id && cache.Url is not null)
             {
                 return cache.Url;
             }
@@ -661,12 +663,29 @@ public sealed class PlaybackController : IAsyncDisposable
         }
 
         // Blocking tag read; offloaded to keep the calling (UI) thread responsive.
-        var url = await Task.Run(() => _metadata.ReadArtworkDataUrl(item.Path), cancellationToken).ConfigureAwait(false);
+        string? url;
+        try
+        {
+            url = await Task.Run(() => _metadata.ReadArtworkDataUrl(item.Path), cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Log(DiagnosticLevel.Warning, "artwork.readFailed", $"Artwork read failed for '{item.Title}': {Describe(ex)}", ("path", item.Path));
+            return null;
+        }
+
+        if (url is null)
+        {
+            Log(DiagnosticLevel.Debug, "artwork.missing", $"No usable embedded artwork for '{item.Title}'.", ("path", item.Path));
+            return null;
+        }
+
         lock (_lock)
         {
             _artworkCache = (id, url);
         }
 
+        Log(DiagnosticLevel.Debug, "artwork.served", $"Artwork ready for '{item.Title}'.", ("url", url));
         return url;
     }
 
@@ -782,8 +801,27 @@ public sealed class PlaybackController : IAsyncDisposable
                 player.Play();
             }
 
+            // Thumbnail for the UI (compact data: URL). Done after Load so a failed decode still leaves tags available.
+            var artworkUrl = item.IsStream
+                ? null
+                : await Task.Run(() => _metadata.ReadArtworkDataUrl(item.Path), linked.Token).ConfigureAwait(false);
+            var published = item with { ArtworkDataUrl = artworkUrl };
+            lock (_lock)
+            {
+                if (!IsLatestLoad(version))
+                {
+                    return;
+                }
+
+                _current = published;
+                if (artworkUrl is not null)
+                {
+                    _artworkCache = (published.Id, artworkUrl);
+                }
+            }
+
             Log(DiagnosticLevel.Info, "playback.loaded", $"Loaded '{item.Title}'.", ("play", play.ToString()), ("generation", generation.ToString()));
-            RaiseUi(UiEventNames.TrackChanged, item with { ArtworkDataUrl = null });
+            RaiseUi(UiEventNames.TrackChanged, published);
             RaiseSnapshot();
             _ = PreloadNextAsync(CancellationToken.None);
         }
@@ -928,6 +966,7 @@ public sealed class PlaybackController : IAsyncDisposable
             ("transitionId", e.TransitionId.ToString()),
             ("previousPath", e.PreviousPath ?? string.Empty),
             ("nextPath", e.NextPath ?? string.Empty));
+        // Artwork is fetched lazily via getArtwork / the next full load; keep the transition payload small.
         RaiseUi(UiEventNames.TrackChanged, advancedTo with { ArtworkDataUrl = null });
         RaiseSnapshot();
         _ = PreloadNextAsync(CancellationToken.None);

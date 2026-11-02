@@ -31,9 +31,10 @@ All notable changes to Sonora will be documented in this file.
 - WASAPI exclusive: wrong `AUDCLNT_E_BUFFER_SIZE_ERROR` HRESULT constant (`0x88890018` → `0x88890016`) caused end-of-stream to be misclassified as device failure; Shared→Exclusive with `ExclusiveModeFallback.None` could crash/hang Test Player via recovery storm
 - WASAPI exclusive Pause: NAudio soft-pause left `IAudioClient` running so the last exclusive period repeated (~1 ms loop); Pause now keeps the client running but feeds silence from the PCM adapter (avoids Stop/GetBuffer races)
 - WASAPI Shared→Exclusive: avoid exclusive open/close during format probe; brief endpoint-release grace after disposing the previous output (mitigates intermittent native `GetBuffer` AV `0xC0000005`)
+- Exclusive Stop/gapless then reload: wait for async output dispose before reopening; initialize output before publishing `_output` (failed Init no longer leaves a disposed zombie that breaks Seek); preference-only configure releases orphaned clients; failed Load tears down half-attached pipelines (fixes `DEVICE_IN_USE` / `ObjectDisposedException` after Stop)
 - PCM adapter: pad short periods without latching EOS on transient underruns; silence-after-EOS must not interfere with pause
 - Test Player: serialize output configure commands; surface configure failures as nonfatal UI errors and resync effective mode after success or failure; clarify configure-before-load messaging when `EffectiveMode` is null by design
-- Test Player Audio Output form: Apply enablement tracks dirty requested config (not effective mode); output snapshots no longer clobber unsaved Shared/Exclusive selections; `configureInFlight` always cleared in `finally`
+- Test Player Audio Output form: Apply enablement tracks dirty requested config (not effective mode); output snapshots no longer clobber unsaved Shared/Exclusive selections; clear `configureInFlight` as soon as configure returns (before refresh) and reconcile in-flight applies from matching output events so Exclusive→Shared Apply cannot stay stuck while playback continues
 
 ### Notes
 

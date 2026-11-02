@@ -267,6 +267,19 @@ body {
 #btn-apply-output:disabled {
   cursor: not-allowed;
 }
+.out-apply-debug {
+  font-family: var(--tp-mono);
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: #b7c0c8;
+  background: #1a1e22;
+  border: 1px solid var(--tp-border-soft);
+  border-radius: 6px;
+  padding: 0.55rem 0.65rem;
+  white-space: pre-wrap;
+  max-height: 12rem;
+  overflow: auto;
+}
 .btn-outline-secondary {
   --bs-btn-color: #b4bbc4;
   --bs-btn-border-color: var(--tp-border);

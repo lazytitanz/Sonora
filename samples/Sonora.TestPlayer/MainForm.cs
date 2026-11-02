@@ -27,6 +27,8 @@ public sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _positionTimer = new() { Interval = PositionIntervalMs };
     private readonly System.Windows.Forms.Timer _resourceTimer = new() { Interval = ResourceIntervalMs };
 
+    private readonly string[] _startupPaths;
+
     private PlaybackController? _playback;
     private DeviceController? _devices;
     private StreamingController? _streaming;
@@ -35,8 +37,13 @@ public sealed class MainForm : Form
     private bool _shutdownComplete;
 
     /// <summary>Creates the main window.</summary>
-    public MainForm()
+    /// <param name="startupPaths">
+    /// Optional local audio paths to load after the engine starts (for example from the command line).
+    /// The first existing file is loaded into the player; additional existing files are queued.
+    /// </param>
+    public MainForm(string[]? startupPaths = null)
     {
+        _startupPaths = startupPaths ?? [];
         Text = "Sonora Test Player";
         Width = 1280;
         Height = 840;
@@ -113,6 +120,7 @@ public sealed class MainForm : Form
             _positionTimer.Start();
             _resourceTimer.Start();
             _store.Add("app", DiagnosticLevel.Info, "app.started", "Sonora Test Player started.");
+            await LoadStartupPathsAsync().ConfigureAwait(true);
         }
         catch (Exception ex)
         {
@@ -125,36 +133,103 @@ public sealed class MainForm : Form
         }
     }
 
-    private VetraOptions CreateVetraOptions() => new()
+    private VetraOptions CreateVetraOptions()
     {
-        WebRoot = "www",
-        StartPage = "index.html",
-        EnableDialogs = true,
-        EnableWindowControls = true,
-        EnableStorage = true,
-        EnableDevTools = true,
-        EnableNotifications = false,
-        EnableSystemTray = false,
-        CompanyName = "Sonora",
-        ApplicationName = "SonoraTestPlayer",
-        Logger = new CallbackVetraLogger((level, message) =>
+        // Always load www from the output directory next to the executable so Debug/Release
+        // runs cannot silently pick up a stale or incomplete working-directory copy.
+        var webRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "www"));
+        if (!Directory.Exists(webRoot) || !File.Exists(Path.Combine(webRoot, "index.html")))
+        {
+            throw new DirectoryNotFoundException(
+                $"Test Player web assets were not found at '{webRoot}'. Rebuild the project so www/** is copied to the output directory.");
+        }
+
+        // Create before Vetra maps the web root so the virtual host can serve cached covers.
+        Directory.CreateDirectory(Path.Combine(webRoot, "_artwork"));
+
+        _store.Add(
+            "app",
+            DiagnosticLevel.Info,
+            "app.webRoot",
+            $"WebRoot={webRoot}");
+
+        return new VetraOptions
+        {
+            WebRoot = webRoot,
+            StartPage = "index.html",
+            EnableDialogs = true,
+            EnableWindowControls = true,
+            // Storage is fine for user prefs; static JS is cache-busted via ?v= query on script tags.
+            EnableStorage = true,
+            EnableDevTools = true,
+            EnableNotifications = false,
+            EnableSystemTray = false,
+            CompanyName = "Sonora",
+            ApplicationName = "SonoraTestPlayer",
+            Logger = new CallbackVetraLogger((level, message) =>
+                _store.Add(
+                    "vetra",
+                    level switch
+                    {
+                        VetraLogLevel.Debug => DiagnosticLevel.Debug,
+                        VetraLogLevel.Warning => DiagnosticLevel.Warning,
+                        VetraLogLevel.Error => DiagnosticLevel.Error,
+                        _ => DiagnosticLevel.Info,
+                    },
+                    "vetra.log",
+                    message)),
+        };
+    }
+
+    private async Task LoadStartupPathsAsync()
+    {
+        if (_playback is null || _startupPaths.Length == 0)
+        {
+            return;
+        }
+
+        var existing = _startupPaths
+            .Select(static p => p.Trim().Trim('"'))
+            .Where(static p => p.Length > 0 && File.Exists(p))
+            .Select(Path.GetFullPath)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (existing.Length == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            if (existing.Length > 1)
+            {
+                await _playback.AddFilesAsync(existing).ConfigureAwait(true);
+            }
+
+            await _playback.LoadAsync(existing[0]).ConfigureAwait(true);
             _store.Add(
-                "vetra",
-                level switch
-                {
-                    VetraLogLevel.Debug => DiagnosticLevel.Debug,
-                    VetraLogLevel.Warning => DiagnosticLevel.Warning,
-                    VetraLogLevel.Error => DiagnosticLevel.Error,
-                    _ => DiagnosticLevel.Info,
-                },
-                "vetra.log",
-                message)),
-    };
+                "app",
+                DiagnosticLevel.Info,
+                "app.startupLoad",
+                $"Loaded startup path '{Path.GetFileName(existing[0])}'" +
+                (existing.Length > 1 ? $" (+{existing.Length - 1} queued)." : "."));
+        }
+        catch (Exception ex)
+        {
+            _store.Add(
+                "app",
+                DiagnosticLevel.Warning,
+                "app.startupLoadFailed",
+                $"Startup load failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
 
     private void CreateServices()
     {
         var context = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
 
+        var webRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "www"));
+        var artworkCache = new ArtworkFileCache(Path.Combine(webRoot, "_artwork"));
         var metadata = new MetadataFacade(
             SonoraWindows.CreateMetadataReader(),
             (path, ex) => _store.Add(
@@ -162,7 +237,8 @@ public sealed class MainForm : Form
                 DiagnosticLevel.Warning,
                 "metadata.readFailed",
                 $"Could not read metadata: {ex.GetType().Name}: {ex.Message}",
-                ("path", path)));
+                ("path", path)),
+            artworkCache);
 
         var playback = new PlaybackController(_store, context, metadata);
         _playback = playback;

@@ -90,6 +90,14 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     private OutputRecoveryIntent _outputRecoveryIntent = OutputRecoveryIntent.None;
     private int _recoveryInFlight;
 
+    /// <summary>
+    /// Serializes asynchronous output Shutdown/Dispose (e.g. from device-loss handlers) so Load /
+    /// Configure / recovery never open a new WASAPI client while a prior exclusive client is still
+    /// releasing the endpoint.
+    /// </summary>
+    private readonly object _outputShutdownSync = new();
+    private Task _outputShutdownTask = Task.CompletedTask;
+
     private AudioOutputConfiguration _outputConfiguration = AudioOutputConfiguration.Default;
     private AudioOutputMode? _effectiveOutputMode;
     private ExclusiveFallbackReason _outputFallbackReason = ExclusiveFallbackReason.None;
@@ -355,6 +363,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         var wasPlaying = false;
         var wasPaused = false;
         var hasSource = false;
+        var releasedExclusiveDevice = false;
         string? effectiveDeviceId;
         IAudioOutput? oldOutput = null;
         try
@@ -409,6 +418,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             // Snapshot so FinishOutputRebind can prefer _heldPosition (including seek-to-zero).
             _heldPosition = heldPosition;
 
+            releasedExclusiveDevice = _effectiveOutputMode == AudioOutputMode.Exclusive;
             oldOutput = DetachOutput_NoLock();
             _outputDeviceStatus = OutputDeviceStatus.Switching;
             RaiseOutputDeviceChanged(OutputDeviceChangeReason.Switching);
@@ -421,6 +431,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         // Yield so callers can observe Switching / supersede this switch before teardown blocks
         // the calling thread (Shutdown may wait for a live pull consumer).
         await Task.Yield();
+        await WaitForOutputShutdownAsync().ConfigureAwait(false);
 
         // Join previous output outside the gate so pull-loop wait cannot deadlock.
         try
@@ -449,6 +460,12 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         }
 
         ThrowIfSwitchSuperseded(switchGeneration, switchToken);
+
+        if (releasedExclusiveDevice || _outputConfiguration.Mode == AudioOutputMode.Exclusive)
+        {
+            await Task.Delay(ExclusiveEndpointReleaseGrace, switchToken).ConfigureAwait(false);
+            ThrowIfSwitchSuperseded(switchGeneration, switchToken);
+        }
 
         await FinishOutputRebindAsync(
             preferredDeviceId: deviceId,
@@ -484,6 +501,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         IAudioOutput? oldOutput = null;
         var modeUnchanged = false;
         var noSourceConfigured = false;
+        var releasedExclusive = false;
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -505,47 +523,51 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
             effectiveDeviceId = ResolveEffectiveDeviceId_NoLock(preferredDeviceId);
             BeginOutputSwitch_NoLock(cancellationToken, out switchGeneration, out switchToken);
+            releasedExclusive = _effectiveOutputMode == AudioOutputMode.Exclusive;
 
             if (!_hasSource)
             {
-                _activeOutputDeviceId = null;
-                _effectiveOutputMode = null;
+                // Preference-only update, but still release any orphaned output (e.g. a disposed
+                // zombie left after a failed Load Attach, or a lingering exclusive client).
+                oldOutput = DetachOutput_NoLock();
                 _outputFallbackReason = ExclusiveFallbackReason.None;
                 _outputDeviceStatus = OutputDeviceStatus.Available;
                 RaiseOutputDeviceChanged(OutputDeviceChangeReason.SelectionChanged);
                 noSourceConfigured = true;
-                return;
             }
-
-            if (effectiveDeviceId is null && preferredDeviceId is not null)
+            else
             {
-                throw new AudioDeviceException($"Output device '{preferredDeviceId}' is not available.");
+                if (effectiveDeviceId is null && preferredDeviceId is not null)
+                {
+                    throw new AudioDeviceException($"Output device '{preferredDeviceId}' is not available.");
+                }
+
+                wasPlaying = _state == PlaybackState.Playing;
+                wasPaused = _state == PlaybackState.Paused;
+                heldPosition = _state is PlaybackState.Playing
+                    ? EstimateAudiblePosition()
+                    : _heldPosition;
+                _heldPosition = heldPosition;
+
+                oldOutput = DetachOutput_NoLock();
+                _effectiveOutputMode = null;
+                _outputDeviceStatus = OutputDeviceStatus.Switching;
+                RaiseOutputDeviceChanged(OutputDeviceChangeReason.Switching);
             }
-
-            wasPlaying = _state == PlaybackState.Playing;
-            wasPaused = _state == PlaybackState.Paused;
-            heldPosition = _state is PlaybackState.Playing
-                ? EstimateAudiblePosition()
-                : _heldPosition;
-            _heldPosition = heldPosition;
-
-            oldOutput = DetachOutput_NoLock();
-            _effectiveOutputMode = null;
-            _outputDeviceStatus = OutputDeviceStatus.Switching;
-            RaiseOutputDeviceChanged(OutputDeviceChangeReason.Switching);
         }
         finally
         {
             _gate.Release();
         }
 
-        if (modeUnchanged || noSourceConfigured)
+        if (modeUnchanged)
         {
             RaiseOutputConfigurationChanged();
             return;
         }
 
         await Task.Yield();
+        await WaitForOutputShutdownAsync().ConfigureAwait(false);
 
         try
         {
@@ -553,7 +575,12 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         }
         catch (Exception ex)
         {
-            if (_disposed
+            if (noSourceConfigured)
+            {
+                // Best-effort preference update; orphan dispose failure must not block mode save.
+                RaiseError(ex);
+            }
+            else if (_disposed
                 || switchGeneration != Volatile.Read(ref _outputSwitchGeneration)
                 || switchToken.IsCancellationRequested)
             {
@@ -561,23 +588,35 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                     ? new ObjectDisposedException(nameof(AudioPlayer))
                     : CreateSupersededException();
             }
+            else
+            {
+                await FailSwitchAfterTeardownAsync(
+                    switchGeneration,
+                    wasPlaying,
+                    wasPaused,
+                    heldPosition,
+                    ex).ConfigureAwait(false);
+                RaiseOutputConfigurationChanged();
+                throw;
+            }
+        }
 
-            await FailSwitchAfterTeardownAsync(
-                switchGeneration,
-                wasPlaying,
-                wasPaused,
-                heldPosition,
-                ex).ConfigureAwait(false);
+        if (noSourceConfigured)
+        {
+            if (releasedExclusive)
+            {
+                await Task.Delay(ExclusiveEndpointReleaseGrace, CancellationToken.None).ConfigureAwait(false);
+            }
+
             RaiseOutputConfigurationChanged();
-            throw;
+            return;
         }
 
         ThrowIfSwitchSuperseded(switchGeneration, switchToken);
 
-        // WASAPI: opening exclusive immediately after tearing down a shared client on the same
-        // endpoint can intermittently native-crash inside IAudioRenderClient.GetBuffer (0xC0000005)
-        // on some drivers. Give the endpoint a brief release window before rebinding exclusive.
-        if (configuration.Mode == AudioOutputMode.Exclusive && oldOutput is not null)
+        // WASAPI: opening a new client immediately after disposing the previous one (especially
+        // exclusive) can fail with DEVICE_IN_USE or native-crash in GetBuffer on some drivers.
+        if (releasedExclusive || configuration.Mode == AudioOutputMode.Exclusive)
         {
             await Task.Delay(ExclusiveEndpointReleaseGrace, switchToken).ConfigureAwait(false);
             ThrowIfSwitchSuperseded(switchGeneration, switchToken);
@@ -613,6 +652,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         var generation = 0;
         SessionTeardownBag? priorSession = null;
+        var releasedExclusive = false;
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -621,6 +661,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             _outputRecoveryIntent = OutputRecoveryIntent.None;
             SetState_NoLock(PlaybackState.Buffering);
 
+            releasedExclusive = _effectiveOutputMode == AudioOutputMode.Exclusive;
             priorSession = BeginTearDownSession_NoLock(takeNext: true);
             _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         }
@@ -632,6 +673,13 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         if (priorSession is not null)
         {
             await CompleteTeardownAsync(priorSession).ConfigureAwait(false);
+        }
+
+        // Wait for any fire-and-forget exclusive dispose (device-loss path) before opening again.
+        await WaitForOutputShutdownAsync().ConfigureAwait(false);
+        if (releasedExclusive || _outputConfiguration.Mode == AudioOutputMode.Exclusive)
+        {
+            await Task.Delay(ExclusiveEndpointReleaseGrace, cancellationToken).ConfigureAwait(false);
         }
 
         IAudioDecoder decoder;
@@ -815,7 +863,40 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         }
         finally
         {
-            created?.Dispose();
+            if (created is not null)
+            {
+                try
+                {
+                    created.Dispose();
+                }
+                catch
+                {
+                    // ignored
+                }
+
+                created = null;
+            }
+
+            // Attach/Init failure (or superseded create) can leave pipelines without an output.
+            // Tear them down so Seek cannot observe a half-loaded session / disposed output.
+            if (!_disposed
+                && generation == _generation
+                && !_hasSource
+                && _active is not null)
+            {
+                var failedLoad = BeginTearDownSession_NoLock(takeNext: true);
+                _outputDeviceStatus = OutputDeviceStatus.Unavailable;
+                SetState_NoLock(PlaybackState.Stopped);
+                try
+                {
+                    CompleteTeardown(failedLoad);
+                }
+                catch
+                {
+                    // ignored — original attach/load exception is authoritative
+                }
+            }
+
             _gate.Release();
         }
 
@@ -1106,7 +1187,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         {
             _output?.Pause();
         }
-        catch (Exception ex) when (ex is not ObjectDisposedException)
+        catch (ObjectDisposedException)
+        {
+            // Failed Load can leave a disposed output reference in rare races; seek must still work.
+        }
+        catch (Exception)
         {
             // Continue — barrier still protects DSP reset.
         }
@@ -1434,6 +1519,50 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Queues Shutdown/Dispose off the command gate and serializes with other pending teardowns.
+    /// </summary>
+    private void QueueOutputShutdown(IAudioOutput? output)
+    {
+        if (output is null)
+        {
+            return;
+        }
+
+        lock (_outputShutdownSync)
+        {
+            var previous = _outputShutdownTask;
+            _outputShutdownTask = Task.Run(() =>
+            {
+                try
+                {
+                    previous.GetAwaiter().GetResult();
+                }
+                catch
+                {
+                    // ignored — prior shutdown failure must not block releasing this client
+                }
+
+                try
+                {
+                    ShutdownAndDispose(output);
+                }
+                catch (Exception ex)
+                {
+                    RaiseError(ex);
+                }
+            });
+        }
+    }
+
+    private Task WaitForOutputShutdownAsync()
+    {
+        lock (_outputShutdownSync)
+        {
+            return _outputShutdownTask;
+        }
+    }
+
     private void ThrowIfSwitchSuperseded(int switchGeneration, CancellationToken switchToken)
     {
         if (_disposed)
@@ -1522,9 +1651,29 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         _effects.DisposeRetired();
         _sampleSource?.ResetEndOfStream();
 
+        // Initialize before publishing _output. If Init throws (e.g. exclusive DEVICE_IN_USE),
+        // callers dispose the instance — leaving _output assigned would make later Seek/Pause
+        // hit ObjectDisposedException and leave the endpoint locked from the app's perspective.
+        output.Stopped += OnOutputStopped;
+        try
+        {
+            output.Initialize(_sampleSource!);
+        }
+        catch
+        {
+            try
+            {
+                output.Stopped -= OnOutputStopped;
+            }
+            catch
+            {
+                // ignored
+            }
+
+            throw;
+        }
+
         _output = output;
-        _output.Stopped += OnOutputStopped;
-        _output.Initialize(_sampleSource!);
         Volatile.Write(ref _activeOutputDeviceId, output.EndpointId);
         _effectiveOutputMode = effectiveMode;
         RebasePositionClock_NoLock(logicalPosition);
@@ -2011,18 +2160,9 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             }
 
             SetState_NoLock(PlaybackState.Stopped);
-            // Shutdown off the gate path: schedule after release via recovery / background.
-            _ = Task.Run(() =>
-            {
-                try
-                {
-                    ShutdownAndDispose(lostOutput);
-                }
-                catch (Exception ex)
-                {
-                    RaiseError(ex);
-                }
-            });
+            // Shutdown off the gate path so Stop/Load are not blocked on WASAPI Join.
+            // Serialize with WaitForOutputShutdownAsync before opening a replacement client.
+            QueueOutputShutdown(lostOutput);
 
             if (autoRecover)
             {
@@ -2119,13 +2259,14 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         }
 
         await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
-        int switchGeneration;
-        CancellationToken switchToken;
-        TimeSpan heldPosition;
-        string? effectiveId;
+        int switchGeneration = 0;
+        CancellationToken switchToken = CancellationToken.None;
+        TimeSpan heldPosition = TimeSpan.Zero;
+        string? effectiveId = null;
         string? preferred;
         var intent = OutputRecoveryIntent.None;
         var needsCreate = false;
+        var releasedExclusive = false;
         IAudioOutput? oldOutput = null;
         try
         {
@@ -2178,6 +2319,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             }
 
             BeginOutputSwitch_NoLock(CancellationToken.None, out switchGeneration, out switchToken);
+            releasedExclusive = _effectiveOutputMode == AudioOutputMode.Exclusive;
             oldOutput = DetachOutput_NoLock();
             _outputDeviceStatus = OutputDeviceStatus.Switching;
             RaiseOutputDeviceChanged(OutputDeviceChangeReason.Switching);
@@ -2189,6 +2331,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         }
 
         await Task.Yield();
+        await WaitForOutputShutdownAsync().ConfigureAwait(false);
 
         try
         {
@@ -2222,6 +2365,15 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         if (switchGeneration != Volatile.Read(ref _outputSwitchGeneration))
         {
             return;
+        }
+
+        if (releasedExclusive || _outputConfiguration.Mode == AudioOutputMode.Exclusive)
+        {
+            await Task.Delay(ExclusiveEndpointReleaseGrace, switchToken).ConfigureAwait(false);
+            if (switchGeneration != Volatile.Read(ref _outputSwitchGeneration))
+            {
+                return;
+            }
         }
 
         IAudioOutput? created = null;

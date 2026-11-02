@@ -30,6 +30,7 @@
   let volumeEpoch = 0;
   let lastNonZeroVolume = DEFAULT_RESTORE_VOLUME;
   let artworkFor = null;
+  let artworkResolved = false;
   let dragId = null;
   let gaplessBusy = false;
   const seekHistory = [];
@@ -77,21 +78,33 @@
   }
 
   // ---------------------------------------------------------------------------------------------
-  // Artwork (only validated image data: URLs ever reach <img src>)
+  // Artwork (only validated image data: / _artwork URLs ever reach <img src>)
   // ---------------------------------------------------------------------------------------------
 
-  function isSafeImageDataUrl(url) {
-    return typeof url === 'string' && /^data:image\/[a-z0-9.+-]+;base64,/i.test(url) && !/^data:image\/svg/i.test(url);
+  function isSafeArtworkUrl(url) {
+    if (typeof url !== 'string' || !url) return false;
+    if (/^data:image\/[a-z0-9.+-]+;base64,/i.test(url) && !/^data:image\/svg/i.test(url)) return true;
+    // Host-written files under the Vetra web root (see ArtworkFileCache).
+    return /^(?:\.\/|\/)?_artwork\/[A-Za-z0-9._-]+\.(?:jpe?g|png|gif|webp|bmp)$/i.test(url);
   }
 
   function setArtwork(url) {
-    const ok = isSafeImageDataUrl(url);
+    const ok = isSafeArtworkUrl(url);
     for (const [img, ph] of [[dom['pb-art-img'], dom['pb-art-ph']], [dom['np-art-img'], dom['np-art-ph']]]) {
       if (ok) {
+        img.onerror = () => {
+          img.removeAttribute('src');
+          img.hidden = true;
+          ph.hidden = false;
+          // Allow syncArtwork to retry after a failed image fetch.
+          artworkFor = null;
+          artworkResolved = false;
+        };
         img.src = url;
         img.hidden = false;
         ph.hidden = true;
       } else {
+        img.onerror = null;
         img.removeAttribute('src');
         img.hidden = true;
         ph.hidden = false;
@@ -101,16 +114,43 @@
 
   async function syncArtwork() {
     const snap = state.snapshot;
-    const id = (snap && snap.currentItemId) || null;
-    if (id === artworkFor) return;
-    artworkFor = id;
-    setArtwork(null);
-    if (!id) return;
     const item = currentItem();
-    if (item && item.isStream) return;
+    // Prefer snapshot id; fall back to the trackChanged payload when snapshot is still stale.
+    const id = (snap && snap.currentItemId) || (item && item.id) || null;
+    if (id === artworkFor && artworkResolved) return;
+    if (id === artworkFor && !artworkResolved) return; // request already in flight
+    artworkFor = id;
+    artworkResolved = false;
+    setArtwork(null);
+    if (!id) {
+      artworkResolved = true;
+      return;
+    }
+    if (item && item.isStream) {
+      artworkResolved = true;
+      return;
+    }
+    if (item && isSafeArtworkUrl(item.artworkDataUrl)) {
+      setArtwork(item.artworkDataUrl);
+      artworkResolved = true;
+      return;
+    }
     const result = await run('playback.getArtwork', [id], { toast: false });
     if (artworkFor !== id) return; // a newer track superseded this request
-    setArtwork(result.ok ? result.value : null);
+    if (result.ok && isSafeArtworkUrl(result.value)) {
+      setArtwork(result.value);
+      artworkResolved = true;
+      return;
+    }
+    setArtwork(null);
+    if (result.ok) {
+      // Host answered definitively (null / rejected URL) — do not hammer.
+      artworkResolved = true;
+      return;
+    }
+    // Invoke failed: clear claim so a later snapshot can retry.
+    artworkFor = null;
+    artworkResolved = false;
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -725,10 +765,17 @@
     TP.bus.on('snapshot', renderAll);
     TP.bus.on('position', renderTransport);
     TP.bus.on('network', renderTransport);
-    TP.bus.on('trackChanged', () => {
+    TP.bus.on('trackChanged', (payload) => {
       renderNowPlaying();
       renderTransport();
       updateQueueHighlight();
+      // Prefer artwork already attached to the track payload (thumbnail data URL from the host).
+      if (payload && isSafeArtworkUrl(payload.artworkDataUrl)) {
+        artworkFor = payload.id || artworkFor;
+        artworkResolved = true;
+        setArtwork(payload.artworkDataUrl);
+        return;
+      }
       syncArtwork();
     });
     TP.bus.on('queue', () => {

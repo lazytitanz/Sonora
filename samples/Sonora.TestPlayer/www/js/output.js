@@ -11,15 +11,19 @@
   const state = TP.state;
   const logic = TP.outputFormLogic;
 
+  if (!logic) {
+    console.error('TP.outputFormLogic missing — outputFormLogic.js did not load. Check WebRoot / script tags.');
+  }
+
   const MIN_LATENCY_MS = 5;
   const MAX_LATENCY_MS = 500;
 
   const dom = {};
-  let formDirty = false;
-  let configureInFlight = false;
-  /** Last saved requested configuration (engine `OutputConfiguration`), not effective mode. */
-  let savedRequest = logic.requestedFromOutput(null);
+  const session = logic.createFormSession(null);
   let switchingId; // undefined = idle, null = switching to system default, string = switching to device id
+  let lastDomModeBeforeSnapshot = null;
+  let snapshotClobberCount = 0;
+  let applyClickCount = 0;
 
   const DEVICE_STATE_TONE = { active: 'ok', disabled: 'warn', unplugged: 'warn', notPresent: 'bad', unknown: 'muted' };
   const OUTPUT_STATUS_TONE = { available: 'ok', switching: 'info', preferredUnavailable: 'warn', unavailable: 'bad' };
@@ -27,16 +31,12 @@
   function resolveDom() {
     const ids = [
       'btn-refresh-devices', 'device-list', 'device-empty', 'output-form', 'out-mode', 'out-fallback', 'out-latency',
-      'out-latency-default', 'btn-apply-output', 'out-form-error', 'eff-fallback-banner', 'eff-req-mode', 'eff-mode',
+      'out-latency-default', 'btn-apply-output', 'out-form-error', 'out-apply-debug', 'eff-fallback-banner', 'eff-req-mode', 'eff-mode',
       'eff-fallback', 'eff-status', 'eff-preferred', 'eff-active', 'eff-recovery', 'eff-req-latency', 'eff-latency',
       'output-checklist',
     ];
     for (const id of ids) dom[id] = document.getElementById(id);
   }
-
-  // ---------------------------------------------------------------------------------------------
-  // Name resolution (shared with the playback bar)
-  // ---------------------------------------------------------------------------------------------
 
   function deviceName(id) {
     if (!id) return null;
@@ -44,7 +44,6 @@
     return found ? found.name : null;
   }
 
-  /** Short label for the device the player is bound to (or would use). */
   function activeLabel() {
     const out = state.output;
     if (!out) return '—';
@@ -59,16 +58,11 @@
     return def ? `${def.name} (system default)` : 'No device attached';
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // Devices
-  // ---------------------------------------------------------------------------------------------
-
   function renderDevices() {
     const list = clear(dom['device-list']);
     const out = state.output;
     const devices = state.devices;
     dom['device-empty'].hidden = devices.length > 0;
-
     const followingDefault = !out || !out.preferredDeviceId;
 
     const makeRow = ({ id, name, sub, badges, active, unavailable, canUse }) => {
@@ -133,10 +127,6 @@
     await TP.core.refreshSnapshot();
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // Effective state
-  // ---------------------------------------------------------------------------------------------
-
   function renderEffective() {
     const out = state.output;
     if (!out) return;
@@ -167,11 +157,7 @@
     }
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // Configuration form
-  // ---------------------------------------------------------------------------------------------
-
-  function readFormRequest() {
+  function readDomForm() {
     return logic.requestedFromForm({
       mode: dom['out-mode'].value,
       exclusiveFallback: dom['out-fallback'].value,
@@ -181,34 +167,11 @@
   }
 
   function syncLatencyInput() {
-    const useDefault = dom['out-latency-default'].checked;
-    dom['out-latency'].disabled = useDefault;
+    dom['out-latency'].disabled = dom['out-latency-default'].checked;
   }
 
   function syncFallbackEnabled() {
     dom['out-fallback'].disabled = dom['out-mode'].value !== 'exclusive';
-  }
-
-  function updateApplyEnabled() {
-    const button = dom['btn-apply-output'];
-    if (!button) return;
-    const enable = logic.shouldEnableApply({
-      formRequest: readFormRequest(),
-      savedRequest,
-      configureInFlight,
-    });
-    button.disabled = !enable;
-    button.title = configureInFlight
-      ? 'Configuration change in progress…'
-      : enable
-        ? 'Apply the selected output configuration'
-        : 'No pending configuration changes';
-  }
-
-  function markFormDirty() {
-    formDirty = true;
-    syncFallbackEnabled();
-    updateApplyEnabled();
   }
 
   function applyFormValues(values) {
@@ -220,23 +183,131 @@
     syncFallbackEnabled();
   }
 
-  /**
-   * Sync editable controls from engine requested configuration only.
-   * Never overwrites pending edits; ignores effective-only output updates.
-   */
-  function syncForm(incomingOutput) {
-    const out = incomingOutput || state.output;
-    if (!out) return;
+  function paintDebug(extra = {}) {
+    const snap = session.snapshot();
+    const form = readDomForm();
+    const button = dom['btn-apply-output'];
+    const panel = dom['out-apply-debug'];
+    const rect = button ? button.getBoundingClientRect() : null;
+    const style = button ? window.getComputedStyle(button) : null;
+    const lines = [
+      `asset=${logic.ASSET_BUILD_ID}`,
+      `domMode=${dom['out-mode'] && dom['out-mode'].value}  formDirty=${snap.formDirty}  inFlight=${snap.configureInFlight}`,
+      `pending=${snap.pendingRequest ? JSON.stringify(snap.pendingRequest) : 'null'}`,
+      `saved=${JSON.stringify(snap.savedRequest)}`,
+      `form =${JSON.stringify(form)}`,
+      `equal=${logic.requestsEqual(form, snap.savedRequest)}  applyEnabled=${logic.shouldEnableApply({ formRequest: form, savedRequest: snap.savedRequest, configureInFlight: snap.configureInFlight })}`,
+      `disabledReason=${logic.applyDisabledReason({ formRequest: form, savedRequest: snap.savedRequest, configureInFlight: snap.configureInFlight }) || 'none'}`,
+      `button.disabled=${button ? button.disabled : 'n/a'}  pointer-events=${style ? style.pointerEvents : 'n/a'}`,
+      `clicks=${applyClickCount}  snapshotClobbers=${snapshotClobberCount}  reconcile=${snap.lastReconcile || 'none'}`,
+      `lastClick=${snap.lastClick ? JSON.stringify(snap.lastClick) : 'none'}`,
+      rect ? `btnBox=${Math.round(rect.left)},${Math.round(rect.top)} ${Math.round(rect.width)}x${Math.round(rect.height)}` : 'btnBox=n/a',
+    ];
+    for (const [k, v] of Object.entries(extra)) lines.push(`${k}=${v}`);
+    const text = lines.join('\n');
+    if (panel) setText(panel, text);
+    window.__TP_OUTPUT_DEBUG__ = {
+      ...snap,
+      domMode: dom['out-mode'] && dom['out-mode'].value,
+      domForm: form,
+      buttonDisabled: button ? button.disabled : null,
+      pointerEvents: style ? style.pointerEvents : null,
+      applyClickCount,
+      snapshotClobberCount,
+      webRootHint: document.baseURI,
+      scripts: Array.from(document.scripts).map((s) => s.src).filter((s) => s.includes('output')),
+      extra,
+    };
+  }
 
-    if (!logic.shouldSyncFormFromOutput({ formDirty, savedRequest, incomingOutput: out })) {
+  function toastConfigureResult(out) {
+    const eff = out && out.effectiveMode;
+    const requested = out && out.mode;
+    const hasSource = out && out.hasSource;
+    if (eff) {
+      toast(`Output configured. Effective mode: ${fmt.humanize(eff)}.`, 'success');
+    } else if (!hasSource) {
+      toast(
+        `Output preference saved (${fmt.humanize(requested || 'shared')}). It will apply when a track is loaded.`,
+        'success');
+    } else if (logic.normalizeMode(requested) === 'exclusive') {
+      toast('Exclusive mode was requested but no output is attached. Check Diagnostics for details.', 'warning');
+    } else {
+      toast('Output configured (no output attached yet).', 'success');
+    }
+  }
+
+  function updateApplyEnabled() {
+    const button = dom['btn-apply-output'];
+    if (!button) return;
+    const form = readDomForm();
+    const snap = session.snapshot();
+    // Keep session formRequest aligned with the live DOM after user edits.
+    const enable = logic.shouldEnableApply({
+      formRequest: form,
+      savedRequest: snap.savedRequest,
+      configureInFlight: snap.configureInFlight,
+    });
+    button.disabled = !enable;
+    button.title = snap.configureInFlight
+      ? 'Configuration change in progress…'
+      : enable
+        ? 'Apply the selected output configuration'
+        : `Nothing to apply (${logic.applyDisabledReason({ formRequest: form, savedRequest: snap.savedRequest, configureInFlight: false })})`;
+    paintDebug();
+  }
+
+  function onFormEdited() {
+    session.setFormRequest(readDomForm());
+    syncFallbackEnabled();
+    updateApplyEnabled();
+  }
+
+  function syncFormFromOutput(incomingOutput) {
+    const out = incomingOutput || state.output;
+    if (!out) {
       updateApplyEnabled();
       return;
     }
 
-    savedRequest = logic.requestedFromOutput(out);
-    applyFormValues(logic.formValuesFromRequest(savedRequest));
-    formDirty = false;
+    lastDomModeBeforeSnapshot = dom['out-mode'] ? dom['out-mode'].value : null;
+    const before = session.snapshot();
+    const beforeDirty = before.formDirty;
+    const beforeMode = lastDomModeBeforeSnapshot;
+    const beforeInFlight = before.configureInFlight;
+    const after = session.receiveOutput(out);
+
+    // Bridge/refresh may still be pending; matching output clears inFlight so Apply is usable.
+    if (beforeInFlight && !after.configureInFlight && after.lastReconcile) {
+      if (!after.formDirty) {
+        applyFormValues(logic.formValuesFromRequest(after.savedRequest));
+      }
+      toastConfigureResult(out);
+      updateApplyEnabled();
+      paintDebug({
+        snapshotDomModeBefore: lastDomModeBeforeSnapshot,
+        snapshotDomModeAfter: dom['out-mode'] && dom['out-mode'].value,
+        reconciledFromOutput: 'yes',
+      });
+      return;
+    }
+
+    if (after.lastSnapshotClobber) {
+      // Host requested config changed while the form was clean — rewrite editable controls.
+      applyFormValues(logic.formValuesFromRequest(after.savedRequest));
+      if (beforeMode !== (dom['out-mode'] && dom['out-mode'].value)) {
+        snapshotClobberCount += 1;
+      }
+    } else if (beforeDirty && beforeMode !== (dom['out-mode'] && dom['out-mode'].value)) {
+      // DOM mode changed without going through onFormEdited — count as unexpected clobber.
+      snapshotClobberCount += 1;
+    }
+
     updateApplyEnabled();
+    paintDebug({
+      snapshotDomModeBefore: lastDomModeBeforeSnapshot,
+      snapshotDomModeAfter: dom['out-mode'] && dom['out-mode'].value,
+    });
   }
 
   function showFormError(message) {
@@ -246,13 +317,17 @@
 
   async function applyConfiguration(event) {
     event.preventDefault();
-    if (configureInFlight) {
-      toast('An output configuration change is already in progress.', 'info');
-      return;
-    }
+    applyClickCount += 1;
 
-    if (!logic.shouldEnableApply({ formRequest: readFormRequest(), savedRequest, configureInFlight: false })) {
-      toast('No output configuration changes to apply.', 'info');
+    const form = readDomForm();
+    session.setFormRequest(form);
+
+    const begin = session.beginApply();
+    paintDebug({ applyAttempt: begin.ok ? 'begin' : `blocked:${begin.reason}` });
+    if (!begin.ok) {
+      toast(begin.reason === 'configureInFlight'
+        ? 'An output configuration change is already in progress.'
+        : 'No output configuration changes to apply.', 'info');
       updateApplyEnabled();
       return;
     }
@@ -264,61 +339,60 @@
       if (!Number.isFinite(latency) || latency < MIN_LATENCY_MS || latency > MAX_LATENCY_MS) {
         showFormError(`Latency must be between ${MIN_LATENCY_MS} and ${MAX_LATENCY_MS} ms.`);
         dom['out-latency'].focus();
+        session.completeApplyFailure();
+        updateApplyEnabled();
         return;
       }
     }
 
     const request = {
-      mode: logic.normalizeMode(dom['out-mode'].value),
-      exclusiveFallback: logic.normalizeFallback(dom['out-fallback'].value),
+      mode: form.mode,
+      exclusiveFallback: form.exclusiveFallback,
       requestedLatencyMs: latency,
     };
 
-    configureInFlight = true;
     updateApplyEnabled();
     try {
       const result = await run('output.configure', [request], { label: 'Output configuration', toast: false });
-      // Always resync host state after success or failure; do not clobber a still-dirty retry form
-      // until we know whether the request stuck.
-      await refresh({ quiet: true });
-      await TP.core.refreshSnapshot();
 
+      // Complete the session BEFORE refresh/snapshot. A hung refresh must not leave
+      // configureInFlight stuck (which permanently disables Apply).
       if (result.ok) {
         if (result.value) TP.core.setOutput(result.value);
-        savedRequest = logic.requestedFromOutput(result.value || state.output);
-        formDirty = false;
-        applyFormValues(logic.formValuesFromRequest(savedRequest));
-        const out = state.output || result.value;
-        const eff = out && out.effectiveMode;
-        const requested = out && out.mode;
-        const hasSource = out && out.hasSource;
-        if (eff) {
-          toast(`Output configured. Effective mode: ${fmt.humanize(eff)}.`, 'success');
-        } else if (!hasSource) {
-          toast(
-            `Output preference saved (${fmt.humanize(requested || 'shared')}). It will apply when a track is loaded.`,
-            'success');
-        } else if (requested === 'exclusive') {
-          toast('Exclusive mode was requested but no output is attached. Check Diagnostics for details.', 'warning');
-        } else {
-          toast('Output configured (no output attached yet).', 'success');
+        const out = result.value || state.output;
+        const alreadyReconciled = !session.snapshot().configureInFlight;
+        session.completeApplySuccess(out, { preserveDirtyForm: true });
+        if (!session.snapshot().formDirty) {
+          applyFormValues(logic.formValuesFromRequest(session.getSavedRequest()));
         }
+        if (!alreadyReconciled) {
+          toastConfigureResult(out);
+        }
+        paintDebug({ lastSent: JSON.stringify(request), applySettled: alreadyReconciled ? 'afterReconcile' : 'fromBridge' });
       } else {
         const message = result.message || 'Output configuration failed.';
         showFormError(message);
         toast(`Output configuration: ${message}`, 'danger');
-        // Keep the user's attempted values so they can edit and retry.
-        formDirty = true;
+        session.completeApplyFailure();
       }
+
+      try {
+        await refresh({ quiet: true });
+        await TP.core.refreshSnapshot();
+      } catch (refreshErr) {
+        console.warn('Post-configure refresh failed:', refreshErr);
+        paintDebug({ refreshError: String(refreshErr && refreshErr.message ? refreshErr.message : refreshErr) });
+      }
+    } catch (err) {
+      if (session.snapshot().configureInFlight) {
+        session.completeApplyFailure();
+      }
+      showFormError(String(err && err.message ? err.message : err));
+      throw err;
     } finally {
-      configureInFlight = false;
       updateApplyEnabled();
     }
   }
-
-  // ---------------------------------------------------------------------------------------------
-  // Refresh / init
-  // ---------------------------------------------------------------------------------------------
 
   async function refresh({ quiet = false } = {}) {
     const [devices, output] = await Promise.all([
@@ -340,28 +414,26 @@
     'After Exclusive applies, change Share mode back to Shared and Apply: the switch succeeds in both directions.',
   ];
 
-  function render() {
-    renderDevices();
-    renderEffective();
-    // Only rewrite editable controls when the *requested* config changes and the form is clean.
-    syncForm(state.output);
-  }
-
   function init() {
     resolveDom();
     TP.ui.checklist(dom['output-checklist'], 'output', CHECKLIST);
 
     dom['btn-refresh-devices'].addEventListener('click', () => refresh());
     dom['output-form'].addEventListener('submit', applyConfiguration);
-    dom['out-latency-default'].addEventListener('change', markFormDirty);
-    // input fires as soon as the selection changes; change alone can lose to a same-tick syncForm.
-    dom['out-mode'].addEventListener('input', markFormDirty);
-    dom['out-mode'].addEventListener('change', markFormDirty);
-    dom['out-fallback'].addEventListener('input', markFormDirty);
-    dom['out-fallback'].addEventListener('change', markFormDirty);
+    // Capture phase on the button itself so we log clicks even if submit is suppressed.
+    dom['btn-apply-output'].addEventListener('click', () => {
+      applyClickCount += 1;
+      paintDebug({ rawButtonClick: 'yes' });
+    }, true);
+
+    dom['out-latency-default'].addEventListener('change', onFormEdited);
+    dom['out-mode'].addEventListener('input', onFormEdited);
+    dom['out-mode'].addEventListener('change', onFormEdited);
+    dom['out-fallback'].addEventListener('input', onFormEdited);
+    dom['out-fallback'].addEventListener('change', onFormEdited);
     dom['out-latency'].addEventListener('input', () => {
       showFormError('');
-      markFormDirty();
+      onFormEdited();
     });
 
     TP.bus.on('devices', () => {
@@ -370,12 +442,20 @@
     TP.bus.on('output', (payload) => {
       renderEffective();
       renderDevices();
-      syncForm(payload || state.output);
+      syncFormFromOutput(payload || state.output);
     });
 
     updateApplyEnabled();
+    paintDebug({ init: 'ok' });
     return refresh({ quiet: true });
   }
 
-  TP.output = { init, refresh, deviceName, activeLabel };
+  TP.output = {
+    init,
+    refresh,
+    deviceName,
+    activeLabel,
+    /** Runtime diagnostics for DevTools: copy(window.__TP_OUTPUT_DEBUG__) */
+    getDebug: () => window.__TP_OUTPUT_DEBUG__,
+  };
 })();
