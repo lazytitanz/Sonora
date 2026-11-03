@@ -33,13 +33,17 @@ Metadata (`IAudioMetadataReader` / `AudioMetadataReader`) lives in `Sonora.Audio
 |---|---|
 | Play / Pause / Stop / Seek / Load / Dispose | Command phases serialized with `SemaphoreSlim(1,1)` (`_gate`) |
 | Decoder seek / pump stop / prime | Run **off** `_gate` (and serialized with `_decoderSeekGate`) so a slow Media Foundation seek cannot freeze Pause/Stop/Dispose |
+| Decode-worker lifetime | **Worker completion** is authoritative for Seek / restart / decoder dispose; a stop-wait timeout only bounds the caller — the pipeline still owns a live worker (`HasOrphanDecodeWorker` is diagnostic) |
+| Dispose / DisposeAsync | Entering dispose is terminal (`DisposePending`: no new Seek/StartPump); decoder/ring release runs once after the worker exits; `DisposeAsync` awaits that release (timeout ≠ disposed) |
+| Stale pump stop | Off-gate `StopPump` completions check pipeline identity / generation so a delayed join cannot affect a newly promoted track |
 | Overlapping loads | Generation counter + cancellation; stale work discarded |
 | Ring buffer | Short critical section; consumer path is non-blocking |
-| Output callback | Never waits on the command gate; never opens files |
+| Output callback | Never waits on the command gate; never opens files; never runs dispose/cleanup continuations |
+| Output `Stopped` | Marshaled on a **dedicated thread** (not `Task.Run`) so device-loss recovery is not starved by blocked pool threads |
 | Events | May fire under the command gate; re-entering player commands from handlers is unsupported |
 | Output Stop / Shutdown / Dispose | Concurrent callers await the **same** shared completion (not merely skip duplicate work) |
 
-Ordered teardown: stop output → stop pump → dispose decoder/output (pump/output shutdown complete **off** the command gate).
+Ordered teardown: stop output → request pump cancel under `_gate` → join pump **off** `_gate` → dispose decoder/ring only after worker exit. A native `Decoder.Read` that never returns cannot be force-killed; ownership holds the decoder until the worker exits.
 
 ## Position model
 
@@ -51,10 +55,10 @@ Ordered teardown: stop output → stop pump → dispose decoder/output (pump/out
 Seek path (command gate released around long work):
 
 1. Under `_gate`: pause output, enter effects barrier, bump seek generation.
-2. Off `_gate`: stop pump / clear ring → `IAudioDecoder.Seek` (may block on Media Foundation) → optional ring prime.
+2. Off `_gate`: stop pump and **wait for worker exit** → clear ring → `IAudioDecoder.Seek` (may block on Media Foundation) → optional ring prime. If the worker has not exited after the caller wait bound, seek fails, the effects barrier is released, and playback lands in `Stopped` (not Playing+silence).
 3. Under `_gate`: reset DSP, rebase timeline, exit barrier; resume only if still playing (Pause mid-seek is honored; Stop supersedes via generation).
 
-`Stop` / natural EOS rewind the decoder to zero the same way (off `_gate`). Does not `Shutdown` WASAPI per seek.
+`Stop` / natural EOS rewind the decoder to zero the same way (off `_gate`, only after worker join + pipeline identity check). Does not `Shutdown` WASAPI per seek.
 
 Accuracy limits are documented in the README.
 

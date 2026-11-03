@@ -127,7 +127,7 @@ var seek = player.SeekWithResult(TimeSpan.FromSeconds(30));
 player.Stop();                         // resets to 00:00; clears next; does not raise PlaybackCompleted
 ```
 
-Seek and Stop’s decoder rewind release the command gate around `IAudioDecoder.Seek`, so other commands are not frozen during a slow Media Foundation seek. The calling thread can still block for the seek itself — from a UI thread, run seek work asynchronously (as the Test Player bridge does).
+Seek and Stop’s decoder rewind release the command gate around pump join / `IAudioDecoder.Seek`, so other commands are not frozen during a slow Media Foundation seek. Seek waits for the previous decode worker to exit before touching the decoder; the calling thread can still block for that join or the seek itself — from a UI thread, run seek work asynchronously (as the Test Player bridge does).
 
 ## Exclusive output (optional)
 
