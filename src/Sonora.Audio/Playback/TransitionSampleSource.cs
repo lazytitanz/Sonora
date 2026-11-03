@@ -1,4 +1,5 @@
 using Sonora.Audio.Abstractions;
+using Sonora.Audio.Diagnostics;
 using Sonora.Audio.DSP;
 using Sonora.Audio.Formats;
 
@@ -13,6 +14,18 @@ namespace Sonora.Audio.Playback;
 /// </summary>
 internal sealed class TransitionSampleSource : IPcmSampleSource
 {
+    /// <summary>
+    /// Caps consecutive empty-track promotions inside one <see cref="Read"/> to avoid
+    /// infinite loops when a queue of zero-length completed rings is promoted.
+    /// </summary>
+    private const int MaxEmptyPromotesPerRead = 16;
+
+    /// <summary>
+    /// After promoting onto an empty completed ring, keep-alive reads before terminal EOS
+    /// so hosts can BeginLoad the next track from TrackTransitioned without racing the latch.
+    /// </summary>
+    private const int EmptyPromoteGraceReads = 256;
+
     private readonly AudioFormat _format;
     private readonly AudioEffectRack _effects;
     private readonly Func<float> _getVolume;
@@ -24,9 +37,13 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
     private readonly Func<PromoteResult?> _tryPromoteNext;
     private readonly Func<bool> _hasPendingNext;
     private readonly Action<TrackTransitionedEventArgs> _scheduleTransitioned;
+    private readonly Action<SeekSilenceReason>? _onSilence;
+    private readonly Action? _onCallbackHeartbeat;
     private int _endOfStream;
     private int _effectsBarrier;
     private int _callbacksInRead;
+    private int _lastReportedSilence;
+    private int _emptyPromoteGraceRemaining;
 
     public TransitionSampleSource(
         AudioFormat format,
@@ -39,7 +56,9 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
         Func<PromoteResult?> tryPromoteNext,
         Func<bool> hasPendingNext,
         Action<TrackTransitionedEventArgs> scheduleTransitioned,
-        Func<bool>? isOutputSwitching = null)
+        Func<bool>? isOutputSwitching = null,
+        Action<SeekSilenceReason>? onSilence = null,
+        Action? onCallbackHeartbeat = null)
     {
         _format = format;
         _effects = effects;
@@ -52,11 +71,20 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
         _tryPromoteNext = tryPromoteNext;
         _hasPendingNext = hasPendingNext;
         _scheduleTransitioned = scheduleTransitioned;
+        _onSilence = onSilence;
+        _onCallbackHeartbeat = onCallbackHeartbeat;
     }
 
     public AudioFormat Format => _format;
 
+    /// <summary>
+    /// True when terminal session EOS is latched. Active-track EOF with a pending/ready next
+    /// must not remain latched — see <see cref="Read"/>.
+    /// </summary>
     public bool IsEndOfStream => Volatile.Read(ref _endOfStream) == 1;
+
+    /// <summary>1 when the effects barrier is armed.</summary>
+    public int EffectsBarrier => Volatile.Read(ref _effectsBarrier);
 
     public int Read(Span<float> destination)
     {
@@ -68,27 +96,62 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
         Interlocked.Increment(ref _callbacksInRead);
         try
         {
-            if (Volatile.Read(ref _effectsBarrier) == 1 || _isOutputSwitching())
+            try
             {
-                // Effects barrier: silence while seek resets DSP.
-                // Output switching: feed silence without draining the ring so a detached
-                // WASAPI/fake pull thread cannot advance samplesConsumed or steal primed PCM
-                // before Shutdown joins (keeps Position and post-rebind continuity coherent).
+                _onCallbackHeartbeat?.Invoke();
+            }
+            catch
+            {
+                // diagnostics must not throw
+            }
+
+            if (Volatile.Read(ref _effectsBarrier) == 1)
+            {
+                ReportSilence(SeekSilenceReason.EffectsBarrier);
                 destination.Clear();
                 return destination.Length;
             }
 
+            if (_isOutputSwitching())
+            {
+                // Feed silence without draining the ring so a detached WASAPI/fake pull thread
+                // cannot advance samplesConsumed or steal primed PCM before Shutdown joins.
+                ReportSilence(SeekSilenceReason.OutputSwitching);
+                destination.Clear();
+                return destination.Length;
+            }
+
+            // Sticky terminal EOS only when no gapless transition is still pending.
+            // If next is Loading/Ready, clear the latch and continue — active-track EOF ≠ session EOS.
             if (Volatile.Read(ref _endOfStream) == 1)
             {
-                destination.Clear();
-                return 0;
+                if (_hasPendingNext())
+                {
+                    Interlocked.Exchange(ref _endOfStream, 0);
+                }
+                else
+                {
+                    ReportSilence(SeekSilenceReason.EndOfStream);
+                    destination.Clear();
+                    return 0;
+                }
             }
 
             var filled = 0;
+            var emptyPromotes = 0;
             while (filled < destination.Length)
             {
-                if (Volatile.Read(ref _effectsBarrier) == 1 || _isOutputSwitching())
+                if (Volatile.Read(ref _effectsBarrier) == 1)
                 {
+                    ReportSilence(SeekSilenceReason.EffectsBarrier);
+                    destination[filled..].Clear();
+                    filled = destination.Length;
+                    break;
+                }
+
+                if (_isOutputSwitching())
+                {
+                    ReportSilence(SeekSilenceReason.OutputSwitching);
                     destination[filled..].Clear();
                     filled = destination.Length;
                     break;
@@ -97,7 +160,13 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
                 var active = _getActive();
                 if (active is null)
                 {
-                    Interlocked.Exchange(ref _endOfStream, 1);
+                    if (_hasPendingNext())
+                    {
+                        ReportPendingNextKeepAlive(destination, ref filled);
+                        break;
+                    }
+
+                    LatchTerminalEndOfStream();
                     break;
                 }
 
@@ -107,6 +176,8 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
                 {
                     filled += read;
                     _onSamplesConsumed(read);
+                    ReportSilence(SeekSilenceReason.None);
+                    emptyPromotes = 0;
                 }
 
                 if (filled == destination.Length)
@@ -121,33 +192,60 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
                         _onUnderrun();
                     }
 
+                    ReportSilence(SeekSilenceReason.Underrun);
                     destination[filled..].Clear();
                     filled = destination.Length;
                     break;
                 }
 
                 // Active completed and drained — try gapless promote into the same buffer.
+                // An empty completed next is a valid (zero-length) track: promote it, then continue.
+                // Do not latch terminal EOS while another next is still pending/ready.
                 var promote = _tryPromoteNext();
                 if (promote is not null)
                 {
                     _scheduleTransitioned(promote.EventArgs);
+                    emptyPromotes++;
+
+                    // If the promoted ring is already empty+completed, grant a short keep-alive
+                    // window for TrackTransitioned → PreloadNext BeginLoad before terminal EOS.
+                    var promoted = _getActive();
+                    if (promoted?.Ring is { IsCompleted: true, Count: 0 })
+                    {
+                        Volatile.Write(ref _emptyPromoteGraceRemaining, EmptyPromoteGraceReads);
+                    }
+                    else
+                    {
+                        Volatile.Write(ref _emptyPromoteGraceRemaining, 0);
+                    }
+
+                    if (emptyPromotes > MaxEmptyPromotesPerRead)
+                    {
+                        // Bound empty-track chains inside one callback; keep the device alive.
+                        ReportPendingNextKeepAlive(destination, ref filled);
+                        break;
+                    }
+
                     continue;
                 }
 
                 if (_hasPendingNext())
                 {
-                    // Next is Loading/Ready but promote could not run (lock contention) — keep WASAPI alive.
-                    if (_isPlaying())
-                    {
-                        _onUnderrun();
-                    }
-
-                    destination[filled..].Clear();
-                    filled = destination.Length;
+                    Volatile.Write(ref _emptyPromoteGraceRemaining, 0);
+                    // Next is Loading/Ready but promote could not run (lock contention or still loading).
+                    ReportPendingNextKeepAlive(destination, ref filled);
                     break;
                 }
 
-                Interlocked.Exchange(ref _endOfStream, 1);
+                var grace = Volatile.Read(ref _emptyPromoteGraceRemaining);
+                if (grace > 0)
+                {
+                    Volatile.Write(ref _emptyPromoteGraceRemaining, grace - 1);
+                    ReportPendingNextKeepAlive(destination, ref filled);
+                    break;
+                }
+
+                LatchTerminalEndOfStream();
                 break;
             }
 
@@ -183,6 +281,9 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
     public void ResetEndOfStream()
     {
         Interlocked.Exchange(ref _endOfStream, 0);
+        // Allow a fresh silence reason to be reported after recovery.
+        Volatile.Write(ref _lastReportedSilence, (int)SeekSilenceReason.None);
+        Volatile.Write(ref _emptyPromoteGraceRemaining, 0);
     }
 
     /// <summary>
@@ -228,6 +329,45 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
     public void ExitEffectsBarrier()
     {
         Volatile.Write(ref _effectsBarrier, 0);
+    }
+
+    private void LatchTerminalEndOfStream()
+    {
+        Interlocked.Exchange(ref _endOfStream, 1);
+        ReportSilence(SeekSilenceReason.EndOfStream);
+    }
+
+    private void ReportPendingNextKeepAlive(Span<float> destination, ref int filled)
+    {
+        // Keep WASAPI / pull loops alive with non-zero silence while gapless next is pending.
+        if (_isPlaying())
+        {
+            _onUnderrun();
+        }
+
+        ReportSilence(SeekSilenceReason.PendingNext);
+        destination[filled..].Clear();
+        filled = destination.Length;
+    }
+
+    private void ReportSilence(SeekSilenceReason reason)
+    {
+        var prior = Volatile.Read(ref _lastReportedSilence);
+        var code = (int)reason;
+        if (prior == code)
+        {
+            return;
+        }
+
+        Volatile.Write(ref _lastReportedSilence, code);
+        try
+        {
+            _onSilence?.Invoke(reason);
+        }
+        catch
+        {
+            // diagnostics must not throw
+        }
     }
 
     internal sealed class PromoteResult

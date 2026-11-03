@@ -1,3 +1,5 @@
+using Sonora.Audio.Diagnostics;
+using Sonora.Audio.Devices;
 using Sonora.Audio.Formats;
 using Sonora.Audio.Network;
 
@@ -95,4 +97,58 @@ public sealed record EngineSnapshotDto
 
     /// <summary><c>Underrun</c> events since startup.</summary>
     public int UnderrunEventsObserved { get; init; }
+
+    /// <summary>Samples written into the ring since the last timeline rebase.</summary>
+    public long SamplesDecoded { get; init; }
+
+    /// <summary>Samples consumed from the ring since the last timeline rebase.</summary>
+    public long SamplesConsumed { get; init; }
+
+    /// <summary>Nested in-flight seek count.</summary>
+    public int SeekInProgress { get; init; }
+
+    /// <summary>Effects barrier armed (1) or clear (0).</summary>
+    public int EffectsBarrier { get; init; }
+
+    /// <summary>Whether the active decode pump reports running.</summary>
+    public bool PumpRunning { get; init; }
+
+    /// <summary>Whether the active ring is completed and drained.</summary>
+    public bool RingCompleted { get; init; }
+
+    /// <summary>Last silence reason on the pull path.</summary>
+    public SeekSilenceReason LastSilenceReason { get; init; }
+
+    /// <summary>Output Read heartbeat timestamp (<see cref="System.Diagnostics.Stopwatch"/> ticks).</summary>
+    public long LastCallbackTimestamp { get; init; }
+
+    /// <summary>Output Read count.</summary>
+    public long CallbackCount { get; init; }
+
+    /// <summary>Last seek id that began.</summary>
+    public int LastSeekId { get; init; }
+
+    /// <summary>Last seek id that reached a terminal stage.</summary>
+    public int LastSeekTerminalId { get; init; }
+
+    /// <summary>Last gapless promote transition id.</summary>
+    public int LastPromoteTransitionId { get; init; }
+
+    /// <summary>StopPump join timeouts.</summary>
+    public long StopPumpTimeoutCount { get; init; }
+
+    /// <summary>StopPump timed out and decode worker may still touch the decoder.</summary>
+    public bool OrphanDecodeWorker { get; init; }
+
+    /// <summary>Seek-trace ring dropped events.</summary>
+    public long TraceDroppedCount { get; init; }
+
+    /// <summary>Seek-trace ring overwritten slots.</summary>
+    public long TraceOverwrittenCount { get; init; }
+
+    /// <summary>Output device status.</summary>
+    public OutputDeviceStatus OutputDeviceStatus { get; init; }
+
+    /// <summary>Active pipeline identity hash.</summary>
+    public int ActivePipelineId { get; init; }
 }

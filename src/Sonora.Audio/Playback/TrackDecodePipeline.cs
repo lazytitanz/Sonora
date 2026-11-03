@@ -13,7 +13,15 @@ namespace Sonora.Audio.Playback;
 internal sealed class TrackDecodePipeline : IDisposable
 {
     private DecodePump? _pump;
+    /// <summary>
+    /// Last pump instance for diagnostics after <see cref="StopPumpAsync"/> nulls <see cref="_pump"/>.
+    /// A timed-out stop does not prove the worker exited; this keeps <see cref="IsPumpRunning"/> accurate.
+    /// </summary>
+    private DecodePump? _observedPump;
     private bool _disposed;
+    private int _lastStopTimedOut;
+    private long _stopPumpTimeoutCount;
+    private Action? _onDecodeWorkerAliveAfterStop;
 
     public TrackDecodePipeline(
         string path,
@@ -48,7 +56,31 @@ internal sealed class TrackDecodePipeline : IDisposable
     public PcmRingBuffer Ring { get; }
     public TimeSpan Duration { get; }
     public AudioFormat Format { get; }
-    public bool IsPumpRunning => _pump?.IsRunning == true;
+    /// <summary>
+    /// True when a decode worker task is still incomplete, including after a StopPump timeout
+    /// where the pipeline cleared its active pump reference.
+    /// </summary>
+    public bool IsPumpRunning => Volatile.Read(ref _observedPump)?.IsRunning == true
+        || Volatile.Read(ref _pump)?.IsRunning == true;
+
+    /// <summary>True when the most recent StopPump timed out before the worker joined.</summary>
+    public bool LastStopTimedOut => Volatile.Read(ref _lastStopTimedOut) != 0;
+
+    /// <summary>
+    /// True when StopPump timed out and the worker may still be inside Decoder.Read/Seek.
+    /// Timeout alone is never treated as proof of exit.
+    /// </summary>
+    public bool HasOrphanDecodeWorker => LastStopTimedOut && IsPumpRunning;
+
+    /// <summary>Cumulative StopPump join timeouts for this pipeline.</summary>
+    public long StopPumpTimeoutCount => Volatile.Read(ref _stopPumpTimeoutCount);
+
+    /// <summary>Optional diagnostics callback when a decode worker is still alive after StopPump timeout.</summary>
+    public Action? OnDecodeWorkerAliveAfterStop
+    {
+        get => _onDecodeWorkerAliveAfterStop;
+        set => _onDecodeWorkerAliveAfterStop = value;
+    }
 
     public static TrackDecodePipeline Create(
         AudioSource source,
@@ -101,7 +133,20 @@ internal sealed class TrackDecodePipeline : IDisposable
             Ring,
             processors,
             onSamplesWritten,
-            onError);
+            onError,
+            onStillAliveAfterCancel: () =>
+            {
+                try
+                {
+                    _onDecodeWorkerAliveAfterStop?.Invoke();
+                }
+                catch
+                {
+                    // diagnostics must not throw
+                }
+            });
+        Volatile.Write(ref _observedPump, _pump);
+        Volatile.Write(ref _lastStopTimedOut, 0);
         _pump.Start();
     }
 
@@ -123,15 +168,34 @@ internal sealed class TrackDecodePipeline : IDisposable
         _pump = null;
         if (pump is null)
         {
+            // Prior stop may have left an orphan; do not clear LastStopTimedOut here.
             return;
         }
 
         try
         {
             await pump.StopAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+            if (pump.StopTimedOut || pump.IsRunning)
+            {
+                // Timeout alone is not proof of exit — IsRunning may still be true.
+                // Seek/Reset/Dispose that proceeds to Decoder.Seek/Dispose while this is true
+                // races a worker that may still be inside Decoder.Read.
+                Volatile.Write(ref _lastStopTimedOut, 1);
+                Interlocked.Increment(ref _stopPumpTimeoutCount);
+                Volatile.Write(ref _observedPump, pump);
+            }
+            else
+            {
+                Volatile.Write(ref _lastStopTimedOut, 0);
+                if (ReferenceEquals(Volatile.Read(ref _observedPump), pump))
+                {
+                    Volatile.Write(ref _observedPump, null);
+                }
+            }
         }
         finally
         {
+            // Dispose cancels the CTS only; it does not join a timed-out worker.
             pump.Dispose();
         }
     }

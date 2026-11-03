@@ -143,6 +143,25 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     /// </summary>
     private int _seekInProgress;
 
+    /// <summary>Multi-producer seek/playback lifecycle trace (audio-thread safe).</summary>
+    private readonly SeekLifecycleTraceRing _seekTrace = new();
+    private int _nextSeekId;
+    private int _lastSeekId;
+    private int _lastSeekTerminalId;
+    private int _lastPromoteTransitionId;
+    private int _lastSilenceReason;
+    private long _lastCallbackTimestamp;
+    private long _callbackCount;
+    private long _stopPumpTimeoutCount;
+    private int _externalSeekId;
+    /// <summary>Counts concurrent SeekWithResult bodies (distinct from position-freeze <see cref="_seekInProgress"/>).</summary>
+    private int _seekBodiesInFlight;
+
+    /// <summary>
+    /// Optional test hook invoked at seek phases (never on the audio callback). Null in production.
+    /// </summary>
+    internal Action<SeekLifecycleStage, int>? SeekTestHook { get; set; }
+
     /// <summary>Creates a player. Prefer <see cref="AudioEngine.CreatePlayer"/>.</summary>
     public AudioPlayer(
         IAudioDecoderFactory decoderFactory,
@@ -358,15 +377,178 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         }
     }
 
-    /// <summary>Returns a diagnostics snapshot.</summary>
+    /// <summary>
+    /// Returns a diagnostics snapshot using atomics / volatile reads only.
+    /// Does not wait on the command gate, decoder seek gate, or pipeline lock.
+    /// </summary>
     public PlaybackDiagnostics GetDiagnostics()
     {
+        var active = Volatile.Read(ref _active);
+        var sampleSource = Volatile.Read(ref _sampleSource);
         return new PlaybackDiagnostics
         {
             UnderrunCount = Interlocked.Read(ref _underrunCount),
-            BufferCapacitySamples = _active?.Ring.Capacity ?? 0,
-            BufferedSamples = _active?.Ring.Count ?? 0,
+            BufferCapacitySamples = active?.Ring.Capacity ?? 0,
+            BufferedSamples = active?.Ring.Count ?? 0,
+            SamplesDecoded = Interlocked.Read(ref _samplesDecoded),
+            SamplesConsumed = Interlocked.Read(ref _samplesConsumed),
+            SeekInProgress = Volatile.Read(ref _seekInProgress),
+            EffectsBarrier = sampleSource?.EffectsBarrier ?? 0,
+            PumpRunning = active?.IsPumpRunning == true,
+            RingCompleted = active?.Ring.IsCompleted == true,
+            SessionGeneration = Volatile.Read(ref _generation),
+            ActiveTrackGeneration = Volatile.Read(ref _activeTrackGeneration),
+            TransitionId = Volatile.Read(ref _transitionId),
+            AcceptEndOfStreamCompletion = Volatile.Read(ref _acceptEndOfStreamCompletion) != 0,
+            State = _state,
+            OutputDeviceStatus = _outputDeviceStatus,
+            NextTrackState = _next.State,
+            NetworkStatus = _networkStatus,
+            LastSilenceReason = (SeekSilenceReason)Volatile.Read(ref _lastSilenceReason),
+            LastCallbackTimestamp = Volatile.Read(ref _lastCallbackTimestamp),
+            CallbackCount = Interlocked.Read(ref _callbackCount),
+            LastSeekId = Volatile.Read(ref _lastSeekId),
+            LastSeekTerminalId = Volatile.Read(ref _lastSeekTerminalId),
+            LastPromoteTransitionId = Volatile.Read(ref _lastPromoteTransitionId),
+            StopPumpTimeoutCount = Interlocked.Read(ref _stopPumpTimeoutCount),
+            OrphanDecodeWorker = active?.HasOrphanDecodeWorker == true,
+            TraceDroppedCount = _seekTrace.DroppedCount,
+            TraceOverwrittenCount = _seekTrace.OverwrittenCount,
+            ActivePipelineId = active is null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(active),
+            SourcePath = Volatile.Read(ref _sourcePath),
         };
+    }
+
+    /// <summary>
+    /// Copies recent seek lifecycle events (oldest first among retained). Best-effort; never blocks on player locks.
+    /// </summary>
+    public int CopySeekLifecycleTrace(Span<SeekLifecycleEvent> destination, out long droppedCount, out long overwrittenCount)
+        => _seekTrace.CopyRecent(destination, out droppedCount, out overwrittenCount);
+
+    /// <summary>
+    /// Associates an external correlation id with the next <see cref="Seek"/> / <see cref="SeekWithResult"/>
+    /// on this player (Test Player / host). Cleared when the seek begins.
+    /// </summary>
+    public void SetNextSeekCorrelationId(int seekId)
+        => Volatile.Write(ref _externalSeekId, seekId);
+
+    private int AllocateSeekId()
+    {
+        var external = Interlocked.Exchange(ref _externalSeekId, 0);
+        var id = external != 0 ? external : Interlocked.Increment(ref _nextSeekId);
+        Volatile.Write(ref _lastSeekId, id);
+        return id;
+    }
+
+    private void RecordSeekTrace(
+        SeekLifecycleStage stage,
+        int seekId,
+        TrackDecodePipeline? pipeline = null,
+        TimeSpan? requested = null,
+        TimeSpan? actual = null,
+        short accuracy = -1,
+        short outcome = 0,
+        SeekSilenceReason silence = SeekSilenceReason.None,
+        int extraFlags = 0)
+    {
+        var active = pipeline ?? Volatile.Read(ref _active);
+        var sampleSource = Volatile.Read(ref _sampleSource);
+        var flags = extraFlags;
+        if (sampleSource is { EffectsBarrier: 1 })
+        {
+            flags |= 1;
+        }
+
+        if (active?.IsPumpRunning == true)
+        {
+            flags |= 2;
+        }
+
+        if (active?.Ring.IsCompleted == true)
+        {
+            flags |= 4;
+        }
+
+        if (Volatile.Read(ref _seekInProgress) > 0)
+        {
+            flags |= 8;
+        }
+
+        var next = _next.State;
+        if (next == NextTrackState.Ready)
+        {
+            flags |= 16;
+        }
+        else if (next == NextTrackState.Loading)
+        {
+            flags |= 32;
+        }
+
+        if (active?.LastStopTimedOut == true)
+        {
+            flags |= 64;
+        }
+
+        var evt = new SeekLifecycleEvent
+        {
+            Timestamp = System.Diagnostics.Stopwatch.GetTimestamp(),
+            SeekId = seekId,
+            SessionGeneration = Volatile.Read(ref _generation),
+            TrackGeneration = Volatile.Read(ref _activeTrackGeneration),
+            PipelineId = active is null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(active),
+            Stage = stage,
+            SilenceReason = silence,
+            RequestedTicks = requested?.Ticks ?? 0,
+            ActualTicks = actual?.Ticks ?? long.MinValue,
+            Accuracy = accuracy,
+            Outcome = outcome,
+            RingCount = active?.Ring.Count ?? 0,
+            SamplesDecoded = Interlocked.Read(ref _samplesDecoded),
+            SamplesConsumed = Interlocked.Read(ref _samplesConsumed),
+            Flags = flags,
+        };
+        _seekTrace.Record(ref evt);
+
+        if (stage is SeekLifecycleStage.Commit or SeekLifecycleStage.Superseded or SeekLifecycleStage.Failed
+            or SeekLifecycleStage.ControllerCoalesced)
+        {
+            Volatile.Write(ref _lastSeekTerminalId, seekId);
+        }
+
+        try
+        {
+            SeekTestHook?.Invoke(stage, seekId);
+        }
+        catch
+        {
+            // test hooks must not break seeks
+        }
+    }
+
+    private void OnOutputCallbackHeartbeat()
+    {
+        Interlocked.Increment(ref _callbackCount);
+        Volatile.Write(ref _lastCallbackTimestamp, System.Diagnostics.Stopwatch.GetTimestamp());
+    }
+
+    private void OnPullSilence(SeekSilenceReason reason)
+    {
+        Volatile.Write(ref _lastSilenceReason, (int)reason);
+        if (reason == SeekSilenceReason.None)
+        {
+            return;
+        }
+
+        // Sparse: only when reason changes (TransitionSampleSource already dedupes).
+        RecordSeekTrace(
+            SeekLifecycleStage.ReadSilence,
+            seekId: Volatile.Read(ref _lastSeekId),
+            silence: reason);
+    }
+
+    private void OnDecodeWorkerAliveAfterStop()
+    {
+        RecordSeekTrace(SeekLifecycleStage.DecodeWorkerAliveAfterStop, Volatile.Read(ref _lastSeekId));
     }
 
     /// <summary>
@@ -461,10 +643,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
             releasedExclusiveDevice = _effectiveOutputMode == AudioOutputMode.Exclusive;
             // Mark Switching before Detach so the still-running pull path feeds silence without
-            // draining the ring (see TransitionSampleSource.isOutputSwitching).
+            // draining the ring (see TransitionSampleSource.isOutputSwitching). Raise the event
+            // after Detach so ActiveDeviceId is null while status is Switching.
             _outputDeviceStatus = OutputDeviceStatus.Switching;
-            RaiseOutputDeviceChanged(OutputDeviceChangeReason.Switching);
             oldOutput = DetachOutput_NoLock();
+            RaiseOutputDeviceChanged(OutputDeviceChangeReason.Switching);
         }
         finally
         {
@@ -594,9 +777,10 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
                 _effectiveOutputMode = null;
                 // Mark Switching before Detach so the pull path stops draining the ring.
+                // Raise after Detach so ActiveDeviceId is null while status is Switching.
                 _outputDeviceStatus = OutputDeviceStatus.Switching;
-                RaiseOutputDeviceChanged(OutputDeviceChangeReason.Switching);
                 oldOutput = DetachOutput_NoLock();
+                RaiseOutputDeviceChanged(OutputDeviceChangeReason.Switching);
             }
         }
         finally
@@ -1020,6 +1204,25 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             }
 
             pipeline = null;
+
+            // Next became Ready after active-track EOS may already have stopped the output.
+            // Kick recovery under the gate so Playing is not left with a stopped pull loop.
+            await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+            try
+            {
+                if (!_disposed
+                    && _hasSource
+                    && _next.IsCurrentGeneration(preloadGeneration)
+                    && _next.State == NextTrackState.Ready
+                    && _state is PlaybackState.Playing or PlaybackState.Buffering)
+                {
+                    RecoverPlaybackAfterNonTerminalEos_NoLock();
+                }
+            }
+            finally
+            {
+                _gate.Release();
+            }
         }
         catch (OperationCanceledException)
         {
@@ -1204,13 +1407,26 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentOutOfRangeException.ThrowIfLessThan(position, TimeSpan.Zero);
 
-        TrackDecodePipeline active;
-        TransitionSampleSource? sampleSource;
+        var seekId = AllocateSeekId();
+        var bodies = Interlocked.Increment(ref _seekBodiesInFlight);
+        if (bodies > 1)
+        {
+            // Evidence for boolean-barrier hypothesis: overlapping SeekWithResult bodies.
+            RecordSeekTrace(SeekLifecycleStage.SeekOverlapEnter, seekId, requested: position, extraFlags: bodies);
+        }
+
+        TrackDecodePipeline active = null!;
+        TransitionSampleSource? sampleSource = null;
         var wasPlaying = false;
         var wasPaused = false;
         var previousHeld = TimeSpan.Zero;
         var seekGeneration = 0;
+        var seekFreezeHeld = false;
 
+        RecordSeekTrace(SeekLifecycleStage.SeekBegin, seekId, requested: position);
+
+        try
+        {
         _gate.Wait();
         try
         {
@@ -1229,9 +1445,12 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 sampleSource?.ArmEffectsBarrier();
             }
 
+            RecordSeekTrace(SeekLifecycleStage.ArmBarrier, seekId, active, requested: position);
+
             if (!active.Decoder.CanSeek)
             {
                 sampleSource?.ExitEffectsBarrier();
+                RecordSeekTrace(SeekLifecycleStage.Failed, seekId, active, requested: position, outcome: 3);
                 throw new NotSupportedException("The current audio source does not support seeking.");
             }
 
@@ -1252,6 +1471,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 : _heldPosition;
             _heldPosition = previousHeld;
             Interlocked.Increment(ref _seekInProgress);
+            seekFreezeHeld = true;
         }
         finally
         {
@@ -1263,10 +1483,9 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         // callback before DSP reset. Keep it short so Seek reaches Decoder.Seek promptly
         // (concurrent Pause/Stop tests and UI must not sit behind a multi-second spin).
         sampleSource?.WaitEffectsBarrier(TimeSpan.FromMilliseconds(100));
+        RecordSeekTrace(SeekLifecycleStage.WaitBarrier, seekId, active, requested: position);
 
         AudioSeekResult result;
-        try
-        {
             try
             {
                 // Abort before StopPump / MF seek when promote/load already replaced this pipeline.
@@ -1274,11 +1493,35 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 if (seekGeneration != Volatile.Read(ref _activeTrackGeneration)
                     || !ReferenceEquals(Volatile.Read(ref _active), active))
                 {
+                    RecordSeekTrace(SeekLifecycleStage.Superseded, seekId, active, requested: position, outcome: 2);
                     throw new InvalidOperationException("Seek was superseded by another session operation.");
                 }
 
                 // StopPump / Decoder.Seek / Clear must not run under _gate (see TrackDecodePipeline.StopPump).
+                RecordSeekTrace(SeekLifecycleStage.StopPumpEnter, seekId, active, requested: position);
+                active.OnDecodeWorkerAliveAfterStop = OnDecodeWorkerAliveAfterStop;
                 active.StopPump();
+                if (active.LastStopTimedOut)
+                {
+                    Interlocked.Increment(ref _stopPumpTimeoutCount);
+                    // Flags bit1 = pump still running (orphan). Timeout ≠ exited.
+                    RecordSeekTrace(
+                        SeekLifecycleStage.StopPumpTimeout,
+                        seekId,
+                        active,
+                        requested: position,
+                        outcome: 5,
+                        extraFlags: active.IsPumpRunning ? 2 : 0);
+                    if (active.HasOrphanDecodeWorker)
+                    {
+                        RecordSeekTrace(SeekLifecycleStage.DecodeWorkerAliveAfterStop, seekId, active, requested: position);
+                    }
+                }
+                else
+                {
+                    RecordSeekTrace(SeekLifecycleStage.StopPumpExit, seekId, active, requested: position);
+                }
+
                 active.Ring.Clear();
                 sampleSource?.ResetEndOfStream();
 
@@ -1291,15 +1534,18 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 if (seekGeneration != Volatile.Read(ref _activeTrackGeneration)
                     || !ReferenceEquals(Volatile.Read(ref _active), active))
                 {
+                    RecordSeekTrace(SeekLifecycleStage.Superseded, seekId, active, requested: position, outcome: 2);
                     throw new InvalidOperationException("Seek was superseded by another session operation.");
                 }
 
+                RecordSeekTrace(SeekLifecycleStage.DecoderSeekEnter, seekId, active, requested: position);
                 _decoderSeekGate.Wait();
                 try
                 {
                     if (seekGeneration != Volatile.Read(ref _activeTrackGeneration)
                         || !ReferenceEquals(Volatile.Read(ref _active), active))
                     {
+                        RecordSeekTrace(SeekLifecycleStage.Superseded, seekId, active, requested: position, outcome: 2);
                         throw new InvalidOperationException("Seek was superseded by another session operation.");
                     }
 
@@ -1309,12 +1555,28 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 {
                     _decoderSeekGate.Release();
                 }
+
+                RecordSeekTrace(
+                    SeekLifecycleStage.DecoderSeekExit,
+                    seekId,
+                    active,
+                    requested: result.RequestedPosition,
+                    actual: result.ActualPosition,
+                    accuracy: (short)result.Accuracy,
+                    outcome: 1);
             }
-            catch
+            catch (Exception ex)
             {
+                var superseded = ex is InvalidOperationException;
+                if (!superseded)
+                {
+                    RecordSeekTrace(SeekLifecycleStage.Failed, seekId, active, requested: position, outcome: 3);
+                }
+
                 _gate.Wait();
                 try
                 {
+                    RecordSeekTrace(SeekLifecycleStage.RestoreAfterFail, seekId, active, requested: position);
                     RestoreAfterFailedSeek_NoLock(
                         active,
                         sampleSource,
@@ -1347,10 +1609,12 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                         _gate.Release();
                     }
 
+                    RecordSeekTrace(SeekLifecycleStage.Prime, seekId, active, requested: position);
                     active.Prime(_options.PrimeDuration);
                 }
                 catch
                 {
+                    RecordSeekTrace(SeekLifecycleStage.Failed, seekId, active, requested: position, outcome: 3);
                     _gate.Wait();
                     try
                     {
@@ -1373,6 +1637,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                     || !ReferenceEquals(_active, active))
                 {
                     sampleSource?.ExitEffectsBarrier();
+                    RecordSeekTrace(SeekLifecycleStage.Superseded, seekId, active, requested: position, outcome: 2);
                     throw new InvalidOperationException("Seek was superseded by another session operation.");
                 }
 
@@ -1417,10 +1682,20 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                             // Replacement output may attach concurrently; next command path recovers.
                         }
                     }
+
+                    RecordSeekTrace(
+                        SeekLifecycleStage.Commit,
+                        seekId,
+                        active,
+                        requested: result.RequestedPosition,
+                        actual: result.ActualPosition,
+                        accuracy: (short)result.Accuracy,
+                        outcome: 1);
                 }
                 finally
                 {
                     sampleSource?.ExitEffectsBarrier();
+                    RecordSeekTrace(SeekLifecycleStage.ExitBarrier, seekId, active, requested: position);
                 }
 
                 return result.EnsureInvariants();
@@ -1432,7 +1707,16 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         }
         finally
         {
-            Interlocked.Decrement(ref _seekInProgress);
+            if (seekFreezeHeld)
+            {
+                Interlocked.Decrement(ref _seekInProgress);
+            }
+
+            var remainingBodies = Interlocked.Decrement(ref _seekBodiesInFlight);
+            if (bodies > 1)
+            {
+                RecordSeekTrace(SeekLifecycleStage.SeekOverlapExit, seekId, requested: position, extraFlags: remainingBodies);
+            }
         }
     }
 
@@ -2081,11 +2365,19 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             }
 
             transitionId = Interlocked.Increment(ref _transitionId);
+            Volatile.Write(ref _lastPromoteTransitionId, transitionId);
+            nextPipeline.OnDecodeWorkerAliveAfterStop = OnDecodeWorkerAliveAfterStop;
         }
         finally
         {
             Monitor.Exit(_pipelineSync);
         }
+
+        RecordSeekTrace(
+            SeekLifecycleStage.Promote,
+            seekId: Volatile.Read(ref _lastSeekId),
+            pipeline: nextPipeline,
+            extraFlags: transitionId);
 
         var args = new TrackTransitionedEventArgs(previousPath, nextPath, previousDuration, transitionId);
         var toDispose = previous;
@@ -2165,6 +2457,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             return;
         }
 
+        active.OnDecodeWorkerAliveAfterStop = OnDecodeWorkerAliveAfterStop;
         active.StartPump(
             _options.Processors,
             onSamplesWritten: n => Interlocked.Add(ref _samplesDecoded, n),
@@ -2398,37 +2691,18 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     /// <summary>
     /// Handles <see cref="IAudioOutput.Stopped"/>. Internal for deterministic stale-sender tests.
     /// </summary>
+    /// <remarks>
+    /// Always marshals off the output pull / WASAPI callback thread. Handling EOS synchronously
+    /// on that thread previously deadlocked: <see cref="StopTransport_NoLock"/> called
+    /// <c>IAudioOutput.Stop()</c> which joins the same pull thread while holding <c>_gate</c>,
+    /// leaving later <see cref="SeekWithResult"/> stuck after <c>SeekBegin</c> with no ArmBarrier
+    /// (manual Duration+10 dump Seek 16).
+    /// </remarks>
     internal void OnOutputStopped(object? sender, AudioOutputStoppedEventArgs e)
     {
-        // Never invoke ErrorOccurred on the output callback / Stopped thread while also taking the
-        // command gate: Post handling onto a worker and raise errors from HandleOutputStopped after
-        // classifying EOS vs failure (EOS must not RaiseError).
         // Capture sender so a deferred handler cannot apply a stale Stopped to a replacement output.
-        if (!_gate.Wait(0))
-        {
-            _ = Task.Run(() => HandleOutputStopped(sender, e));
-            return;
-        }
-
-        try
-        {
-            HandleOutputStopped_NoLock(sender, e);
-        }
-        catch (ObjectDisposedException)
-        {
-            // Gate may be contended during teardown; ignore late callbacks.
-        }
-        finally
-        {
-            try
-            {
-                _gate.Release();
-            }
-            catch (ObjectDisposedException)
-            {
-                // ignored — gate is never disposed now, but keep defensive
-            }
-        }
+        // Never take _gate or call output.Stop on the raising thread.
+        _ = Task.Run(() => HandleOutputStopped(sender, e));
     }
 
     private void HandleOutputStopped(object? sender, AudioOutputStoppedEventArgs e)
@@ -2442,9 +2716,10 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             return;
         }
 
+        TrackDecodePipeline? decoderReset = null;
         try
         {
-            HandleOutputStopped_NoLock(sender, e);
+            decoderReset = HandleOutputStopped_NoLock(sender, e);
         }
         finally
         {
@@ -2457,58 +2732,66 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 // ignored
             }
         }
+
+        if (decoderReset is not null)
+        {
+            // Must not Decoder.Seek under the gate (may block on Media Foundation).
+            ApplyDecoderResetToStart(decoderReset);
+        }
     }
 
-    private void HandleOutputStopped_NoLock(object? sender, AudioOutputStoppedEventArgs e)
+    /// <summary>
+    /// Classifies output Stopped under the command gate. Returns a pipeline that needs an off-gate
+    /// decoder rewind after terminal EOS, or <see langword="null"/>.
+    /// </summary>
+    private TrackDecodePipeline? HandleOutputStopped_NoLock(object? sender, AudioOutputStoppedEventArgs e)
     {
         if (_disposed || !_hasSource)
         {
-            return;
+            return null;
         }
 
         // Ignore Stopped from an output that is no longer current (stale deferred callback).
         if (!ReferenceEquals(sender, _output))
         {
-            return;
+            return null;
         }
 
         if (e.ReachedEndOfStream)
         {
             if (Volatile.Read(ref _acceptEndOfStreamCompletion) == 0)
             {
-                return;
+                return null;
             }
 
-            // If a next track became ready after EOS signaling started, do not complete the session.
-            if (_next.State == NextTrackState.Ready)
+            // Active-track / device EOS while gapless next is Ready or still Loading is NOT
+            // terminal session completion. Recover so Playing is never left with a stopped output.
+            var nextState = _next.State;
+            if (nextState is NextTrackState.Ready or NextTrackState.Loading)
             {
-                return;
+                RecoverPlaybackAfterNonTerminalEos_NoLock();
+                return null;
             }
 
             // Ignore spurious device EOS at a gapless A|B boundary: the sample source is still live
             // after next was promoted (slot empty) but before the session has truly ended.
             if (_sampleSource is { IsEndOfStream: false })
             {
-                return;
+                return null;
             }
 
             if (_state is PlaybackState.Playing or PlaybackState.Paused or PlaybackState.Buffering)
             {
                 _activeTrackGeneration++;
-                var decoderReset = StopTransport_NoLock(resetToStart: true, raiseCompletion: true);
-                if (decoderReset is not null)
-                {
-                    // Must not Decoder.Seek under the gate (may block on Media Foundation).
-                    _ = Task.Run(() => ApplyDecoderResetToStart(decoderReset));
-                }
+                return StopTransport_NoLock(resetToStart: true, raiseCompletion: true);
             }
 
-            return;
+            return null;
         }
 
         if (e.Exception is null)
         {
-            return;
+            return null;
         }
 
         RaiseError(e.Exception);
@@ -2561,6 +2844,58 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             {
                 RaiseOutputDeviceChanged(OutputDeviceChangeReason.Unavailable);
             }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Clears sticky sample-source EOS and restarts the pull loop when gapless next is still
+    /// Ready/Loading. Prevents <see cref="PlaybackState.Playing"/> with a stopped output after
+    /// device EOS was observed before the next track could promote. Also undoes a false terminal
+    /// <see cref="PlaybackState.Stopped"/> completion when next became Ready afterward.
+    /// </summary>
+    private void RecoverPlaybackAfterNonTerminalEos_NoLock()
+    {
+        if (_disposed || !_hasSource || _output is null)
+        {
+            return;
+        }
+
+        // False session completion: device EOS raced ahead of gapless preload/promote.
+        if (_state == PlaybackState.Stopped
+            && _completionRaised
+            && _next.State is NextTrackState.Ready or NextTrackState.Loading)
+        {
+            _completionRaised = false;
+            SetState_NoLock(PlaybackState.Playing);
+        }
+
+        if (_state is not (PlaybackState.Playing or PlaybackState.Buffering))
+        {
+            return;
+        }
+
+        _sampleSource?.ResetEndOfStream();
+        EnsureActivePumpRunning_NoLock();
+        Volatile.Write(ref _acceptEndOfStreamCompletion, 1);
+
+        RecordSeekTrace(
+            SeekLifecycleStage.GaplessRecover,
+            seekId: Volatile.Read(ref _lastSeekId),
+            silence: SeekSilenceReason.PendingNext);
+
+        try
+        {
+            _output.Play();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Replacement output may attach concurrently; next command path recovers.
+        }
+        catch (InvalidOperationException)
+        {
+            // Shutdown mid-recover — ignore.
         }
     }
 
@@ -3066,10 +3401,21 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             isPlaying: () => _state == PlaybackState.Playing,
             getActive: () =>
             {
-                lock (_pipelineSync)
+                // Best-effort without blocking: TryEnter so a contended pipeline lock
+                // cannot stall the audio callback during seek/promote diagnostics.
+                if (Monitor.TryEnter(_pipelineSync))
                 {
-                    return _active;
+                    try
+                    {
+                        return _active;
+                    }
+                    finally
+                    {
+                        Monitor.Exit(_pipelineSync);
+                    }
                 }
+
+                return Volatile.Read(ref _active);
             },
             tryPromoteNext: TryPromoteNextFromCallback,
             hasPendingNext: () =>
@@ -3078,7 +3424,9 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 return s is NextTrackState.Ready or NextTrackState.Loading;
             },
             scheduleTransitioned: ScheduleTrackTransitioned,
-            isOutputSwitching: () => _outputDeviceStatus == OutputDeviceStatus.Switching);
+            isOutputSwitching: () => _outputDeviceStatus == OutputDeviceStatus.Switching,
+            onSilence: OnPullSilence,
+            onCallbackHeartbeat: OnOutputCallbackHeartbeat);
 
     private void BindNetworkInfo_NoLock(INetworkTransportInfo? info)
     {

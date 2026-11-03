@@ -38,6 +38,7 @@
     completed: 'playback.completed',
     queueChanged: 'queue.changed',
     diagnosticEvent: 'diagnostics.event',
+    stall: 'diagnostics.stall',
     resources: 'diagnostics.resources',
     devicesChanged: 'devices.changed',
     outputChanged: 'output.changed',

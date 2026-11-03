@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Sonora.Audio;
+using Sonora.Audio.Diagnostics;
 using Sonora.Audio.Formats;
 using Sonora.Audio.Playback;
 using Sonora.Audio.Sources;
@@ -430,22 +431,36 @@ public sealed class PlaybackController : IAsyncDisposable
 
     /// <summary>Seeks to a position. Invalid positions are rejected by the engine.</summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="positionMs"/> is negative or not finite.</exception>
-    public void Seek(double positionMs)
+    public void Seek(double positionMs, int correlationId = 0)
     {
         ThrowIfDisposed();
         _ = ToPosition(positionMs); // validate before publishing
         Volatile.Write(ref _latestSeekMs, positionMs);
         var ticket = Interlocked.Increment(ref _seekTicket);
+        Log(
+            DiagnosticLevel.Debug,
+            "playback.seek.enter",
+            "Seek enter.",
+            ("correlationId", correlationId.ToString()),
+            ("ticket", ticket.ToString()),
+            ("positionMs", positionMs.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)));
         _seekGate.Wait();
         try
         {
             ThrowIfDisposed();
             if (ticket != Volatile.Read(ref _seekTicket))
             {
+                Log(DiagnosticLevel.Debug, "playback.seek.coalesced", "Seek coalesced.", ("correlationId", correlationId.ToString()));
                 return;
             }
 
-            RequirePlayer().Seek(ToPosition(Volatile.Read(ref _latestSeekMs)));
+            var player = RequirePlayer();
+            if (correlationId != 0)
+            {
+                player.SetNextSeekCorrelationId(correlationId);
+            }
+
+            player.Seek(ToPosition(Volatile.Read(ref _latestSeekMs)));
         }
         finally
         {
@@ -455,12 +470,19 @@ public sealed class PlaybackController : IAsyncDisposable
 
     /// <summary>Seeks and reports requested vs actual landing position.</summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="positionMs"/> is negative or not finite.</exception>
-    public SeekResultDto SeekWithResult(double positionMs)
+    public SeekResultDto SeekWithResult(double positionMs, int correlationId = 0)
     {
         ThrowIfDisposed();
         _ = ToPosition(positionMs); // validate before publishing
         Volatile.Write(ref _latestSeekMs, positionMs);
         var ticket = Interlocked.Increment(ref _seekTicket);
+        Log(
+            DiagnosticLevel.Debug,
+            "playback.seek.enter",
+            "SeekWithResult enter.",
+            ("correlationId", correlationId.ToString()),
+            ("ticket", ticket.ToString()),
+            ("positionMs", positionMs.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)));
         _seekGate.Wait();
         try
         {
@@ -471,15 +493,23 @@ public sealed class PlaybackController : IAsyncDisposable
                 // Coalesced must not be confused with a real decoder Unknown accuracy (UI was
                 // swallowing every post-gapless Unknown seek as "skipped").
                 var skipped = ToPosition(Volatile.Read(ref _latestSeekMs));
+                Log(DiagnosticLevel.Debug, "playback.seek.coalesced", "SeekWithResult coalesced.", ("correlationId", correlationId.ToString()));
                 return SeekResultDto.CoalescedSkip(skipped.TotalMilliseconds);
             }
 
-            var result = RequirePlayer().SeekWithResult(ToPosition(Volatile.Read(ref _latestSeekMs)));
+            var player = RequirePlayer();
+            if (correlationId != 0)
+            {
+                player.SetNextSeekCorrelationId(correlationId);
+            }
+
+            var result = player.SeekWithResult(ToPosition(Volatile.Read(ref _latestSeekMs)));
             var dto = SeekResultDto.From(result);
             Log(
                 DiagnosticLevel.Info,
                 "playback.seek",
                 $"Seek {dto.Accuracy}.",
+                ("correlationId", correlationId.ToString()),
                 ("requestedMs", dto.RequestedMs.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)),
                 ("actualMs", dto.ActualMs?.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) ?? "unknown"));
             return dto;
@@ -488,6 +518,47 @@ public sealed class PlaybackController : IAsyncDisposable
         {
             _seekGate.Release();
         }
+    }
+
+    /// <summary>Copies recent seek lifecycle events from the engine (best-effort, non-blocking).</summary>
+    public object CaptureSeekTrace(int maxEvents = 256)
+    {
+        ThrowIfDisposed();
+        var player = _player;
+        if (player is null)
+        {
+            return new { events = Array.Empty<object>(), dropped = 0L, overwritten = 0L };
+        }
+
+        maxEvents = Math.Clamp(maxEvents, 16, 2048);
+        var buffer = new SeekLifecycleEvent[maxEvents];
+        var copied = player.CopySeekLifecycleTrace(buffer, out var dropped, out var overwritten);
+        var events = new object[copied];
+        for (var i = 0; i < copied; i++)
+        {
+            var e = buffer[i];
+            events[i] = new
+            {
+                sequence = e.Sequence,
+                timestamp = e.Timestamp,
+                seekId = e.SeekId,
+                sessionGeneration = e.SessionGeneration,
+                trackGeneration = e.TrackGeneration,
+                pipelineId = e.PipelineId,
+                stage = e.Stage.ToString(),
+                silenceReason = e.SilenceReason.ToString(),
+                requestedTicks = e.RequestedTicks,
+                actualTicks = e.ActualTicks,
+                accuracy = e.Accuracy,
+                outcome = e.Outcome,
+                ringCount = e.RingCount,
+                samplesDecoded = e.SamplesDecoded,
+                samplesConsumed = e.SamplesConsumed,
+                flags = e.Flags,
+            };
+        }
+
+        return new { events, dropped, overwritten, frequency = System.Diagnostics.Stopwatch.Frequency };
     }
 
     /// <summary>Sets linear volume and returns the authoritative engine value.</summary>
@@ -711,6 +782,24 @@ public sealed class PlaybackController : IAsyncDisposable
                 UnderrunCount = diagnostics.UnderrunCount,
                 BufferedSamples = diagnostics.BufferedSamples,
                 BufferCapacitySamples = diagnostics.BufferCapacitySamples,
+                SamplesDecoded = diagnostics.SamplesDecoded,
+                SamplesConsumed = diagnostics.SamplesConsumed,
+                SeekInProgress = diagnostics.SeekInProgress,
+                EffectsBarrier = diagnostics.EffectsBarrier,
+                PumpRunning = diagnostics.PumpRunning,
+                RingCompleted = diagnostics.RingCompleted,
+                LastSilenceReason = diagnostics.LastSilenceReason,
+                LastCallbackTimestamp = diagnostics.LastCallbackTimestamp,
+                CallbackCount = diagnostics.CallbackCount,
+                LastSeekId = diagnostics.LastSeekId,
+                LastSeekTerminalId = diagnostics.LastSeekTerminalId,
+                LastPromoteTransitionId = diagnostics.LastPromoteTransitionId,
+                StopPumpTimeoutCount = diagnostics.StopPumpTimeoutCount,
+                OrphanDecodeWorker = diagnostics.OrphanDecodeWorker,
+                TraceDroppedCount = diagnostics.TraceDroppedCount,
+                TraceOverwrittenCount = diagnostics.TraceOverwrittenCount,
+                OutputDeviceStatus = diagnostics.OutputDeviceStatus,
+                ActivePipelineId = diagnostics.ActivePipelineId,
                 Output = OutputConfigDto.FromPlayer(p),
             };
         }

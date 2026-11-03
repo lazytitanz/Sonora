@@ -252,6 +252,12 @@
 
     on(E.diagnosticEvent, (payload) => bus.emit('diagEvent', payload));
 
+    on(E.stall, (payload) => {
+      const msg = (payload && payload.message) || 'Playback stalled while Playing (no audio progress).';
+      toast(msg, 'danger');
+      bus.emit('stall', payload);
+    });
+
     on(E.resources, (payload) => {
       if (payload) setResources(payload.sample, payload.soak);
     });

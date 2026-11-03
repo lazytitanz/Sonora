@@ -153,12 +153,14 @@ public sealed class AppBridge : IDisposable
         _bridge.RegisterAsync("playback.next", ct => Box(_playback.NextAsync(ct)));
         _bridge.RegisterAsync("playback.previous", ct => Box(_playback.PreviousAsync(ct)));
         // Off the UI/bridge thread: Media Foundation seeks can block long enough to AppHang the host.
-        _bridge.RegisterAsync<double>(
+        // Optional second arg is a JS correlation id for the seek lifecycle trace.
+        _bridge.RegisterAsync<double, int>(
             "playback.seek",
-            (positionMs, ct) => Done(Task.Run(() => _playback.Seek(positionMs), ct)));
-        _bridge.RegisterAsync<double>(
+            (positionMs, correlationId, ct) => Done(Task.Run(() => _playback.Seek(positionMs, correlationId), ct)));
+        _bridge.RegisterAsync<double, int>(
             "playback.seekWithResult",
-            (positionMs, ct) => Box(Task.Run(() => _playback.SeekWithResult(positionMs), ct)));
+            (positionMs, correlationId, ct) => Box(Task.Run(() => _playback.SeekWithResult(positionMs, correlationId), ct)));
+        _bridge.Register<int>("diagnostics.seekTrace", max => _playback.CaptureSeekTrace(max <= 0 ? 256 : max));
         _bridge.Register<float>("playback.setVolume", volume => _playback.SetVolume(volume));
         _bridge.Register<bool>("playback.setGapless", enabled => Run(() => _playback.SetGaplessEnabled(enabled)));
         _bridge.RegisterAsync("playback.preloadNext", ct => Done(_playback.PreloadNextAsync(ct)));
@@ -290,6 +292,9 @@ public sealed class AppBridge : IDisposable
     }
 
     private void OnDiagnosticEvent(DiagnosticEventDto evt) => Emit(UiEventNames.DiagnosticEvent, evt);
+
+    /// <summary>Pushes a UI event onto the web view (marshalled; never blocks the caller on Emit).</summary>
+    public void EmitUiEvent(string name, object? payload) => Emit(name, payload);
 
     private void Emit(string name, object? payload)
     {

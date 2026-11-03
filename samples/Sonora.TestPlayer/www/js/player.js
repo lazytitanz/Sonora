@@ -339,8 +339,11 @@
     await refreshSnapshot();
   }
 
+  let seekCorrelationSeq = 0;
+
   async function seekSeconds(seconds) {
-    return run('playback.seek', [seconds * 1000], { label: 'Seek' });
+    const correlationId = ++seekCorrelationSeq;
+    return run('playback.seek', [seconds * 1000, correlationId], { label: 'Seek' });
   }
 
   function wirePlaybar() {
@@ -707,9 +710,10 @@
       return;
     }
     const epoch = ++seekUiEpoch;
+    const correlationId = ++seekCorrelationSeq;
     const ms = seconds * 1000;
     if (withResult) {
-      const result = await run('playback.seekWithResult', [ms], { toast: false });
+      const result = await run('playback.seekWithResult', [ms, correlationId], { toast: false });
       if (epoch !== seekUiEpoch) return; // a newer click owns the result panel
       if (result.ok) {
         if (result.value && result.value.coalesced) {
@@ -722,7 +726,7 @@
         toast(`Seek rejected: ${result.message}`, 'warning');
       }
     } else {
-      const result = await run('playback.seek', [ms], { toast: false });
+      const result = await run('playback.seek', [ms, correlationId], { toast: false });
       if (epoch !== seekUiEpoch) return;
       if (result.ok) showSeekText(`Seek to ${seconds} s issued. Plain seek reports no landing position; use “Seek with result” for that.`, 'muted', `${seconds} s issued (no result)`);
       else {

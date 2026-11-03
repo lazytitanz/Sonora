@@ -21,6 +21,8 @@ internal sealed class DecodePump : IDisposable
     private CancellationTokenSource? _cts;
     private Task? _task;
     private int _started;
+    private int _stopTimedOut;
+    private Action? _onStillAliveAfterCancel;
 
     public DecodePump(
         IAudioDecoder decoder,
@@ -28,7 +30,8 @@ internal sealed class DecodePump : IDisposable
         IReadOnlyList<IAudioProcessor> processors,
         Action<int> onSamplesWritten,
         Action<Exception>? onError = null,
-        int scratchSamples = 4096)
+        int scratchSamples = 4096,
+        Action? onStillAliveAfterCancel = null)
     {
         _decoder = decoder;
         _ring = ring;
@@ -36,9 +39,13 @@ internal sealed class DecodePump : IDisposable
         _onSamplesWritten = onSamplesWritten;
         _onError = onError;
         _scratch = new float[Math.Max(256, scratchSamples)];
+        _onStillAliveAfterCancel = onStillAliveAfterCancel;
     }
 
     public bool IsRunning => _task is { IsCompleted: false };
+
+    /// <summary>True when the last <see cref="StopAsync"/> timed out before the worker joined.</summary>
+    public bool StopTimedOut => Volatile.Read(ref _stopTimedOut) != 0;
 
     public void Start()
     {
@@ -80,7 +87,20 @@ internal sealed class DecodePump : IDisposable
         var completed = await Task.WhenAny(task, Task.Delay(timeout)).ConfigureAwait(false);
         if (completed != task)
         {
-            // Best effort; Dispose will abandon the worker.
+            // Timeout is NOT proof the worker exited — it may still be inside Decoder.Read.
+            Volatile.Write(ref _stopTimedOut, 1);
+            try
+            {
+                _onStillAliveAfterCancel?.Invoke();
+            }
+            catch
+            {
+                // diagnostics must not throw
+            }
+        }
+        else
+        {
+            Volatile.Write(ref _stopTimedOut, 0);
         }
 
         Interlocked.Exchange(ref _started, 0);
@@ -107,6 +127,18 @@ internal sealed class DecodePump : IDisposable
         {
             while (!cancellationToken.IsCancellationRequested)
             {
+                if (cancellationToken.IsCancellationRequested && Volatile.Read(ref _stopTimedOut) != 0)
+                {
+                    try
+                    {
+                        _onStillAliveAfterCancel?.Invoke();
+                    }
+                    catch
+                    {
+                        // diagnostics must not throw
+                    }
+                }
+
                 int read;
                 try
                 {

@@ -33,6 +33,7 @@ public sealed class MainForm : Form
     private DeviceController? _devices;
     private StreamingController? _streaming;
     private AppBridge? _appBridge;
+    private PlaybackStallWatchdog? _stallWatchdog;
     private bool _shuttingDown;
     private bool _shutdownComplete;
 
@@ -53,7 +54,11 @@ public sealed class MainForm : Form
         _host = new VetraHost { Dock = DockStyle.Fill };
         Controls.Add(_host);
 
-        _positionTimer.Tick += (_, _) => SafeTick(() => _appBridge?.EmitPositionTick(), "position");
+        _positionTimer.Tick += (_, _) => SafeTick(() =>
+        {
+            _appBridge?.EmitPositionTick();
+            _stallWatchdog?.Tick();
+        }, "position");
         _resourceTimer.Tick += (_, _) => SafeTick(() => _appBridge?.EmitResourceTick(), "resources");
 
         Shown += async (_, _) => await InitializeAsync();
@@ -263,6 +268,22 @@ public sealed class MainForm : Form
             _sampler,
             folderPicker);
         _appBridge.Register();
+
+        _stallWatchdog = new PlaybackStallWatchdog(
+            _store,
+            () => _playback?.Player,
+            () => _playback?.GetSnapshot() ?? new Models.EngineSnapshotDto { CapturedAtUtc = DateTimeOffset.UtcNow },
+            (name, payload) =>
+            {
+                try
+                {
+                    _appBridge?.EmitUiEvent(name, payload);
+                }
+                catch
+                {
+                    // best-effort UI notify
+                }
+            });
     }
 
     private void ShowFatalAndClose(Exception exception)
