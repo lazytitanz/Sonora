@@ -85,25 +85,6 @@ internal sealed class DecodePump : IDisposable
             CancellationToken.None,
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
-
-        // Observe completion off the worker thread so cleanup cannot re-enter the worker.
-        _ = _task.ContinueWith(
-            static (t, state) =>
-            {
-                var self = (DecodePump)state!;
-                if (t.IsFaulted && t.Exception is not null)
-                {
-                    self._shutdownTcs.TrySetException(t.Exception.InnerExceptions);
-                }
-                else
-                {
-                    self._shutdownTcs.TrySetResult();
-                }
-            },
-            this,
-            CancellationToken.None,
-            TaskContinuationOptions.RunContinuationsAsynchronously,
-            TaskScheduler.Default);
     }
 
     /// <summary>
@@ -278,6 +259,13 @@ internal sealed class DecodePump : IDisposable
         catch (Exception ex)
         {
             _onError?.Invoke(ex);
+        }
+        finally
+        {
+            // Signal on the worker itself so ShutdownCompleted cannot stall behind a starved
+            // thread-pool ContinueWith (DisposeAsync awaits this under CI blame-hang).
+            // TCS uses RunContinuationsAsynchronously so awaiters/cleanups do not re-enter here.
+            _shutdownTcs.TrySetResult();
         }
     }
 }

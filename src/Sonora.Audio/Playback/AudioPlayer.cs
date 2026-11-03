@@ -2783,8 +2783,25 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     internal void OnOutputStopped(object? sender, AudioOutputStoppedEventArgs e)
     {
         // Capture sender so a deferred handler cannot apply a stale Stopped to a replacement output.
-        // Never take _gate or call output.Stop on the raising thread.
-        _ = Task.Run(() => HandleOutputStopped(sender, e));
+        // Never take _gate or call output.Stop/Join on the raising (pull) thread — that deadlocks
+        // with QueueOutputShutdown. Use a dedicated thread rather than Task.Run so parallel tests
+        // that block the thread pool (ownership StopPump joins) cannot starve device-loss recovery.
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                HandleOutputStopped(sender, e);
+            }
+            catch (ObjectDisposedException)
+            {
+                // ignored
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "Sonora.OutputStopped",
+        };
+        thread.Start();
     }
 
     private void HandleOutputStopped(object? sender, AudioOutputStoppedEventArgs e)

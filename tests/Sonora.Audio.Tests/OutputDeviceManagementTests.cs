@@ -430,7 +430,9 @@ public class OutputDeviceManagementTests
         FakeAudioOutputFactory outputs,
         TimeSpan? duration = null)
     {
-        var seconds = duration?.TotalSeconds ?? 1.0;
+        // Keep device-loss / switch tests well clear of natural EOS: default ring is ~1s, so a
+        // 1s fixture can complete and race InjectFailure's Stopped handler.
+        var seconds = duration?.TotalSeconds ?? 30.0;
         var decoder = new FakeAudioDecoder(Format, CreatePcm(Format, (float)seconds, 0.2f));
         return new AudioEngine(
             new FakeAudioDecoderFactory(decoder),
