@@ -1,5 +1,6 @@
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
 using Sonora.Audio.Abstractions;
 using Sonora.Audio.Formats;
 using Sonora.Audio.Output;
@@ -36,6 +37,7 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
     private readonly object _lifecycleSync = new();
     private IPcmSampleSource? _source;
     private PcmSampleProviderAdapter? _adapter;
+    private WasapiRenderSubmissionProbe? _submissionProbe;
     private AudioFormat? _format;
     private bool _initialized;
     private bool _shutdown;
@@ -163,6 +165,91 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
 
     public event EventHandler<AudioOutputStoppedEventArgs>? Stopped;
 
+    /// <summary>
+    /// Diagnostic: arm bounded capture at <see cref="PcmSampleProviderAdapter.Read"/>
+    /// (managed <see cref="ISampleProvider"/> output, including exclusive padding).
+    /// Not a post-engine / MixFormat capture. Prefer
+    /// <see cref="ArmRenderSubmissionCapture"/> when comparing bytes released to
+    /// <c>IAudioRenderClient</c>.
+    /// </summary>
+    internal void ArmManagedOutputCapture(int skipSamples, int captureSamples)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var adapter = _adapter
+            ?? throw new InvalidOperationException("WASAPI output is not initialized.");
+        adapter.ArmManagedOutputCapture(skipSamples, captureSamples);
+    }
+
+    /// <summary>Diagnostic: true when the armed managed-provider capture has filled its window.</summary>
+    internal bool IsManagedOutputCaptureComplete =>
+        _adapter?.ManagedOutputCapture?.IsComplete == true;
+
+    /// <summary>Diagnostic: copy the completed managed-provider capture window.</summary>
+    internal bool TryCopyManagedOutputCapture(Span<float> destination, out int written)
+    {
+        written = 0;
+        var capture = _adapter?.ManagedOutputCapture;
+        return capture is not null && capture.TryCopyCaptured(destination, out written);
+    }
+
+    /// <summary>
+    /// Diagnostic: arm capture of floats reinterpreted from the byte buffer returned by
+    /// <see cref="WasapiRenderSubmissionProbe"/> — the same lease memory
+    /// <c>WasapiPlayer.FillBuffer</c> releases to WASAPI (pre-engine).
+    /// </summary>
+    internal void ArmRenderSubmissionCapture(int skipSamples, int captureSamples)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var probe = _submissionProbe
+            ?? throw new InvalidOperationException("WASAPI output is not initialized.");
+        probe.ArmCapture(skipSamples, captureSamples);
+    }
+
+    /// <summary>Diagnostic: true when render-submission capture has filled its window.</summary>
+    internal bool IsRenderSubmissionCaptureComplete =>
+        _submissionProbe?.Capture?.IsComplete == true;
+
+    /// <summary>Diagnostic: copy the completed render-submission capture window.</summary>
+    internal bool TryCopyRenderSubmissionCapture(Span<float> destination, out int written)
+    {
+        written = 0;
+        var capture = _submissionProbe?.Capture;
+        return capture is not null && capture.TryCopyCaptured(destination, out written);
+    }
+
+    /// <summary>Diagnostic: period journal at the render-submission probe (may wrap).</summary>
+    internal RenderSubmissionPeriodRecord[] SnapshotRenderSubmissionJournal() =>
+        _submissionProbe?.Journal.Snapshot() ?? Array.Empty<RenderSubmissionPeriodRecord>();
+
+    /// <summary>
+    /// Format passed to <c>IAudioClient.Initialize</c> (source IeeeFloat under shared AutoConvertPcm).
+    /// Null before <see cref="Initialize"/>.
+    /// </summary>
+    internal WaveFormat? ClientOutputWaveFormat => _initialized ? _player.OutputWaveFormat : null;
+
+    /// <summary>
+    /// Endpoint mix format (engine target under shared mode). Null before init or when unavailable.
+    /// </summary>
+    internal WaveFormat? DeviceMixFormat
+    {
+        get
+        {
+            if (!_initialized)
+            {
+                return null;
+            }
+
+            try
+            {
+                return _player.DeviceMixFormat;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+    }
+
     public void Initialize(IPcmSampleSource source)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -177,6 +264,9 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
         // When the PCM source ends, stop WasapiPlayer off the render thread so exclusive mode
         // does not ReleaseBuffer(0) → AUDCLNT_E_BUFFER_SIZE_ERROR (0x88890016).
         _adapter = new PcmSampleProviderAdapter(source, RequestStopAfterEndOfStream);
+        // Explicit SampleToWaveProvider + submission probe (same wrap as IWavePlayer.Init(ISampleProvider),
+        // plus a disarmed pass-through for render-client lease observation).
+        _submissionProbe = new WasapiRenderSubmissionProbe(new SampleToWaveProvider(_adapter));
 
         var latencyMs = _requestedLatencyMs;
         Exception? last = null;
@@ -189,7 +279,7 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
                     RebuildPlayer(latencyMs);
                 }
 
-                _player.Init(_adapter);
+                _player.Init(_submissionProbe);
                 _initialized = true;
                 return;
             }
@@ -204,6 +294,7 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
             catch (Exception ex)
             {
                 _adapter = null;
+                _submissionProbe = null;
                 _source = null;
                 _format = null;
                 throw WasapiErrorMapper.Wrap(
@@ -215,6 +306,7 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
         }
 
         _adapter = null;
+        _submissionProbe = null;
         _source = null;
         _format = null;
         throw WasapiErrorMapper.Wrap(

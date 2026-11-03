@@ -23,6 +23,7 @@ internal sealed class PcmSampleProviderAdapter : ISampleProvider
     private int _endOfStreamSignaled;
     private int _eosCallbackRaised;
     private int _paused;
+    private BoundedManagedPcmCapture? _managedCapture;
 
     public PcmSampleProviderAdapter(IPcmSampleSource source, Action? onEndOfStream = null)
     {
@@ -36,6 +37,24 @@ internal sealed class PcmSampleProviderAdapter : ISampleProvider
 
     /// <summary>True after a genuine source EOS has been observed and padded.</summary>
     public bool HasSignaledEndOfStream => Volatile.Read(ref _endOfStreamSignaled) == 1;
+
+    /// <summary>
+    /// Diagnostic capture of floats returned from this <see cref="ISampleProvider"/>
+    /// (including EOS/pause padding). Null when not armed. This is <em>not</em> a capture of
+    /// post-<c>ReleaseBuffer</c> MixFormat engine output — see <see cref="WasapiRenderSubmissionProbe"/>.
+    /// </summary>
+    public BoundedManagedPcmCapture? ManagedOutputCapture => Volatile.Read(ref _managedCapture);
+
+    /// <summary>
+    /// Arms a bounded capture of this provider's Read output (managed float PCM + padding).
+    /// Call off the audio callback. No-op for playback behavior when unused.
+    /// </summary>
+    public void ArmManagedOutputCapture(int skipSamples, int captureSamples)
+    {
+        Volatile.Write(ref _managedCapture, new BoundedManagedPcmCapture(skipSamples, captureSamples));
+    }
+
+    public void ClearManagedOutputCapture() => Volatile.Write(ref _managedCapture, null);
 
     /// <summary>
     /// Prevents any further reads of the PCM source (used during output shutdown).
@@ -70,6 +89,7 @@ internal sealed class PcmSampleProviderAdapter : ISampleProvider
         if (Volatile.Read(ref _paused) == 1)
         {
             buffer.Clear();
+            OfferManagedCapture(buffer);
             return buffer.Length;
         }
 
@@ -78,6 +98,7 @@ internal sealed class PcmSampleProviderAdapter : ISampleProvider
         if (Volatile.Read(ref _endOfStreamSignaled) == 1)
         {
             buffer.Clear();
+            OfferManagedCapture(buffer);
             return buffer.Length;
         }
 
@@ -87,6 +108,7 @@ internal sealed class PcmSampleProviderAdapter : ISampleProvider
             // Disconnected during shutdown: feed silence until Stop joins the render thread.
             // Do not treat this as track EOS (would confuse pause/shutdown with completion).
             buffer.Clear();
+            OfferManagedCapture(buffer);
             return buffer.Length;
         }
 
@@ -94,12 +116,14 @@ internal sealed class PcmSampleProviderAdapter : ISampleProvider
         {
             buffer.Clear();
             SignalEndOfStream();
+            OfferManagedCapture(buffer);
             return buffer.Length;
         }
 
         var read = source.Read(buffer);
         if (read >= buffer.Length)
         {
+            OfferManagedCapture(buffer);
             return buffer.Length;
         }
 
@@ -118,7 +142,13 @@ internal sealed class PcmSampleProviderAdapter : ISampleProvider
             SignalEndOfStream();
         }
 
+        OfferManagedCapture(buffer);
         return buffer.Length;
+    }
+
+    private void OfferManagedCapture(ReadOnlySpan<float> period)
+    {
+        Volatile.Read(ref _managedCapture)?.Offer(period);
     }
 
     private void SignalEndOfStream()

@@ -577,6 +577,74 @@
           </div>
 
           <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">Gapless PCM (developer)</h2></div>
+            <div class="panel-body">
+              <p class="small text-body-secondary mb-2">
+                Captures bounded float PCM at the managed→WASAPI boundary when <code>Position</code> reaches the start time on track B.
+                <strong>Capture after promote</strong> requires gapless on and <code>NextTrackState=Ready</code> before A ends (otherwise B loads via ordinary completion — no <code>TrackTransitioned</code>).
+                Start the capture while A is loaded/playing, then listen; repeat with a fresh Load of B for the manual path. Never auto-pass.
+              </p>
+              <div class="row g-2 mb-2">
+                <div class="col-md-6">
+                  <label class="form-label form-label-sm" for="gapless-pcm-dir">Output folder</label>
+                  <input id="gapless-pcm-dir" type="text" class="form-control form-control-sm" spellcheck="false" placeholder="e.g. %USERPROFILE%\sonora-gapless-pcm">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label form-label-sm" for="gapless-pcm-start-ms">Start (ms into B)</label>
+                  <input id="gapless-pcm-start-ms" type="number" class="form-control form-control-sm" value="3000" min="0" step="100">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label form-label-sm" for="gapless-pcm-window-ms">Window (ms)</label>
+                  <input id="gapless-pcm-window-ms" type="number" class="form-control form-control-sm" value="500" min="50" step="50">
+                </div>
+              </div>
+              <div class="d-flex flex-wrap gap-2 mb-2">
+                <button id="btn-gapless-pcm-promote" type="button" class="btn btn-sm btn-accent">Capture after promote</button>
+                <button id="btn-gapless-pcm-manual" type="button" class="btn btn-sm btn-outline-secondary">Capture manual Load</button>
+                <button id="btn-gapless-pcm-compare" type="button" class="btn btn-sm btn-outline-secondary">Compare last</button>
+              </div>
+              <div id="gapless-pcm-status" class="small text-body-secondary mb-2" aria-live="polite"></div>
+              <label class="visually-hidden" for="gapless-pcm-result">Compare result</label>
+              <textarea id="gapless-pcm-result" class="form-control export-preview" rows="6" readonly spellcheck="false" placeholder="Capture / compare JSON appears here."></textarea>
+
+              <hr class="my-3">
+              <h3 class="h6">Listening A/B test</h3>
+              <p class="small text-body-secondary mb-2">
+                Automatically runs natural gapless promotion of B, then a fresh Load of B, at your current volume (~17%).
+                After each scenario, classify what you heard. Does not infer quality from PCM.
+                Select Track A and Track B paths below (or use the first two queue items).
+              </p>
+              <div class="row g-2 mb-2">
+                <div class="col-md-6">
+                  <label class="form-label form-label-sm" for="listening-ab-a">Track A path</label>
+                  <input id="listening-ab-a" type="text" class="form-control form-control-sm" spellcheck="false" placeholder="Known-bad A (played first)">
+                </div>
+                <div class="col-md-6">
+                  <label class="form-label form-label-sm" for="listening-ab-b">Track B path</label>
+                  <input id="listening-ab-b" type="text" class="form-control form-control-sm" spellcheck="false" placeholder="Known-bad B (promoted / loaded)">
+                </div>
+              </div>
+              <div class="d-flex flex-wrap gap-2 mb-2">
+                <button id="btn-listening-ab-run" type="button" class="btn btn-sm btn-accent">Run Listening A/B Test</button>
+              </div>
+              <div id="listening-ab-status" class="small text-body-secondary mb-2" aria-live="polite"></div>
+              <div id="listening-ab-observe" class="border rounded p-2 mb-2" hidden>
+                <div id="listening-ab-prompt" class="small mb-2"></div>
+                <div class="d-flex flex-wrap gap-2 mb-2" role="group" aria-label="Listening classification">
+                  <button type="button" class="btn btn-sm btn-outline-success listening-ab-class" data-class="Clean">Clean</button>
+                  <button type="button" class="btn btn-sm btn-outline-danger listening-ab-class" data-class="Static">Static / distorted</button>
+                  <button type="button" class="btn btn-sm btn-outline-secondary listening-ab-class" data-class="Unsure">Unsure</button>
+                </div>
+                <button id="btn-listening-ab-continue" type="button" class="btn btn-sm btn-accent" disabled>Continue</button>
+              </div>
+              <label class="visually-hidden" for="listening-ab-result">Listening A/B result</label>
+              <textarea id="listening-ab-result" class="form-control export-preview" rows="6" readonly spellcheck="false" placeholder="Summary / report JSON appears here."></textarea>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12">
+          <div class="panel">
             <div class="panel-header"><h2 class="panel-title">Export</h2></div>
             <div class="panel-body">
               <div class="d-flex flex-wrap gap-3 mb-2">
@@ -793,7 +861,7 @@
 <script src="js/output.js?v=device-switch-ui-2026-11-02e"></script>
 <script src="js/dsp.js?v=device-switch-ui-2026-11-02e"></script>
 <script src="js/streaming.js?v=device-switch-ui-2026-11-02e"></script>
-<script src="js/diagnostics.js?v=device-switch-ui-2026-11-02e"></script>
+<script src="js/diagnostics.js?v=listening-ab-2026-11-03"></script>
 <script src="js/scenarios.js?v=device-switch-ui-2026-11-02e"></script>
 <script src="js/app.js?v=device-switch-ui-2026-11-02e"></script>
 </body>

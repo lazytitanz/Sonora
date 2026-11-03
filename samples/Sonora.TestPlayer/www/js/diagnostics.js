@@ -471,12 +471,201 @@
     renderStateTable();
   }
 
+  function gaplessPcmParams() {
+    const dir = (dom['gapless-pcm-dir'].value || '').trim();
+    const start = Number(dom['gapless-pcm-start-ms'].value);
+    const windowMs = Number(dom['gapless-pcm-window-ms'].value);
+    return {
+      dir,
+      start: Number.isFinite(start) && start >= 0 ? start : 3000,
+      windowMs: Number.isFinite(windowMs) && windowMs > 0 ? windowMs : 500,
+    };
+  }
+
+  function setGaplessPcmStatus(text, tone) {
+    const el = dom['gapless-pcm-status'];
+    el.textContent = text || '';
+    el.classList.toggle('text-danger', tone === 'bad');
+    el.classList.toggle('text-success', tone === 'ok');
+  }
+
+  async function captureGaplessPromote() {
+    const p = gaplessPcmParams();
+    if (!p.dir) {
+      setGaplessPcmStatus('Set an output folder first.', 'bad');
+      return;
+    }
+    setGaplessPcmStatus('checkingPrerequisites…', null);
+    const result = await run(
+      'diagnostics.gaplessPcm.captureAfterPromote',
+      [p.dir, p.start, p.windowMs],
+      { label: 'Gapless PCM promote capture' });
+    if (result.ok) {
+      dom['gapless-pcm-result'].value = JSON.stringify(result.value, null, 2);
+      setGaplessPcmStatus('captureCompleted — listen and note whether B was distorted.', 'ok');
+      TP.ui.toast('Promote mid-B PCM capture saved.', 'success');
+    } else {
+      setGaplessPcmStatus(result.message || 'Promote capture failed.', 'bad');
+      dom['gapless-pcm-result'].value = result.message || '';
+    }
+  }
+
+  async function captureGaplessManual() {
+    const p = gaplessPcmParams();
+    if (!p.dir) {
+      setGaplessPcmStatus('Set an output folder first.', 'bad');
+      return;
+    }
+    setGaplessPcmStatus('Waiting for Position on current track…', null);
+    const result = await run(
+      'diagnostics.gaplessPcm.captureManual',
+      [p.dir, p.start, p.windowMs],
+      { label: 'Gapless PCM manual capture' });
+    if (result.ok) {
+      dom['gapless-pcm-result'].value = JSON.stringify(result.value, null, 2);
+      setGaplessPcmStatus('Manual capture saved.', 'ok');
+      TP.ui.toast('Manual mid-B PCM capture saved.', 'success');
+    } else {
+      setGaplessPcmStatus(result.message || 'Manual capture failed.', 'bad');
+    }
+  }
+
+  async function compareGaplessPcm() {
+    setGaplessPcmStatus('Comparing last promote vs manual captures…', null);
+    const result = await run('diagnostics.gaplessPcm.compareLast', [100], { label: 'Gapless PCM compare' });
+    if (result.ok) {
+      dom['gapless-pcm-result'].value = JSON.stringify(result.value, null, 2);
+      const v = result.value || {};
+      if (v.suitable === false) {
+        setGaplessPcmStatus(v.reason || 'Captures unsuitable for comparison.', 'bad');
+      } else if (v.alignmentInconclusive) {
+        setGaplessPcmStatus('Alignment inconclusive (weak NCC). Do not treat as a PCM match.', 'bad');
+      } else if (v.alignedMatch) {
+        setGaplessPcmStatus('Aligned managed-boundary PCM matches. Pair with your listen notes — match alone does not prove post-boundary cause.', 'ok');
+      } else {
+        setGaplessPcmStatus('Aligned PCM still diverges after best lag.', 'bad');
+      }
+    } else {
+      setGaplessPcmStatus(result.message || 'Compare failed.', 'bad');
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Listening A/B (interactive observation)
+  // ---------------------------------------------------------------------------------------------
+
+  let listeningAbAttemptId = null;
+  let listeningAbSelectedClass = null;
+
+  function setListeningAbStatus(text, tone) {
+    const el = dom['listening-ab-status'];
+    if (!el) return;
+    el.textContent = text || '';
+    el.classList.toggle('text-danger', tone === 'bad');
+    el.classList.toggle('text-success', tone === 'ok');
+  }
+
+  function showListeningAbObserve(prompt, attemptId) {
+    listeningAbAttemptId = attemptId || null;
+    listeningAbSelectedClass = null;
+    const box = dom['listening-ab-observe'];
+    const promptEl = dom['listening-ab-prompt'];
+    const cont = dom['btn-listening-ab-continue'];
+    if (promptEl) promptEl.textContent = prompt || 'How did that playback sound?';
+    if (box) box.hidden = false;
+    if (cont) cont.disabled = true;
+    document.querySelectorAll('.listening-ab-class').forEach((btn) => {
+      btn.classList.remove('active');
+    });
+  }
+
+  function hideListeningAbObserve() {
+    listeningAbAttemptId = null;
+    listeningAbSelectedClass = null;
+    const box = dom['listening-ab-observe'];
+    if (box) box.hidden = true;
+  }
+
+  function resolveListeningAbPaths() {
+    let a = (dom['listening-ab-a'] && dom['listening-ab-a'].value || '').trim();
+    let b = (dom['listening-ab-b'] && dom['listening-ab-b'].value || '').trim();
+    const queue = (TP.state && TP.state.queue) || [];
+    if (!a && queue[0] && queue[0].path) a = queue[0].path;
+    if (!b && queue[1] && queue[1].path) b = queue[1].path;
+    if (!b && queue[0] && queue[0].path && a && a !== queue[0].path) b = queue[0].path;
+    return { a, b };
+  }
+
+  async function runListeningAbTest() {
+    const paths = resolveListeningAbPaths();
+    const dir = (dom['gapless-pcm-dir'].value || '').trim()
+      || (window.TP && TP.state && TP.state.defaultCaptureDir)
+      || '';
+    let outDir = dir;
+    if (!outDir) {
+      // Sensible default under the user profile — host expands when writing.
+      outDir = '%USERPROFILE%\\sonora-listening-ab';
+    }
+    if (!paths.a || !paths.b) {
+      setListeningAbStatus('Set Track A and Track B paths (or queue two files).', 'bad');
+      return;
+    }
+    setListeningAbStatus('Running listening A/B… follow on-screen prompts after each scenario.', null);
+    hideListeningAbObserve();
+    if (dom['listening-ab-result']) dom['listening-ab-result'].value = '';
+    const result = await run(
+      'diagnostics.listeningAb.run',
+      [paths.a, paths.b, outDir],
+      { label: 'Listening A/B test', timeoutMs: 45 * 60 * 1000 });
+    hideListeningAbObserve();
+    if (result.ok) {
+      const v = result.value || {};
+      const summary = v.summaryLine || JSON.stringify(v, null, 2);
+      if (dom['listening-ab-result']) {
+        dom['listening-ab-result'].value = typeof summary === 'string'
+          ? summary + (v.caution ? '\n\n' + v.caution : '') + '\n\n' + JSON.stringify(v, null, 2)
+          : JSON.stringify(v, null, 2);
+      }
+      setListeningAbStatus(v.summaryLine || 'Listening A/B completed.', 'ok');
+      TP.ui.toast('Listening A/B report saved.', 'success');
+    } else {
+      setListeningAbStatus(result.message || 'Listening A/B failed.', 'bad');
+      if (dom['listening-ab-result']) dom['listening-ab-result'].value = result.message || '';
+    }
+  }
+
+  async function submitListeningAbObservation() {
+    if (!listeningAbAttemptId || !listeningAbSelectedClass) {
+      setListeningAbStatus('Select Clean, Static, or Unsure before Continue.', 'bad');
+      return;
+    }
+    const result = await run(
+      'diagnostics.listeningAb.submitObservation',
+      [listeningAbAttemptId, listeningAbSelectedClass, null],
+      { label: 'Submit listening observation' });
+    if (result.ok && result.value && result.value.accepted) {
+      setListeningAbStatus(`Recorded ${listeningAbSelectedClass} for ${listeningAbAttemptId}.`, 'ok');
+      hideListeningAbObserve();
+    } else {
+      setListeningAbStatus(
+        (result.value && result.value.accepted === false)
+          ? 'Observation rejected (attempt id mismatch or no pending prompt).'
+          : (result.message || 'Could not submit observation.'),
+        'bad');
+    }
+  }
+
   function resolveDom() {
     const ids = [
       'diag-filter-source', 'diag-state-body', 'btn-diag-refresh', 'res-body', 'res-spark', 'res-range', 'log-level',
       'log-category', 'log-search', 'btn-log-pause', 'log-autoscroll', 'btn-log-clear', 'log-count', 'log-list',
       'export-sensitive', 'btn-export-preview', 'btn-export-copy', 'btn-export-save', 'export-path-wrap', 'export-path',
       'export-preview', 'export-status',
+      'gapless-pcm-dir', 'gapless-pcm-start-ms', 'gapless-pcm-window-ms',
+      'btn-gapless-pcm-promote', 'btn-gapless-pcm-manual', 'btn-gapless-pcm-compare',
+      'gapless-pcm-status', 'gapless-pcm-result',
+      'listening-ab-a', 'listening-ab-b', 'btn-listening-ab-run', 'listening-ab-status',
+      'listening-ab-observe', 'listening-ab-prompt', 'btn-listening-ab-continue', 'listening-ab-result',
     ];
     for (const id of ids) dom[id] = document.getElementById(id);
   }
@@ -496,6 +685,45 @@
     dom['btn-export-copy'].addEventListener('click', copyExport);
     dom['btn-export-save'].addEventListener('click', saveExport);
     dom['export-sensitive'].addEventListener('change', onSensitiveChanged);
+    dom['btn-gapless-pcm-promote'].addEventListener('click', captureGaplessPromote);
+    dom['btn-gapless-pcm-manual'].addEventListener('click', captureGaplessManual);
+    dom['btn-gapless-pcm-compare'].addEventListener('click', compareGaplessPcm);
+    if (dom['btn-listening-ab-run']) {
+      dom['btn-listening-ab-run'].addEventListener('click', runListeningAbTest);
+    }
+    document.querySelectorAll('.listening-ab-class').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        listeningAbSelectedClass = btn.getAttribute('data-class');
+        document.querySelectorAll('.listening-ab-class').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        if (dom['btn-listening-ab-continue']) dom['btn-listening-ab-continue'].disabled = false;
+      });
+    });
+    if (dom['btn-listening-ab-continue']) {
+      dom['btn-listening-ab-continue'].addEventListener('click', submitListeningAbObservation);
+    }
+
+    TP.bus.on('gaplessPcmPhase', (payload) => {
+      if (!payload) return;
+      const phase = payload.phase || '';
+      const message = payload.message || phase;
+      setGaplessPcmStatus(`${phase}: ${message}`, phase === 'captureFailed' ? 'bad' : null);
+    });
+
+    TP.bus.on('listeningAbPhase', (payload) => {
+      if (!payload) return;
+      setListeningAbStatus(`${payload.phase || ''}: ${payload.message || ''}`, payload.phase === 'failed' ? 'bad' : null);
+    });
+
+    TP.bus.on('listeningAbAwaitObservation', (payload) => {
+      if (!payload) return;
+      showListeningAbObserve(payload.prompt, payload.attemptId);
+      setListeningAbStatus('Waiting for your listening classification…', null);
+    });
+
+    TP.bus.on('listeningAbObservationReceived', () => {
+      hideListeningAbObserve();
+    });
 
     TP.bus.on('snapshot', renderIfVisible);
     TP.bus.on('position', renderIfVisible);

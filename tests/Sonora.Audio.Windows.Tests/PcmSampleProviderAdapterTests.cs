@@ -103,6 +103,46 @@ public sealed class PcmSampleProviderAdapterTests
         Assert.False(adapter.HasSignaledEndOfStream);
     }
 
+    [Fact]
+    public void ManagedOutputCapture_skipsThenCapturesExactWindow()
+    {
+        var source = new FillingSource(Format, fillValue: 0.25f);
+        var adapter = new PcmSampleProviderAdapter(source);
+        adapter.ArmManagedOutputCapture(skipSamples: 5, captureSamples: 4);
+
+        Span<float> period = stackalloc float[3];
+        Assert.Equal(3, adapter.Read(period)); // skip 3
+        Assert.False(adapter.ManagedOutputCapture!.IsComplete);
+        Assert.Equal(3, adapter.Read(period)); // skip 2, capture 1
+        Assert.Equal(3, adapter.Read(period)); // capture 3 → complete
+        Assert.True(adapter.ManagedOutputCapture.IsComplete);
+
+        Span<float> captured = stackalloc float[4];
+        Assert.True(adapter.ManagedOutputCapture.TryCopyCaptured(captured, out var written));
+        Assert.Equal(4, written);
+        Assert.All(captured.ToArray(), s => Assert.Equal(0.25f, s));
+    }
+
+    private sealed class FillingSource : IPcmSampleSource
+    {
+        private readonly float _fillValue;
+
+        public FillingSource(AudioFormat format, float fillValue)
+        {
+            Format = format;
+            _fillValue = fillValue;
+        }
+
+        public AudioFormat Format { get; }
+        public bool IsEndOfStream => false;
+
+        public int Read(Span<float> destination)
+        {
+            destination.Fill(_fillValue);
+            return destination.Length;
+        }
+    }
+
     private sealed class ScriptedSource : IPcmSampleSource
     {
         private readonly Queue<int> _reads;

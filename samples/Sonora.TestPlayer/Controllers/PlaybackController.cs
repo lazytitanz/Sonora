@@ -5,6 +5,10 @@ using Sonora.Audio.Formats;
 using Sonora.Audio.Playback;
 using Sonora.Audio.Sources;
 using Sonora.Audio.Windows;
+using Sonora.Audio.Windows.Decoding;
+using Sonora.Audio.Windows.Devices;
+using Sonora.Audio.Windows.DSP;
+using Sonora.Audio.Windows.Output;
 using Sonora.TestPlayer.Diagnostics;
 using Sonora.TestPlayer.Models;
 using Sonora.TestPlayer.Services;
@@ -48,6 +52,7 @@ public sealed class PlaybackController : IAsyncDisposable
 
     private AudioEngine? _engine;
     private AudioPlayer? _player;
+    private TrackingWasapiOutputFactory? _wasapiTracker;
     private int _disposed;
 
     private int _transitionsObserved;
@@ -90,6 +95,12 @@ public sealed class PlaybackController : IAsyncDisposable
     /// <summary>The player, or <see langword="null"/> before <see cref="CreatePlayer"/>.</summary>
     public AudioPlayer? Player => _player;
 
+    /// <summary>
+    /// Last WASAPI output created by the tracking factory (for managed-boundary PCM diagnostics).
+    /// Null before the first output is opened.
+    /// </summary>
+    internal WasapiAudioOutput? LastWasapiOutput => _wasapiTracker?.LastWasapi;
+
     /// <summary>Whether the next queue item is preloaded for gapless handoff.</summary>
     public bool GaplessEnabled => Volatile.Read(ref _gaplessEnabled);
 
@@ -106,8 +117,29 @@ public sealed class PlaybackController : IAsyncDisposable
             throw new InvalidOperationException("The engine has already been created.");
         }
 
-        _engine = SonoraWindows.CreateEngine(options);
-        Log(DiagnosticLevel.Info, "engine.created", "Audio engine created.");
+        // Same wiring as SonoraWindows.CreateEngine, with a tracking WASAPI factory so
+        // developer gapless PCM captures can tap the managed→WASAPI boundary.
+        options ??= new AudioEngineOptions();
+        if (options.EffectFactory is null || options.FormatConverter is null)
+        {
+            options = new AudioEngineOptions
+            {
+                BufferDuration = options.BufferDuration,
+                PrimeDuration = options.PrimeDuration,
+                Processors = options.Processors,
+                EffectFactory = options.EffectFactory ?? new WindowsAudioEffectFactory(),
+                FormatConverter = options.FormatConverter ?? new WindowsAudioFormatConverter(),
+                HttpStreaming = options.HttpStreaming,
+            };
+        }
+
+        _wasapiTracker = new TrackingWasapiOutputFactory();
+        _engine = new AudioEngine(
+            new WindowsAudioDecoderFactory(options.HttpStreaming),
+            _wasapiTracker,
+            options,
+            new WindowsAudioOutputDevices());
+        Log(DiagnosticLevel.Info, "engine.created", "Audio engine created (WASAPI tracking enabled for diagnostics).");
         return _engine;
     }
 

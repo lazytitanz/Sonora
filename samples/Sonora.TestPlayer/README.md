@@ -88,6 +88,34 @@ Use Audio Output and Test Scenarios for device unplug/replug, Windows default ch
 
 Diagnostics → Export writes a local JSON (and optional text) report: versions, OS/runtime, output config, scenario results, events, errors, underrun counts, process snapshots, notes, and measurement limitations. Full paths / usernames / URL query strings are redacted unless you opt in to sensitive details.
 
+## Gapless PCM capture (developer)
+
+Diagnostics → **Gapless PCM** captures bounded float samples at the managed→WASAPI boundary when playback `Position` reaches a chosen offset on the current track. Use this to compare a **natural promote** of B with a **manual Load** of the same B while listening.
+
+## Listening A/B test (developer)
+
+Diagnostics → **Run Listening A/B Test** correlates **what you hear** with managed-boundary PCM from the same attempt.
+
+1. Set comfortable volume (~17%). Keep DSP bypass if you want a clean A/B.
+2. Enter Track A and Track B paths (or queue two files — first = A, second = B).
+3. Optionally set the Gapless PCM output folder (defaults under `%USERPROFILE%\sonora-listening-ab`).
+4. Click **Run Listening A/B Test**. The host will:
+   - Load A, preload B to Ready, play through a verified `TrackTransitioned`, capture windows on B, then ask how it sounded.
+   - Stop, fresh-Load B (no `TrackTransitioned`), capture the same windows, then ask again.
+5. After each scenario, choose **Clean**, **Static / distorted**, or **Unsure**, then **Continue**.
+6. Read the on-screen summary (e.g. `Natural promotion: Static / PCM exact`) and open `report.json` in the timestamped dump folder.
+
+Listening class is never inferred from PCM. Matching managed PCM with an audible difference only suggests looking downstream of the capture boundary — it does not prove the cause.
+
+Typical flow (scenario `gapless.pcm-boundary-diag`):
+
+1. Bypass DSP; gapless on; queue short A then the file that distorts on automatic transition.
+2. Set an output folder; click **Capture after promote**; Play and listen.
+3. Stop; load only B; Play; **Capture manual Load**.
+4. **Compare last**; paste the JSON and your listen notes into the scenario result.
+
+Captures and compares never run on the WASAPI callback thread. Do not treat a PCM match alone as proof that distortion is downstream of the managed boundary.
+
 ## Automated tests
 
 ```powershell

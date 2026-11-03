@@ -254,6 +254,8 @@ public sealed class MainForm : Form
         var dsp = new DspController(player, _store);
         _streaming = new StreamingController(playback, _store);
         var scenarios = new ScenarioController(_store, _sampler);
+        var gaplessPcm = new GaplessPcmCaptureService(playback, _store);
+        var listeningAb = new ListeningAbTestService(playback, _store);
 
         var folderPicker = new MusicFolderPicker(this);
         _appBridge = new AppBridge(
@@ -266,7 +268,11 @@ public sealed class MainForm : Form
             scenarios,
             _store,
             _sampler,
+            gaplessPcm,
+            listeningAb,
             folderPicker);
+        gaplessPcm.PhaseChanged = (name, payload) => _appBridge.EmitUiEvent(name, payload);
+        listeningAb.PhaseChanged = (name, payload) => _appBridge.EmitUiEvent(name, payload);
         _appBridge.Register();
 
         _stallWatchdog = new PlaybackStallWatchdog(

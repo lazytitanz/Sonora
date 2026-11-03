@@ -4,11 +4,15 @@ using Sonora.Audio.Output;
 
 namespace Sonora.Audio.Windows.Tests.Fakes;
 
-/// <summary>Minimal pull-loop output for non-hardware Windows seek/gapless stress tests.</summary>
+/// <summary>
+/// Pull-loop output for non-hardware Windows seek/gapless/diagnostic tests.
+/// Optionally retains interleaved float PCM for offline comparison (not RT-safe for long captures in production).
+/// </summary>
 internal sealed class PullingFakeOutput : IAudioOutput
 {
     private readonly int _blockSamples;
     private readonly TimeSpan _latency;
+    private readonly bool _capture;
     private IPcmSampleSource? _source;
     private CancellationTokenSource? _cts;
     private Thread? _thread;
@@ -16,10 +20,15 @@ internal sealed class PullingFakeOutput : IAudioOutput
     private bool _disposed;
     private long _rendered;
 
-    public PullingFakeOutput(int blockSamples = 256, TimeSpan? latency = null, string? endpointId = null)
+    public PullingFakeOutput(
+        int blockSamples = 256,
+        TimeSpan? latency = null,
+        string? endpointId = null,
+        bool captureSamples = false)
     {
         _blockSamples = Math.Max(32, blockSamples);
         _latency = latency ?? TimeSpan.FromMilliseconds(5);
+        _capture = captureSamples;
         EndpointId = endpointId;
     }
 
@@ -29,6 +38,19 @@ internal sealed class PullingFakeOutput : IAudioOutput
     public TimeSpan CurrentLatency => _playing == 1 ? _latency : _latency;
     public event EventHandler<AudioOutputStoppedEventArgs>? Stopped;
     public long RenderedSamples => Interlocked.Read(ref _rendered);
+    public List<float> CapturedSamples { get; } = new();
+    public int ReadCount { get; private set; }
+    public int PlayCount { get; private set; }
+
+    /// <summary>True when no pull loop is running.</summary>
+    public bool IsPullLoopIdle
+    {
+        get
+        {
+            var thread = _thread;
+            return thread is null || !thread.IsAlive;
+        }
+    }
 
     public void Initialize(IPcmSampleSource source)
     {
@@ -40,6 +62,7 @@ internal sealed class PullingFakeOutput : IAudioOutput
     public void Play()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        PlayCount++;
         if (Interlocked.Exchange(ref _playing, 1) == 1)
         {
             return;
@@ -134,6 +157,7 @@ internal sealed class PullingFakeOutput : IAudioOutput
             try
             {
                 read = source.Read(buffer);
+                ReadCount++;
             }
             catch
             {
@@ -155,14 +179,45 @@ internal sealed class PullingFakeOutput : IAudioOutput
                 break;
             }
 
+            if (_capture && read > 0)
+            {
+                lock (CapturedSamples)
+                {
+                    for (var i = 0; i < read; i++)
+                    {
+                        CapturedSamples.Add(buffer[i]);
+                    }
+                }
+            }
+
             Interlocked.Add(ref _rendered, read);
-            Thread.Sleep(1);
+            // Wake promptly on cancel; 1 ms pacing keeps pull ahead of realtime for offline capture.
+            if (token.WaitHandle.WaitOne(1))
+            {
+                break;
+            }
         }
     }
 }
 
 internal sealed class PullingFakeOutputFactory : IAudioOutputFactory
 {
+    private readonly bool _captureSamples;
+    private readonly Func<PullingFakeOutput>? _create;
+
+    public PullingFakeOutputFactory(bool captureSamples = false)
+    {
+        _captureSamples = captureSamples;
+    }
+
+    public PullingFakeOutputFactory(Func<PullingFakeOutput> create)
+    {
+        _create = create ?? throw new ArgumentNullException(nameof(create));
+    }
+
+    /// <summary>Most recently created output (when using the capture/default constructors).</summary>
+    public PullingFakeOutput? LastCreated { get; private set; }
+
     public Task<IAudioOutput> CreateOutputAsync(
         string? deviceId = null,
         CancellationToken cancellationToken = default) =>
@@ -173,7 +228,12 @@ internal sealed class PullingFakeOutputFactory : IAudioOutputFactory
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult<IAudioOutput>(new PullingFakeOutput(endpointId: request.DeviceId ?? "pulling-fake"));
+        var output = _create?.Invoke()
+            ?? new PullingFakeOutput(
+                endpointId: request.DeviceId ?? "pulling-fake",
+                captureSamples: _captureSamples);
+        LastCreated = output;
+        return Task.FromResult<IAudioOutput>(output);
     }
 
     public Task<AudioOutputFormatProbeResult> ProbeOutputFormatAsync(

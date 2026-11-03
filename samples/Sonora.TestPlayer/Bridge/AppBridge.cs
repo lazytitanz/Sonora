@@ -33,6 +33,8 @@ public sealed class AppBridge : IDisposable
     private readonly ScenarioController _scenarios;
     private readonly DiagnosticEventStore _store;
     private readonly ProcessResourceSampler _sampler;
+    private readonly GaplessPcmCaptureService _gaplessPcm;
+    private readonly ListeningAbTestService _listeningAb;
     private readonly MusicFolderPicker? _folderPicker;
     private int _disposed;
 
@@ -47,6 +49,8 @@ public sealed class AppBridge : IDisposable
         ScenarioController scenarios,
         DiagnosticEventStore store,
         ProcessResourceSampler sampler,
+        GaplessPcmCaptureService gaplessPcm,
+        ListeningAbTestService listeningAb,
         MusicFolderPicker? folderPicker = null)
     {
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
@@ -58,6 +62,8 @@ public sealed class AppBridge : IDisposable
         _scenarios = scenarios ?? throw new ArgumentNullException(nameof(scenarios));
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _sampler = sampler ?? throw new ArgumentNullException(nameof(sampler));
+        _gaplessPcm = gaplessPcm ?? throw new ArgumentNullException(nameof(gaplessPcm));
+        _listeningAb = listeningAb ?? throw new ArgumentNullException(nameof(listeningAb));
         _folderPicker = folderPicker;
     }
 
@@ -127,6 +133,7 @@ public sealed class AppBridge : IDisposable
         _playback.UiEvent -= Emit;
         _devices.UiEvent -= Emit;
         _store.EventAdded -= OnDiagnosticEvent;
+        _listeningAb.Observations.CancelPending();
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -263,6 +270,53 @@ public sealed class AppBridge : IDisposable
                 var content = Export(includeSensitive, format);
                 await DiagnosticExporter.WriteToFileAsync(path, content, ct).ConfigureAwait(false);
                 return Path.GetFileName(path);
+            });
+
+        // Developer-only gapless managed-boundary PCM capture (off the WASAPI callback).
+        _bridge.RegisterAsync<string, double, double>(
+            "diagnostics.gaplessPcm.captureAfterPromote",
+            async (outputDirectory, positionStartMs, windowMs, ct) =>
+                await _gaplessPcm.CaptureAfterNaturalPromoteAsync(
+                    outputDirectory,
+                    positionStartMs <= 0 ? 3000 : positionStartMs,
+                    windowMs <= 0 ? 500 : windowMs,
+                    ct).ConfigureAwait(false));
+        _bridge.RegisterAsync<string, double, double>(
+            "diagnostics.gaplessPcm.captureManual",
+            async (outputDirectory, positionStartMs, windowMs, ct) =>
+                await _gaplessPcm.CaptureManualLoadAsync(
+                    outputDirectory,
+                    positionStartMs <= 0 ? 3000 : positionStartMs,
+                    windowMs <= 0 ? 500 : windowMs,
+                    ct).ConfigureAwait(false));
+        _bridge.Register<int>(
+            "diagnostics.gaplessPcm.compareLast",
+            maxLagMs => _gaplessPcm.CompareLastCaptures(maxLagMs <= 0 ? 100 : maxLagMs));
+        _bridge.Register(
+            "diagnostics.gaplessPcm.lastPaths",
+            () => new
+            {
+                promote = _gaplessPcm.LastPromoteCaptureDirectory,
+                manual = _gaplessPcm.LastManualCaptureDirectory,
+            });
+
+        _bridge.RegisterAsync<string, string, string>(
+            "diagnostics.listeningAb.run",
+            async (trackA, trackB, outputDirectory, ct) =>
+                await _listeningAb.RunAsync(trackA, trackB, outputDirectory, ct).ConfigureAwait(false));
+        _bridge.Register<string, string, string?>(
+            "diagnostics.listeningAb.submitObservation",
+            (attemptId, classification, notes) =>
+            {
+                var ok = _listeningAb.SubmitObservation(attemptId, classification, notes);
+                return new { accepted = ok, attemptId, classification };
+            });
+        _bridge.Register(
+            "diagnostics.listeningAb.pending",
+            () => new
+            {
+                attemptId = _listeningAb.Observations.PendingAttemptId,
+                prompt = _listeningAb.Observations.PendingPrompt,
             });
     }
 

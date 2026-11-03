@@ -30,6 +30,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="Sonora.Audio.Windows.Tests" />
     <InternalsVisibleTo Include="Sonora.Benchmarks" />
+    <InternalsVisibleTo Include="Sonora.TestPlayer" />
   </ItemGroup>
 
 </Project>

@@ -35,4 +35,16 @@ public static class UiEventNames
 
     /// <summary>An engine error was reported.</summary>
     public const string Error = "playback.error";
+
+    /// <summary>Developer gapless PCM capture phase update (progress / failure).</summary>
+    public const string GaplessPcmPhase = "diagnostics.gaplessPcm.phase";
+
+    /// <summary>Listening A/B diagnostic phase updates.</summary>
+    public const string ListeningAbPhase = "diagnostics.listeningAb.phase";
+
+    /// <summary>Host is waiting for Clean / Static / Unsure observation.</summary>
+    public const string ListeningAbAwaitObservation = "diagnostics.listeningAb.awaitObservation";
+
+    /// <summary>Observation was accepted for the pending attempt.</summary>
+    public const string ListeningAbObservationReceived = "diagnostics.listeningAb.observationReceived";
 }

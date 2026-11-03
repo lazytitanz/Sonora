@@ -141,6 +141,10 @@ Next Decoder (+ convert) → Pump → Ring B ───┘
 | Seek | Preserves a safe next track; does not promote or notify |
 | DSP | Same rack across joins; no `ResetProcessingState` on gapless handoff |
 
+Known deferred defect (diagnostics/error routing only): post-promote pump callbacks — see [gapless-callback-ownership.md](gapless-callback-ownership.md).
+
+Native submission boundary (pre-engine lease vs MixFormat): see [gapless-native-submission-boundary.md](gapless-native-submission-boundary.md).
+
 ## DSP (0.3.0+)
 
 ```text

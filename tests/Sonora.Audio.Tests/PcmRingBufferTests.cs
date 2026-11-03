@@ -34,4 +34,29 @@ public sealed class PcmRingBufferTests
         ring.TryRead(new float[2]);
         Assert.True(ring.IsCompleted);
     }
+
+    /// <summary>
+    /// Documents a real contract gap: <see cref="PcmRingBuffer"/> does not enforce
+    /// channel-frame alignment. A stereo promote that drained an odd leftover sample
+    /// before swapping rings would permanently swap L/R for the rest of B.
+    /// This test proves the API permits it; it does not prove production decoders do it.
+    /// </summary>
+    [Fact]
+    public void TryRead_DoesNotEnforceFrameAlignment_OddDestinationLength()
+    {
+        var ring = new PcmRingBuffer(16);
+        // Stereo frame = 2 samples; write two full frames then one orphan sample.
+        Assert.Equal(5, ring.Write([0.1f, -0.1f, 0.2f, -0.2f, 0.3f], CancellationToken.None));
+
+        var odd = new float[3];
+        Assert.Equal(3, ring.TryRead(odd));
+        Assert.Equal(0.1f, odd[0]);
+        Assert.Equal(-0.1f, odd[1]);
+        Assert.Equal(0.2f, odd[2]); // half-frame: next TryRead would start mid-frame
+
+        var rest = new float[8];
+        Assert.Equal(2, ring.TryRead(rest));
+        Assert.Equal(-0.2f, rest[0]);
+        Assert.Equal(0.3f, rest[1]);
+    }
 }

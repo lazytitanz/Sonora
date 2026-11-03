@@ -211,16 +211,51 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
 
         try
         {
-            var count = Math.Min(destination.Length, _conversionScratch.Length);
-            var read = _samples.Read(_conversionScratch.AsSpan(0, count));
-            if (read > 0)
+            // Fill the destination across scratch-sized underlying reads. A single capped return
+            // (legacy behavior) looks like a mid-stream short read to NAudio WDL, which flushes
+            // the resampler on every under-fill and corrupts gapless upward SRC (44.1→48/96).
+            var channels = Math.Max(1, Format.ChannelCount);
+            var total = 0;
+            while (total < destination.Length)
             {
-                _conversionScratch.AsSpan(0, read).CopyTo(destination);
-                return read;
+                var remaining = destination.Length - total;
+                remaining -= remaining % channels;
+                if (remaining <= 0)
+                {
+                    break;
+                }
+
+                var count = Math.Min(remaining, _conversionScratch.Length);
+                count -= count % channels;
+                if (count <= 0)
+                {
+                    break;
+                }
+
+                var read = _samples.Read(_conversionScratch.AsSpan(0, count));
+                if (read <= 0)
+                {
+                    _reachedEnd = true;
+                    break;
+                }
+
+                var aligned = read - (read % channels);
+                if (aligned <= 0)
+                {
+                    break;
+                }
+
+                _conversionScratch.AsSpan(0, aligned).CopyTo(destination.Slice(total, aligned));
+                total += aligned;
+
+                // Underlying provider short-read: treat as drained for this call (EOS or boundary).
+                if (aligned < count)
+                {
+                    break;
+                }
             }
 
-            _reachedEnd = true;
-            return 0;
+            return total;
         }
         catch (Exception ex) when (ex is not OperationCanceledException and not ObjectDisposedException)
         {

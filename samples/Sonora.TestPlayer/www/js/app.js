@@ -252,6 +252,11 @@
 
     on(E.diagnosticEvent, (payload) => bus.emit('diagEvent', payload));
 
+    on(E.gaplessPcmPhase, (payload) => bus.emit('gaplessPcmPhase', payload));
+    on(E.listeningAbPhase, (payload) => bus.emit('listeningAbPhase', payload));
+    on(E.listeningAbAwaitObservation, (payload) => bus.emit('listeningAbAwaitObservation', payload));
+    on(E.listeningAbObservationReceived, (payload) => bus.emit('listeningAbObservationReceived', payload));
+
     on(E.stall, (payload) => {
       const msg = (payload && payload.message) || 'Playback stalled while Playing (no audio progress).';
       toast(msg, 'danger');
