@@ -342,6 +342,8 @@
         }
       } finally {
         inFlight = false;
+        // Restart if a value arrived between the last while-check and clearing inFlight.
+        if (hasPending) queueMicrotask(pump);
       }
     }
     return (value) => {

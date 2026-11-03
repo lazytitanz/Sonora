@@ -281,6 +281,66 @@ public sealed class GaplessPlaybackTests
     }
 
     [Fact]
+    public async Task Seek_PastEnd_WithNextReady_TransitionsAndStaysPlaying()
+    {
+        // Regression: Duration+10 seeks clamped to EOS, promoted gapless next, then a follow-up seek
+        // suppressed TrackTransitioned and/or touched the disposed prior decoder (Playing + silent hang).
+        HoldableFakeDecoder? trackB = null;
+        var factory = new FakeAudioDecoderFactory((path, _) =>
+        {
+            if (path == "a.wav")
+            {
+                return Task.FromResult<IAudioDecoder>(
+                    FakeAudioDecoder.CreateTone(Format, TimeSpan.FromMilliseconds(200)));
+            }
+
+            trackB = new HoldableFakeDecoder(
+                FakeAudioDecoder.CreateTone(Format, TimeSpan.FromMilliseconds(500)));
+            trackB.Release();
+            return Task.FromResult<IAudioDecoder>(trackB);
+        });
+
+        FakeAudioOutput? output = null;
+        var outputs = new FakeAudioOutputFactory(() =>
+        {
+            output = new FakeAudioOutput(blockSamples: 64, latency: TimeSpan.FromMilliseconds(1));
+            return output;
+        });
+
+        using var engine = new AudioEngine(
+            factory,
+            outputs,
+            new AudioEngineOptions { PrimeDuration = TimeSpan.Zero, BufferDuration = TimeSpan.FromMilliseconds(50) });
+        using var player = engine.CreatePlayer();
+        var transitions = 0;
+        player.TrackTransitioned += (_, _) => Interlocked.Increment(ref transitions);
+
+        await player.LoadAsync("a.wav");
+        await player.PreloadNextAsync("b.wav");
+        Assert.NotNull(trackB);
+        player.Play();
+
+        // Past-end clamp (TestPlayer "Duration + 10 s").
+        player.Seek(player.Duration + TimeSpan.FromSeconds(10));
+
+        await WaitForAsync(() => Volatile.Read(ref transitions) >= 1, TimeSpan.FromSeconds(5));
+        Assert.Equal("b.wav", player.SourcePath);
+        Assert.Equal(PlaybackState.Playing, player.State);
+        Assert.NotNull(output);
+        Assert.False(output!.IsPullLoopIdle);
+
+        // A rapid follow-up seek must not drop the transition or leave the transport silent.
+        var followUp = Task.Run(() => player.Seek(TimeSpan.FromMilliseconds(20)));
+        await followUp.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(50);
+
+        Assert.Equal(1, Volatile.Read(ref transitions));
+        Assert.Equal("b.wav", player.SourcePath);
+        Assert.Equal(PlaybackState.Playing, player.State);
+        Assert.False(output.IsPullLoopIdle);
+    }
+
+    [Fact]
     public async Task LoadAsync_ClearsNext()
     {
         var factory = new FakeAudioDecoderFactory((path, _) =>

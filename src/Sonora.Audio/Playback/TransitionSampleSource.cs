@@ -19,6 +19,7 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
     private readonly Action<int> _onSamplesConsumed;
     private readonly Action _onUnderrun;
     private readonly Func<bool> _isPlaying;
+    private readonly Func<bool> _isOutputSwitching;
     private readonly Func<TrackDecodePipeline?> _getActive;
     private readonly Func<PromoteResult?> _tryPromoteNext;
     private readonly Func<bool> _hasPendingNext;
@@ -37,7 +38,8 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
         Func<TrackDecodePipeline?> getActive,
         Func<PromoteResult?> tryPromoteNext,
         Func<bool> hasPendingNext,
-        Action<TrackTransitionedEventArgs> scheduleTransitioned)
+        Action<TrackTransitionedEventArgs> scheduleTransitioned,
+        Func<bool>? isOutputSwitching = null)
     {
         _format = format;
         _effects = effects;
@@ -45,6 +47,7 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
         _onSamplesConsumed = onSamplesConsumed;
         _onUnderrun = onUnderrun;
         _isPlaying = isPlaying;
+        _isOutputSwitching = isOutputSwitching ?? (() => false);
         _getActive = getActive;
         _tryPromoteNext = tryPromoteNext;
         _hasPendingNext = hasPendingNext;
@@ -65,9 +68,12 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
         Interlocked.Increment(ref _callbacksInRead);
         try
         {
-            if (Volatile.Read(ref _effectsBarrier) == 1)
+            if (Volatile.Read(ref _effectsBarrier) == 1 || _isOutputSwitching())
             {
-                // Keep the device fed with silence while seek resets DSP / pipeline state.
+                // Effects barrier: silence while seek resets DSP.
+                // Output switching: feed silence without draining the ring so a detached
+                // WASAPI/fake pull thread cannot advance samplesConsumed or steal primed PCM
+                // before Shutdown joins (keeps Position and post-rebind continuity coherent).
                 destination.Clear();
                 return destination.Length;
             }
@@ -81,7 +87,7 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
             var filled = 0;
             while (filled < destination.Length)
             {
-                if (Volatile.Read(ref _effectsBarrier) == 1)
+                if (Volatile.Read(ref _effectsBarrier) == 1 || _isOutputSwitching())
                 {
                     destination[filled..].Clear();
                     filled = destination.Length;
@@ -147,8 +153,8 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
 
             if (filled > 0)
             {
-                // Re-check barrier so Reset cannot race an in-flight Process call.
-                if (Volatile.Read(ref _effectsBarrier) == 1)
+                // Re-check barrier / switch so Reset or detach cannot race an in-flight Process call.
+                if (Volatile.Read(ref _effectsBarrier) == 1 || _isOutputSwitching())
                 {
                     destination.Clear();
                     return destination.Length;
@@ -180,13 +186,21 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
     }
 
     /// <summary>
-    /// Blocks output callbacks from observing effect state. Waits for any in-flight
-    /// <see cref="Read"/> to finish so <see cref="AudioEffectRack.ResetProcessingState"/> is safe.
-    /// Does not shut down WASAPI.
+    /// Arms the effects barrier so subsequent <see cref="Read"/> calls return silence and do not
+    /// drain or promote. Does not wait for an in-flight callback — pair with
+    /// <see cref="WaitEffectsBarrier"/> after releasing locks that an audio callback must not hold.
     /// </summary>
-    public void EnterEffectsBarrier(TimeSpan timeout)
+    public void ArmEffectsBarrier()
     {
         Volatile.Write(ref _effectsBarrier, 1);
+    }
+
+    /// <summary>
+    /// Waits for any in-flight <see cref="Read"/> to finish after <see cref="ArmEffectsBarrier"/>
+    /// so <see cref="AudioEffectRack.ResetProcessingState"/> is safe.
+    /// </summary>
+    public void WaitEffectsBarrier(TimeSpan timeout)
+    {
         var deadline = Environment.TickCount64 + (long)Math.Max(1, timeout.TotalMilliseconds);
         while (Volatile.Read(ref _callbacksInRead) != 0)
         {
@@ -197,6 +211,17 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
 
             Thread.SpinWait(40);
         }
+    }
+
+    /// <summary>
+    /// Blocks output callbacks from observing effect state. Waits for any in-flight
+    /// <see cref="Read"/> to finish so <see cref="AudioEffectRack.ResetProcessingState"/> is safe.
+    /// Does not shut down WASAPI.
+    /// </summary>
+    public void EnterEffectsBarrier(TimeSpan timeout)
+    {
+        ArmEffectsBarrier();
+        WaitEffectsBarrier(timeout);
     }
 
     /// <summary>Allows output callbacks to process effects again.</summary>

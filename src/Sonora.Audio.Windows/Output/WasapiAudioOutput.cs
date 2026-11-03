@@ -16,7 +16,14 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
     /// Exclusive event-sync at 50ms still trips native GetBuffer AVs on some HDMI/AMD endpoints
     /// during Shared→Exclusive rebinds. Prefer a slightly larger exclusive period.
     /// </summary>
-    private const int DefaultExclusiveLatencyMs = 100;
+    private const int DefaultExclusiveLatencyMs = 150;
+
+    /// <summary>
+    /// Brief pause after Stop/Join before releasing <see cref="WasapiPlayer"/> COM objects.
+    /// Shared→Exclusive rebinds still race some drivers if FinalRelease runs too close to Stop.
+    /// </summary>
+    private static readonly TimeSpan ComReleaseAfterStopGrace = TimeSpan.FromMilliseconds(75);
+
     private const int MaxAlignmentRetries = 2;
 
     private WasapiPlayer _player;
@@ -307,6 +314,11 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
             return;
         }
 
+        // Disconnect before Stop/Join so the render thread feeds silence instead of touching the
+        // live sample source / ring while we tear the client down.
+        _adapter?.Disconnect();
+        _source = null;
+
         try
         {
             if (_initialized)
@@ -316,16 +328,17 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _adapter?.Disconnect();
-            _source = null;
+            lock (_lifecycleSync)
+            {
+                _shutdown = true;
+            }
+
             throw new AudioOutputException(
                 "Failed to stop WASAPI output during shutdown; replacement output was not started.",
                 AudioOutputFailureKind.ShutdownFailed,
                 ex);
         }
 
-        _adapter?.Disconnect();
-        _source = null;
         lock (_lifecycleSync)
         {
             _shutdown = true;
@@ -475,6 +488,18 @@ internal sealed class WasapiAudioOutput : IAudioOutput, IAsyncDisposable
         }
 
         _player.PlaybackStopped -= OnPlaybackStopped;
+
+        // Let the driver finish releasing the endpoint after Join before FinalRelease of the
+        // AudioClient / AudioRenderClient. Skipping this still allows intermittent GetBuffer AVs
+        // when the next exclusive client opens the same endpoint immediately.
+        try
+        {
+            Thread.Sleep(ComReleaseAfterStopGrace);
+        }
+        catch (ThreadInterruptedException)
+        {
+            // ignored — best-effort settle
+        }
 
         try
         {

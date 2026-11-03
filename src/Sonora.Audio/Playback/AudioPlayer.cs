@@ -67,17 +67,25 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Pause after disposing a live WASAPI output before opening exclusive mode on the
-    /// same endpoint. Short values (≤50ms) still allow intermittent native
-    /// <c>IAudioRenderClient.GetBuffer</c> AVs (<c>0xC0000005</c>) on some drivers when
-    /// Shared→Exclusive follows a device switch while playing.
+    /// same endpoint. Values under ~750ms still allow intermittent native
+    /// <c>IAudioRenderClient.GetBuffer</c> AVs (<c>0xC0000005</c>) on some AMD/HDMI drivers when
+    /// Shared→Exclusive rebinds while playing.
     /// </summary>
-    private static readonly TimeSpan ExclusiveEndpointReleaseGrace = TimeSpan.FromMilliseconds(400);
+    private static readonly TimeSpan ExclusiveEndpointReleaseGrace = TimeSpan.FromMilliseconds(1000);
 
     /// <summary>
     /// Extra settle after constructing an exclusive client before <see cref="IAudioOutput.Initialize"/>,
     /// and again before <see cref="IAudioOutput.Play"/> so the first GetBuffer is not immediate.
     /// </summary>
-    private static readonly TimeSpan ExclusiveEndpointInitGrace = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan ExclusiveEndpointInitGrace = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
+    /// After a query-only exclusive probe (temporary <c>IAudioClient</c>), wait before the real
+    /// exclusive open — probe open/close churn still destabilizes some endpoints.
+    /// </summary>
+    private static readonly TimeSpan ExclusivePostProbeGrace = TimeSpan.FromMilliseconds(200);
+
+    private const int ExclusiveOpenMaxAttempts = 3;
 
     private TrackDecodePipeline? _active;
     private IAudioOutput? _output;
@@ -127,6 +135,13 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     private TimeSpan _logicalPositionAtAnchor;
     /// <summary>Bumped on every position rebase (including seek-to-zero) so output rebinds observe seek intent.</summary>
     private int _positionIntentGeneration;
+
+    /// <summary>
+    /// Nested count of in-flight <see cref="SeekWithResult"/> calls. While non-zero, <see cref="Position"/>
+    /// returns <see cref="_heldPosition"/> so a long Media Foundation seek cannot report a drifting
+    /// device clock (and so we need not Pause the output for the whole seek window).
+    /// </summary>
+    private int _seekInProgress;
 
     /// <summary>Creates a player. Prefer <see cref="AudioEngine.CreatePlayer"/>.</summary>
     public AudioPlayer(
@@ -275,8 +290,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     /// Estimated audible playback position within the active track. Accounts for device rendered clock
     /// and output latency when available. This is an estimate of what is being heard — not the last
     /// seek request, not the verified decoded landing, and not sample-accurate under shared-mode
-    /// resampling, device buffering, underruns, gapless handoffs, or output device switches.
-    /// Use <see cref="SeekWithResult"/> for requested vs actual decoded seek positions.
+    /// resampling, device buffering, underruns, or gapless handoffs.
+    /// During <see cref="OutputDeviceStatus.Switching"/> the last reliable audible snapshot
+    /// (<c>_heldPosition</c>) is returned so UI does not observe sample-based jumps while the
+    /// previous output is detached. Use <see cref="SeekWithResult"/> for requested vs actual
+    /// decoded seek positions.
     /// </summary>
     public TimeSpan Position
     {
@@ -285,6 +303,13 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             if (!_hasSource || _active is null)
             {
                 return TimeSpan.Zero;
+            }
+
+            // Freeze for the whole rebind window (Playing included) — not merely when _output is null.
+            if (_outputDeviceStatus == OutputDeviceStatus.Switching
+                || Volatile.Read(ref _seekInProgress) > 0)
+            {
+                return _heldPosition;
             }
 
             var state = _state;
@@ -435,9 +460,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             _heldPosition = heldPosition;
 
             releasedExclusiveDevice = _effectiveOutputMode == AudioOutputMode.Exclusive;
-            oldOutput = DetachOutput_NoLock();
+            // Mark Switching before Detach so the still-running pull path feeds silence without
+            // draining the ring (see TransitionSampleSource.isOutputSwitching).
             _outputDeviceStatus = OutputDeviceStatus.Switching;
             RaiseOutputDeviceChanged(OutputDeviceChangeReason.Switching);
+            oldOutput = DetachOutput_NoLock();
         }
         finally
         {
@@ -478,6 +505,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
         if (releasedExclusiveDevice || _outputConfiguration.Mode == AudioOutputMode.Exclusive)
         {
+            AssistWasapiEndpointRelease();
             await Task.Delay(ExclusiveEndpointReleaseGrace, switchToken).ConfigureAwait(false);
             ThrowIfSwitchSuperseded(switchGeneration, switchToken);
         }
@@ -564,10 +592,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                     : _heldPosition;
                 _heldPosition = heldPosition;
 
-                oldOutput = DetachOutput_NoLock();
                 _effectiveOutputMode = null;
+                // Mark Switching before Detach so the pull path stops draining the ring.
                 _outputDeviceStatus = OutputDeviceStatus.Switching;
                 RaiseOutputDeviceChanged(OutputDeviceChangeReason.Switching);
+                oldOutput = DetachOutput_NoLock();
             }
         }
         finally
@@ -632,6 +661,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         // exclusive) can fail with DEVICE_IN_USE or native-crash in GetBuffer on some drivers.
         if (releasedExclusive || configuration.Mode == AudioOutputMode.Exclusive)
         {
+            AssistWasapiEndpointRelease();
             await Task.Delay(ExclusiveEndpointReleaseGrace, switchToken).ConfigureAwait(false);
             ThrowIfSwitchSuperseded(switchGeneration, switchToken);
         }
@@ -693,6 +723,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         await WaitForOutputShutdownAsync().ConfigureAwait(false);
         if (releasedExclusive || _outputConfiguration.Mode == AudioOutputMode.Exclusive)
         {
+            AssistWasapiEndpointRelease();
             await Task.Delay(ExclusiveEndpointReleaseGrace, cancellationToken).ConfigureAwait(false);
         }
 
@@ -1159,8 +1190,14 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     /// </summary>
     /// <remarks>
     /// Pump stop, decoder seek, and ring priming run <b>off</b> the command gate so a slow Media Foundation
-    /// seek (or a held decode worker) cannot freeze UI/dispose. Callers on a UI thread should still prefer
-    /// invoking this off the UI thread when possible.
+    /// seek (or a held decode worker) cannot freeze UI/dispose. The output is <b>not</b> Pause'd for the
+    /// seek window — the effects barrier feeds silence instead — so a superseded/abandoned seek cannot
+    /// leave the player <see cref="PlaybackState.Playing"/> with a paused output (no audio, frozen UI).
+    /// The effects barrier is <b>armed under</b> the pipeline lock before the gate is released so a gapless
+    /// promote cannot swap <c>_active</c> in the window before silence begins (that race sought/disposed the
+    /// previous track and dropped <see cref="TrackTransitioned"/>). Seek does not suppress transition ids —
+    /// a committed promote must still notify consumers (artwork / queue index).
+    /// Callers on a UI thread should still prefer invoking this off the UI thread when possible.
     /// </remarks>
     public AudioSeekResult SeekWithResult(TimeSpan position)
     {
@@ -1187,10 +1224,14 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 }
 
                 active = _active;
+                sampleSource = _sampleSource;
+                // Arm before releasing locks so Read cannot promote between capture and silence.
+                sampleSource?.ArmEffectsBarrier();
             }
 
             if (!active.Decoder.CanSeek)
             {
+                sampleSource?.ExitEffectsBarrier();
                 throw new NotSupportedException("The current audio source does not support seeking.");
             }
 
@@ -1199,107 +1240,88 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 position = _duration;
             }
 
-            // Invalidate in-flight transition notifications from a pre-seek drain.
+            // Invalidate older seeks / loads. Do not suppress TrackTransitioned: a promote that
+            // already committed (or commits after this seek) must still reach the host.
             seekGeneration = ++_activeTrackGeneration;
-            _suppressTransitionIdsAtOrBelow = Volatile.Read(ref _transitionId);
 
             wasPlaying = _state == PlaybackState.Playing;
             wasPaused = _state == PlaybackState.Paused;
-            previousHeld = _heldPosition;
-            sampleSource = _sampleSource;
-
-            try
-            {
-                _output?.Pause();
-            }
-            catch (ObjectDisposedException)
-            {
-                // Failed Load can leave a disposed output reference in rare races; seek must still work.
-            }
-            catch (Exception)
-            {
-                // Continue — barrier still protects DSP reset.
-            }
-
-            // Silence the pull path before releasing the gate so DSP reset cannot race callbacks.
-            sampleSource?.EnterEffectsBarrier(TimeSpan.FromSeconds(2));
+            // Freeze Position to the current audible estimate for the seek window (no output Pause).
+            previousHeld = _state is PlaybackState.Playing
+                ? EstimateAudiblePosition()
+                : _heldPosition;
+            _heldPosition = previousHeld;
+            Interlocked.Increment(ref _seekInProgress);
         }
         finally
         {
             _gate.Release();
         }
 
+        // Brief wait for in-flight Read off-gate (must not hold _gate across the spin).
+        // Promote is already blocked by Arm under _pipelineSync; this only drains an in-flight
+        // callback before DSP reset. Keep it short so Seek reaches Decoder.Seek promptly
+        // (concurrent Pause/Stop tests and UI must not sit behind a multi-second spin).
+        sampleSource?.WaitEffectsBarrier(TimeSpan.FromMilliseconds(100));
+
         AudioSeekResult result;
         try
         {
-            // StopPump / Decoder.Seek / Clear must not run under _gate (see TrackDecodePipeline.StopPump).
-            // Media Foundation seeks can block for a long time; holding the gate here AppHangs the UI and
-            // prevents Dispose from completing.
-            active.StopPump();
-            active.Ring.Clear();
-            sampleSource?.ResetEndOfStream();
-
-            var duration = active.Duration > TimeSpan.Zero ? active.Duration : TimeSpan.Zero;
-            if (duration > TimeSpan.Zero && position > duration)
-            {
-                position = duration;
-            }
-
-            _decoderSeekGate.Wait();
             try
             {
-                result = active.Decoder.Seek(position);
-            }
-            finally
-            {
-                _decoderSeekGate.Release();
-            }
-        }
-        catch
-        {
-            _gate.Wait();
-            try
-            {
-                RestoreAfterFailedSeek_NoLock(
-                    active,
-                    sampleSource,
-                    seekGeneration,
-                    wasPlaying,
-                    wasPaused,
-                    previousHeld);
-            }
-            finally
-            {
-                _gate.Release();
-            }
+                // Abort before StopPump / MF seek when promote/load already replaced this pipeline.
+                // Touching a promoted-away decoder races its Dispose and can hang the process.
+                if (seekGeneration != Volatile.Read(ref _activeTrackGeneration)
+                    || !ReferenceEquals(Volatile.Read(ref _active), active))
+                {
+                    throw new InvalidOperationException("Seek was superseded by another session operation.");
+                }
 
-            throw;
-        }
+                // StopPump / Decoder.Seek / Clear must not run under _gate (see TrackDecodePipeline.StopPump).
+                active.StopPump();
+                active.Ring.Clear();
+                sampleSource?.ResetEndOfStream();
 
-        // Prime off-gate: may sleep up to PrimeDuration while the pump fills the ring.
-        if (wasPlaying)
-        {
-            try
-            {
-                _gate.Wait();
+                var duration = active.Duration > TimeSpan.Zero ? active.Duration : TimeSpan.Zero;
+                if (duration > TimeSpan.Zero && position > duration)
+                {
+                    position = duration;
+                }
+
+                if (seekGeneration != Volatile.Read(ref _activeTrackGeneration)
+                    || !ReferenceEquals(Volatile.Read(ref _active), active))
+                {
+                    throw new InvalidOperationException("Seek was superseded by another session operation.");
+                }
+
+                _decoderSeekGate.Wait();
                 try
                 {
-                    ThrowIfSeekSuperseded_NoLock(active, seekGeneration);
-                    EnsureActivePumpRunning_NoLock();
+                    if (seekGeneration != Volatile.Read(ref _activeTrackGeneration)
+                        || !ReferenceEquals(Volatile.Read(ref _active), active))
+                    {
+                        throw new InvalidOperationException("Seek was superseded by another session operation.");
+                    }
+
+                    result = active.Decoder.Seek(position);
                 }
                 finally
                 {
-                    _gate.Release();
+                    _decoderSeekGate.Release();
                 }
-
-                active.Prime(_options.PrimeDuration);
             }
             catch
             {
                 _gate.Wait();
                 try
                 {
-                    sampleSource?.ExitEffectsBarrier();
+                    RestoreAfterFailedSeek_NoLock(
+                        active,
+                        sampleSource,
+                        seekGeneration,
+                        wasPlaying,
+                        wasPaused,
+                        previousHeld);
                 }
                 finally
                 {
@@ -1308,62 +1330,109 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
                 throw;
             }
-        }
 
-        _gate.Wait();
-        try
-        {
-            if (_disposed
-                || seekGeneration != _activeTrackGeneration
-                || !ReferenceEquals(_active, active))
+            // Prime off-gate: may sleep up to PrimeDuration while the pump fills the ring.
+            if (wasPlaying)
             {
-                sampleSource?.ExitEffectsBarrier();
-                throw new InvalidOperationException("Seek was superseded by another session operation.");
+                try
+                {
+                    _gate.Wait();
+                    try
+                    {
+                        ThrowIfSeekSuperseded_NoLock(active, seekGeneration);
+                        EnsureActivePumpRunning_NoLock();
+                    }
+                    finally
+                    {
+                        _gate.Release();
+                    }
+
+                    active.Prime(_options.PrimeDuration);
+                }
+                catch
+                {
+                    _gate.Wait();
+                    try
+                    {
+                        sampleSource?.ExitEffectsBarrier();
+                    }
+                    finally
+                    {
+                        _gate.Release();
+                    }
+
+                    throw;
+                }
             }
 
+            _gate.Wait();
             try
             {
-                _effects.ResetProcessingState();
-                _effects.DisposeRetired();
-
-                // Authoritative timeline from evidence-backed actual when present; otherwise requested intent.
-                var timelinePosition = result.ActualPosition ?? result.RequestedPosition;
-                _timelineOriginSamples = active.Format.TimeToSamples(timelinePosition);
-                Interlocked.Exchange(ref _samplesDecoded, 0);
-                Interlocked.Exchange(ref _samplesConsumed, 0);
-                _completionRaised = false;
-                Interlocked.Exchange(ref _underrunLatched, 0);
-                // Allow natural completion again after seeking away from a prior EOS.
-                Volatile.Write(ref _acceptEndOfStreamCompletion, 1);
-                RebasePositionClock_NoLock(timelinePosition);
-
-                EnsureActivePumpRunning_NoLock();
-
-                // Pause may have landed while Decoder.Seek ran off-gate — do not resume.
-                // Stop bumps _activeTrackGeneration and is rejected by the supersede check above.
-                var resumePlaying = wasPlaying
-                    && _state != PlaybackState.Paused
-                    && _output is not null;
-                if (resumePlaying)
+                if (_disposed
+                    || seekGeneration != _activeTrackGeneration
+                    || !ReferenceEquals(_active, active))
                 {
-                    _output!.Play();
-                    SetState_NoLock(PlaybackState.Playing);
+                    sampleSource?.ExitEffectsBarrier();
+                    throw new InvalidOperationException("Seek was superseded by another session operation.");
                 }
-                else if (wasPaused || _state == PlaybackState.Paused)
+
+                try
                 {
-                    SetState_NoLock(PlaybackState.Paused);
+                    _effects.ResetProcessingState();
+                    _effects.DisposeRetired();
+
+                    // Authoritative timeline from evidence-backed actual when present; otherwise requested intent.
+                    var timelinePosition = result.ActualPosition ?? result.RequestedPosition;
+                    _timelineOriginSamples = active.Format.TimeToSamples(timelinePosition);
+                    Interlocked.Exchange(ref _samplesDecoded, 0);
+                    Interlocked.Exchange(ref _samplesConsumed, 0);
+                    _completionRaised = false;
+                    Interlocked.Exchange(ref _underrunLatched, 0);
+                    // Allow natural completion again after seeking away from a prior EOS.
+                    Volatile.Write(ref _acceptEndOfStreamCompletion, 1);
+                    RebasePositionClock_NoLock(timelinePosition);
+
+                    EnsureActivePumpRunning_NoLock();
+
+                    // Pause may have landed while Decoder.Seek ran off-gate — do not force Playing.
+                    // Output was not Pause'd for seek; keep transport running when still Playing.
+                    if (wasPaused || _state == PlaybackState.Paused)
+                    {
+                        SetState_NoLock(PlaybackState.Paused);
+                    }
+                    else if (wasPlaying && _output is not null && _state != PlaybackState.Stopped)
+                    {
+                        // Ensure the device is pulling after barrier exit (shared soft-pause is unused here).
+                        if (_state != PlaybackState.Playing)
+                        {
+                            SetState_NoLock(PlaybackState.Playing);
+                        }
+
+                        try
+                        {
+                            _output.Play();
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                            // Replacement output may attach concurrently; next command path recovers.
+                        }
+                    }
                 }
+                finally
+                {
+                    sampleSource?.ExitEffectsBarrier();
+                }
+
+                return result.EnsureInvariants();
             }
             finally
             {
-                sampleSource?.ExitEffectsBarrier();
+                _gate.Release();
             }
-
-            return result.EnsureInvariants();
         }
         finally
         {
-            _gate.Release();
+            Interlocked.Decrement(ref _seekInProgress);
         }
     }
 
@@ -1847,7 +1916,10 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             _activeOutputDeviceId = null;
             _effectiveOutputMode = null;
             _outputDeviceStatus = OutputDeviceStatus.Unavailable;
-            _heldPosition = heldPosition;
+            // Keep _heldPosition as-is: switch start snapshotted it, and seek/pause during
+            // Switching may have updated it. Do not clobber with the start-of-switch parameter.
+            _ = heldPosition;
+
             if (wasPlaying)
             {
                 _outputRecoveryIntent = OutputRecoveryIntent.ResumePlaying;
@@ -2455,7 +2527,6 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             }
 
             Volatile.Write(ref _acceptEndOfStreamCompletion, 0);
-            var lostOutput = DetachOutput_NoLock();
             var failureKind = OutputFailureHelpers.KindOf(e.Exception);
             // Exclusive init/format/busy failures are not "device lost": auto-recovering with the
             // same Exclusive configuration recreates the failure in a tight loop. Leave the player
@@ -2464,9 +2535,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 or AudioOutputFailureKind.Unspecified
                 or AudioOutputFailureKind.ShutdownFailed;
 
+            // Switching before Detach freezes Position and stops ring drain on the dying pull path.
             _outputDeviceStatus = autoRecover
                 ? OutputDeviceStatus.Switching
                 : OutputDeviceStatus.Unavailable;
+            var lostOutput = DetachOutput_NoLock();
             if (!autoRecover
                 && failureKind != AudioOutputFailureKind.Unspecified
                 && failureKind != AudioOutputFailureKind.ShutdownFailed)
@@ -2654,9 +2727,9 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             {
                 BeginOutputSwitch_NoLock(CancellationToken.None, out switchGeneration, out switchToken);
                 releasedExclusive = _effectiveOutputMode == AudioOutputMode.Exclusive;
-                oldOutput = DetachOutput_NoLock();
                 _outputDeviceStatus = OutputDeviceStatus.Switching;
                 RaiseOutputDeviceChanged(OutputDeviceChangeReason.Switching);
+                oldOutput = DetachOutput_NoLock();
                 needsCreate = true;
             }
         }
@@ -2703,6 +2776,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
         if (releasedExclusive || _outputConfiguration.Mode == AudioOutputMode.Exclusive)
         {
+            AssistWasapiEndpointRelease();
             await Task.Delay(ExclusiveEndpointReleaseGrace, switchToken).ConfigureAwait(false);
             if (switchGeneration != Volatile.Read(ref _outputSwitchGeneration))
             {
@@ -2914,6 +2988,13 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             return TimeSpan.Zero;
         }
 
+        // Output rebind / in-flight seek: report the held snapshot (seek/pause may update it).
+        if (_outputDeviceStatus == OutputDeviceStatus.Switching
+            || Volatile.Read(ref _seekInProgress) > 0)
+        {
+            return _heldPosition;
+        }
+
         if (Volatile.Read(ref _positionFrozen) == 1)
         {
             return _frozenAudiblePosition;
@@ -2996,7 +3077,8 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 var s = _next.State;
                 return s is NextTrackState.Ready or NextTrackState.Loading;
             },
-            scheduleTransitioned: ScheduleTrackTransitioned);
+            scheduleTransitioned: ScheduleTrackTransitioned,
+            isOutputSwitching: () => _outputDeviceStatus == OutputDeviceStatus.Switching);
 
     private void BindNetworkInfo_NoLock(INetworkTransportInfo? info)
     {
@@ -3256,24 +3338,58 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
         ThrowIfSwitchSuperseded(switchGeneration, switchToken);
 
+        if (useExclusive)
+        {
+            // Probe opened/closed a temporary IAudioClient; give the endpoint a beat before the real open.
+            await Task.Delay(ExclusivePostProbeGrace, switchToken).ConfigureAwait(false);
+            ThrowIfSwitchSuperseded(switchGeneration, switchToken);
+        }
+
         var modeToCreate = useExclusive ? AudioOutputMode.Exclusive : AudioOutputMode.Shared;
         IAudioOutput? created = null;
-        try
+        Exception? createError = null;
+        var attempts = modeToCreate == AudioOutputMode.Exclusive ? ExclusiveOpenMaxAttempts : 1;
+        for (var attempt = 1; attempt <= attempts; attempt++)
         {
-            created = await _outputFactory
-                .CreateOutputAsync(BuildCreateRequest(effectiveDeviceId, modeToCreate), switchToken)
-                .ConfigureAwait(false);
+            try
+            {
+                created = await _outputFactory
+                    .CreateOutputAsync(BuildCreateRequest(effectiveDeviceId, modeToCreate), switchToken)
+                    .ConfigureAwait(false);
+                createError = null;
+                break;
+            }
+            catch (OperationCanceledException)
+            {
+                ThrowIfSwitchSuperseded(switchGeneration, CancellationToken.None);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                createError = ex is AudioException
+                    ? ex
+                    : new AudioOutputException("Failed to open the output device.", ex);
+
+                var kind = OutputFailureHelpers.KindOf(createError);
+                var canRetry = modeToCreate == AudioOutputMode.Exclusive
+                    && attempt < attempts
+                    && OutputFailureHelpers.IsFallbackEligible(kind);
+                if (canRetry)
+                {
+                    AssistWasapiEndpointRelease();
+                    await Task.Delay(ExclusiveEndpointReleaseGrace, switchToken).ConfigureAwait(false);
+                    ThrowIfSwitchSuperseded(switchGeneration, switchToken);
+                    continue;
+                }
+
+                break;
+            }
         }
-        catch (OperationCanceledException)
+
+        if (created is null)
         {
-            ThrowIfSwitchSuperseded(switchGeneration, CancellationToken.None);
-            throw;
-        }
-        catch (Exception ex)
-        {
-            var wrapped = ex is AudioException
-                ? ex
-                : new AudioOutputException("Failed to open the output device.", ex);
+            var wrapped = createError
+                ?? new AudioOutputException("Failed to open the output device.");
 
             if (useExclusive
                 && config.ExclusiveFallback == ExclusiveModeFallback.Shared
@@ -3300,7 +3416,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                     RaiseOutputConfigurationChanged();
                 }
 
-                throw;
+                throw wrapped;
             }
         }
 
@@ -3627,7 +3743,8 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         _activeOutputDeviceId = null;
         _effectiveOutputMode = null;
         _outputDeviceStatus = OutputDeviceStatus.Unavailable;
-        _heldPosition = heldPosition;
+        // Preserve seek/pause updates applied to _heldPosition during Switching.
+        _ = heldPosition;
         if (wasPlaying)
         {
             _outputRecoveryIntent = OutputRecoveryIntent.ResumePlaying;
@@ -3652,6 +3769,19 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         a.SampleRate == b.SampleRate
         && a.ChannelCount == b.ChannelCount
         && a.SampleFormat == b.SampleFormat;
+
+    /// <summary>
+    /// Encourages prompt RCW finalization of disposed WASAPI clients before reopening the
+    /// same endpoint in exclusive mode. Timing alone is not a lifecycle signal; this is a
+    /// narrow assist for drivers that AV <c>GetBuffer</c> when the previous client is still
+    /// mid-FinalRelease.
+    /// </summary>
+    private static void AssistWasapiEndpointRelease()
+    {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+    }
 
     private async Task RebuildSessionForOutputFormatAsync(
         AudioFormat requiredFormat,

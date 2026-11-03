@@ -64,6 +64,47 @@ public sealed class ConcurrentLifecycleTests
     }
 
     [Fact]
+    public async Task Seek_SupersededByNewerSeek_DoesNotLeaveOutputPaused()
+    {
+        // Regression: Seek used to Pause the output for the whole Decoder.Seek window. A superseded
+        // seek then abandoned without Play, leaving Playing + silent/frozen progress under rapid seeks.
+        var hold = new HoldableFakeDecoder(FakeAudioDecoder.CreateTone(Format, TimeSpan.FromSeconds(3)));
+        hold.Release();
+        FakeAudioOutput? output = null;
+        var factory = new FakeAudioOutputFactory(_ =>
+        {
+            output = new FakeAudioOutput();
+            return output;
+        });
+        using var engine = new AudioEngine(
+            new FakeAudioDecoderFactory(hold),
+            factory,
+            new AudioEngineOptions { PrimeDuration = TimeSpan.Zero });
+        using var player = engine.CreatePlayer();
+        await player.LoadAsync("a.wav");
+        player.Play();
+        Assert.NotNull(output);
+        var playCountAtStart = output!.PlayCount;
+
+        hold.HoldSeek();
+        var first = Task.Run(() => player.Seek(TimeSpan.FromMilliseconds(100)));
+        Assert.True(hold.WaitUntilSeekHeld(TimeSpan.FromSeconds(2)));
+
+        // Newer seek supersedes; first must abort without leaving the transport paused.
+        var second = Task.Run(() => player.Seek(TimeSpan.FromMilliseconds(200)));
+        await Task.Delay(50);
+        hold.ReleaseSeek();
+
+        _ = await Record.ExceptionAsync(() => first);
+        await second.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(PlaybackState.Playing, player.State);
+        // Seek no longer soft-Pauses the output for the MF window; the pull loop must stay alive.
+        Assert.False(output.IsPullLoopIdle);
+        Assert.True(output.PlayCount >= playCountAtStart);
+    }
+
+    [Fact]
     public async Task Seek_WhileDecoderSeekHeld_DoesNotBlockPauseOrStop()
     {
         // Regression: Seek used to hold the command gate across Decoder.Seek. A slow MF seek
@@ -79,25 +120,51 @@ public sealed class ConcurrentLifecycleTests
         player.Play();
 
         hold.HoldSeek();
-        var seekTask = Task.Run(() => player.Seek(TimeSpan.FromMilliseconds(200)));
-        Assert.True(hold.WaitUntilSeekHeld(TimeSpan.FromSeconds(2)));
+        // Dedicated thread: under CI thread-pool pressure Task.Run can delay past a short WaitUntilSeekHeld.
+        Exception? seekError = null;
+        var seekThread = new Thread(() =>
+        {
+            try
+            {
+                player.Seek(TimeSpan.FromMilliseconds(200));
+            }
+            catch (Exception ex)
+            {
+                seekError = ex;
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "Sonora.Test.SeekHeld",
+        };
+        seekThread.Start();
+        try
+        {
+            Assert.True(
+                hold.WaitUntilSeekHeld(TimeSpan.FromSeconds(10)),
+                "Seek did not reach Decoder.Seek within the hold window.");
 
-        // Pause must return without waiting for Decoder.Seek.
-        var paused = Task.Run(player.Pause);
-        await paused.WaitAsync(TimeSpan.FromSeconds(2));
-        Assert.Equal(PlaybackState.Paused, player.State);
+            // Pause must return without waiting for Decoder.Seek.
+            var paused = Task.Run(player.Pause);
+            await paused.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.Equal(PlaybackState.Paused, player.State);
 
-        // Stop's gate section must finish; decoder rewind may still be waiting on HoldSeek.
-        var stopTask = Task.Run(player.Stop);
-        await Task.Delay(100);
-        Assert.Equal(PlaybackState.Stopped, player.State);
+            // Stop's gate section must finish; decoder rewind may still be waiting on HoldSeek.
+            var stopTask = Task.Run(player.Stop);
+            await Task.Delay(100);
+            Assert.Equal(PlaybackState.Stopped, player.State);
 
-        hold.ReleaseSeek();
-        await stopTask.WaitAsync(TimeSpan.FromSeconds(5));
-        // Seek may succeed or fault (superseded); it must not hang.
-        var finished = await Task.WhenAny(seekTask, Task.Delay(TimeSpan.FromSeconds(5)));
-        Assert.Same(seekTask, finished);
-        _ = await Record.ExceptionAsync(() => seekTask);
+            hold.ReleaseSeek();
+            await stopTask.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(seekThread.Join(TimeSpan.FromSeconds(5)), "Seek thread did not finish after ReleaseSeek.");
+            // Seek may succeed or fault (superseded); it must not hang.
+            _ = seekError;
+        }
+        finally
+        {
+            hold.ReleaseSeek();
+            seekThread.Join(TimeSpan.FromSeconds(2));
+        }
     }
 
     [Fact]

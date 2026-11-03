@@ -44,7 +44,7 @@ Ordered teardown: stop output → stop pump → dispose decoder/output (pump/out
 ## Position model
 
 - `BufferedPosition` — decode frontier (samples written to the ring).
-- `Position` — estimated audible time. On Windows, `WasapiPlayer.GetPosition()` is rebased at load/seek/stop so the logical timeline remains consistent.
+- `Position` — estimated audible time. On Windows, `WasapiPlayer.GetPosition()` is rebased at load/seek/stop so the logical timeline remains consistent. While `OutputDeviceStatus.Switching`, reports the held audible snapshot (seek/pause may update it) so UI does not observe sample-based jumps while the previous output is detached; the pull path also feeds silence without draining the ring during that window.
 - `SeekWithResult` — requested vs actual source-frame landing (`AudioSeekResult`); `Unknown` ⇒ null `ActualPosition`.
 - Frame indices are authoritative inside converters (`TimeToFrames` / `FramesToTime`); `TimeSpan` is used at API boundaries.
 

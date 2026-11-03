@@ -112,11 +112,12 @@
     }
   }
 
-  async function syncArtwork() {
+  async function syncArtwork(preferredId) {
     const snap = state.snapshot;
     const item = currentItem();
-    // Prefer snapshot id; fall back to the trackChanged payload when snapshot is still stale.
-    const id = (snap && snap.currentItemId) || (item && item.id) || null;
+    // Prefer an explicit trackChanged id: snapshot.currentItemId can still be the previous track
+    // when gapless TrackTransitioned fires (artwork was missing after Duration+10 s advances).
+    const id = preferredId || (item && item.id) || (snap && snap.currentItemId) || null;
     if (id === artworkFor && artworkResolved) return;
     if (id === artworkFor && !artworkResolved) return; // request already in flight
     artworkFor = id;
@@ -126,12 +127,13 @@
       artworkResolved = true;
       return;
     }
-    if (item && item.isStream) {
+    const artItem = (item && item.id === id) ? item : (state.queue.find((i) => i.id === id) || item);
+    if (artItem && artItem.isStream) {
       artworkResolved = true;
       return;
     }
-    if (item && isSafeArtworkUrl(item.artworkDataUrl)) {
-      setArtwork(item.artworkDataUrl);
+    if (artItem && isSafeArtworkUrl(artItem.artworkDataUrl)) {
+      setArtwork(artItem.artworkDataUrl);
       artworkResolved = true;
       return;
     }
@@ -694,29 +696,41 @@
     pushHistory(historyText || message);
   }
 
+  // Host coalesces rapid seeks (latest-wins). Keep UI responsive: never block the next click behind
+  // an in-flight seek, and never treat a real decoder "unknown" accuracy as a coalesced skip.
+  let seekUiEpoch = 0;
+
   async function doSeek(withResult) {
     const seconds = Number.parseFloat(dom['seek-input'].value);
     if (!Number.isFinite(seconds)) {
       toast('Enter a number of seconds to seek to.', 'warning');
       return;
     }
+    const epoch = ++seekUiEpoch;
     const ms = seconds * 1000;
     if (withResult) {
       const result = await run('playback.seekWithResult', [ms], { toast: false });
-      if (result.ok) showSeekResult(seconds, result.value);
-      else {
+      if (epoch !== seekUiEpoch) return; // a newer click owns the result panel
+      if (result.ok) {
+        if (result.value && result.value.coalesced) {
+          // Host dropped this ticket behind a newer target — leave the panel for the latest call.
+          return;
+        }
+        showSeekResult(seconds, result.value);
+      } else {
         showSeekText(`Rejected: ${result.message}`, 'bad', `${seconds} s rejected`);
         toast(`Seek rejected: ${result.message}`, 'warning');
       }
     } else {
       const result = await run('playback.seek', [ms], { toast: false });
+      if (epoch !== seekUiEpoch) return;
       if (result.ok) showSeekText(`Seek to ${seconds} s issued. Plain seek reports no landing position; use “Seek with result” for that.`, 'muted', `${seconds} s issued (no result)`);
       else {
         showSeekText(`Rejected: ${result.message}`, 'bad', `${seconds} s rejected`);
         toast(`Seek rejected: ${result.message}`, 'warning');
       }
     }
-    await refreshSnapshot();
+    if (epoch === seekUiEpoch) await refreshSnapshot();
   }
 
   function presetSeconds(kind) {
@@ -789,6 +803,9 @@
       renderNowPlaying();
       renderTransport();
       updateQueueHighlight();
+      // Force a fresh artwork resolve on every track change (gapless Duration+10 advances).
+      artworkFor = null;
+      artworkResolved = false;
       // Prefer artwork already attached to the track payload (thumbnail data URL from the host).
       if (payload && isSafeArtworkUrl(payload.artworkDataUrl)) {
         artworkFor = payload.id || artworkFor;
@@ -796,7 +813,8 @@
         setArtwork(payload.artworkDataUrl);
         return;
       }
-      syncArtwork();
+      // Pass payload.id so we do not keep the previous track's artwork when snapshot is stale.
+      syncArtwork(payload && payload.id ? payload.id : null);
     });
     TP.bus.on('queue', () => {
       renderQueue();

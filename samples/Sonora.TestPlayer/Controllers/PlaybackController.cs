@@ -55,6 +55,14 @@ public sealed class PlaybackController : IAsyncDisposable
     private int _errorsObserved;
     private int _underrunEventsObserved;
 
+    /// <summary>
+    /// Serializes seek commands and coalesces to the latest target so rapid preset clicks (Duration+10 s)
+    /// cannot queue N Media Foundation seeks behind a hung/slow one.
+    /// </summary>
+    private readonly SemaphoreSlim _seekGate = new(1, 1);
+    private int _seekTicket;
+    private double _latestSeekMs;
+
     /// <summary>Creates the controller. Call <see cref="CreateEngine"/> and <see cref="CreatePlayer"/> next.</summary>
     /// <param name="store">Diagnostics sink.</param>
     /// <param name="context">Context to marshal engine events onto (the UI context in the app).</param>
@@ -425,7 +433,24 @@ public sealed class PlaybackController : IAsyncDisposable
     public void Seek(double positionMs)
     {
         ThrowIfDisposed();
-        RequirePlayer().Seek(ToPosition(positionMs));
+        _ = ToPosition(positionMs); // validate before publishing
+        Volatile.Write(ref _latestSeekMs, positionMs);
+        var ticket = Interlocked.Increment(ref _seekTicket);
+        _seekGate.Wait();
+        try
+        {
+            ThrowIfDisposed();
+            if (ticket != Volatile.Read(ref _seekTicket))
+            {
+                return;
+            }
+
+            RequirePlayer().Seek(ToPosition(Volatile.Read(ref _latestSeekMs)));
+        }
+        finally
+        {
+            _seekGate.Release();
+        }
     }
 
     /// <summary>Seeks and reports requested vs actual landing position.</summary>
@@ -433,15 +458,36 @@ public sealed class PlaybackController : IAsyncDisposable
     public SeekResultDto SeekWithResult(double positionMs)
     {
         ThrowIfDisposed();
-        var result = RequirePlayer().SeekWithResult(ToPosition(positionMs));
-        var dto = SeekResultDto.From(result);
-        Log(
-            DiagnosticLevel.Info,
-            "playback.seek",
-            $"Seek {dto.Accuracy}.",
-            ("requestedMs", dto.RequestedMs.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)),
-            ("actualMs", dto.ActualMs?.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) ?? "unknown"));
-        return dto;
+        _ = ToPosition(positionMs); // validate before publishing
+        Volatile.Write(ref _latestSeekMs, positionMs);
+        var ticket = Interlocked.Increment(ref _seekTicket);
+        _seekGate.Wait();
+        try
+        {
+            ThrowIfDisposed();
+            if (ticket != Volatile.Read(ref _seekTicket))
+            {
+                // Newer seek owns the gate next — do not invent a landing position.
+                // Coalesced must not be confused with a real decoder Unknown accuracy (UI was
+                // swallowing every post-gapless Unknown seek as "skipped").
+                var skipped = ToPosition(Volatile.Read(ref _latestSeekMs));
+                return SeekResultDto.CoalescedSkip(skipped.TotalMilliseconds);
+            }
+
+            var result = RequirePlayer().SeekWithResult(ToPosition(Volatile.Read(ref _latestSeekMs)));
+            var dto = SeekResultDto.From(result);
+            Log(
+                DiagnosticLevel.Info,
+                "playback.seek",
+                $"Seek {dto.Accuracy}.",
+                ("requestedMs", dto.RequestedMs.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)),
+                ("actualMs", dto.ActualMs?.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) ?? "unknown"));
+            return dto;
+        }
+        finally
+        {
+            _seekGate.Release();
+        }
     }
 
     /// <summary>Sets linear volume and returns the authoritative engine value.</summary>
@@ -775,6 +821,8 @@ public sealed class PlaybackController : IAsyncDisposable
         {
             await DisposeQuietlyAsync(engine.DisposeAsync(), "engine").ConfigureAwait(false);
         }
+
+        _seekGate.Dispose();
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -1014,10 +1062,36 @@ public sealed class PlaybackController : IAsyncDisposable
             ("transitionId", e.TransitionId.ToString()),
             ("previousPath", e.PreviousPath ?? string.Empty),
             ("nextPath", e.NextPath ?? string.Empty));
-        // Artwork is fetched lazily via getArtwork / the next full load; keep the transition payload small.
-        RaiseUi(UiEventNames.TrackChanged, advancedTo with { ArtworkDataUrl = null });
+        // Include cached artwork when available so Duration+10 gapless advances paint immediately;
+        // otherwise the UI fetches via getArtwork (payload id is authoritative).
+        string? cachedArt = null;
+        lock (_lock)
+        {
+            if (_artworkCache is { } cache && cache.Id == advancedTo!.Id)
+            {
+                cachedArt = cache.Url;
+            }
+        }
+
+        RaiseUi(UiEventNames.TrackChanged, advancedTo with { ArtworkDataUrl = cachedArt });
         RaiseSnapshot();
         _ = PreloadNextAsync(CancellationToken.None);
+        if (cachedArt is null)
+        {
+            _ = PrefetchArtworkAsync(advancedTo.Id);
+        }
+    }
+
+    private async Task PrefetchArtworkAsync(string id)
+    {
+        try
+        {
+            await GetArtworkDataUrlAsync(id, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Best-effort warm cache; UI getArtwork remains the source of truth.
+        }
     }
 
     private void HandleCompleted(int generation)

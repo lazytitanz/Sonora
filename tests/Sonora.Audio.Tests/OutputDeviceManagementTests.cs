@@ -130,8 +130,9 @@ public class OutputDeviceManagementTests
         var first = player.SetOutputDeviceAsync("b");
         await createBStarted.Task.WaitAsync(TimeSpan.FromSeconds(3));
         var second = player.SetOutputDeviceAsync("a");
-        await second;
-        var firstError = await Record.ExceptionAsync(() => first);
+        // Bound waits so a stuck cancellation cannot sit until blame-hang (3m) aborts the host.
+        await second.WaitAsync(TimeSpan.FromSeconds(10));
+        var firstError = await Record.ExceptionAsync(() => first.WaitAsync(TimeSpan.FromSeconds(10)));
         Assert.IsType<OperationCanceledException>(firstError);
 
         Assert.Equal("a", player.PreferredOutputDeviceId);

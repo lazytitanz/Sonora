@@ -7,11 +7,16 @@ namespace Sonora.TestPlayer.Models;
 /// <param name="ActualMs">Decoder-evidenced landing position, or <see langword="null"/> when unknown.</param>
 /// <param name="Accuracy">How precisely the landing was established.</param>
 /// <param name="DeltaMs">Signed difference (actual − requested) when <paramref name="ActualMs"/> is known.</param>
+/// <param name="Coalesced">
+/// True when this call was skipped because a newer seek target was already queued (latest-wins).
+/// Not the same as <see cref="AudioSeekAccuracy.Unknown"/> from a real decoder landing.
+/// </param>
 public sealed record SeekResultDto(
     double RequestedMs,
     double? ActualMs,
     AudioSeekAccuracy Accuracy,
-    double? DeltaMs)
+    double? DeltaMs,
+    bool Coalesced = false)
 {
     /// <summary>Creates a DTO from an engine seek result.</summary>
     public static SeekResultDto From(AudioSeekResult result)
@@ -19,6 +24,10 @@ public sealed record SeekResultDto(
         ArgumentNullException.ThrowIfNull(result);
         var requested = result.RequestedPosition.TotalMilliseconds;
         var actual = result.ActualPosition?.TotalMilliseconds;
-        return new SeekResultDto(requested, actual, result.Accuracy, actual - requested);
+        return new SeekResultDto(requested, actual, result.Accuracy, actual - requested, Coalesced: false);
     }
+
+    /// <summary>Creates a placeholder for a seek that lost latest-wins coalescing.</summary>
+    public static SeekResultDto CoalescedSkip(double requestedMs) =>
+        new(requestedMs, ActualMs: null, AudioSeekAccuracy.Unknown, DeltaMs: null, Coalesced: true);
 }
