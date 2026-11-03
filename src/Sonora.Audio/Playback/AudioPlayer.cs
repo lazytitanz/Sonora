@@ -1374,10 +1374,37 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             _gate.Release();
         }
 
-        // Decoder.Seek must not run under _gate (same AppHang class as user Seek).
-        if (decoderReset is not null)
+        // StopPump join and Decoder.Seek must not run under _gate.
+        var toStop = decoderReset ?? Volatile.Read(ref _active);
+        var stopIdentity = toStop?.Identity;
+        toStop?.StopPump();
+        if (decoderReset is not null
+            && stopIdentity is int id
+            && ReferenceEquals(Volatile.Read(ref _active), decoderReset)
+            && decoderReset.Identity == id)
         {
             ApplyDecoderResetToStart(decoderReset);
+        }
+        else if (toStop is { Decoder.CanSeek: false }
+                 && stopIdentity is int nonSeekId
+                 && ReferenceEquals(Volatile.Read(ref _active), toStop)
+                 && toStop.Identity == nonSeekId
+                 && toStop.WorkerShutdownCompleted.IsCompleted)
+        {
+            _gate.Wait();
+            try
+            {
+                if (!_disposed
+                    && ReferenceEquals(_active, toStop)
+                    && toStop.Identity == nonSeekId)
+                {
+                    EnsureActivePumpRunning_NoLock();
+                }
+            }
+            finally
+            {
+                _gate.Release();
+            }
         }
     }
 
@@ -1498,13 +1525,19 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 }
 
                 // StopPump / Decoder.Seek / Clear must not run under _gate (see TrackDecodePipeline.StopPump).
+                if (active.IsDisposePending)
+                {
+                    RecordSeekTrace(SeekLifecycleStage.Failed, seekId, active, requested: position, outcome: 3);
+                    throw new InvalidOperationException("Seek cannot proceed because the track pipeline is disposing.");
+                }
+
                 RecordSeekTrace(SeekLifecycleStage.StopPumpEnter, seekId, active, requested: position);
                 active.OnDecodeWorkerAliveAfterStop = OnDecodeWorkerAliveAfterStop;
                 active.StopPump();
                 if (active.LastStopTimedOut)
                 {
                     Interlocked.Increment(ref _stopPumpTimeoutCount);
-                    // Flags bit1 = pump still running (orphan). Timeout ≠ exited.
+                    // Flags bit1 = worker still alive after caller wait (still owned — diagnostic).
                     RecordSeekTrace(
                         SeekLifecycleStage.StopPumpTimeout,
                         seekId,
@@ -1520,6 +1553,14 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 else
                 {
                     RecordSeekTrace(SeekLifecycleStage.StopPumpExit, seekId, active, requested: position);
+                }
+
+                // Authoritative: worker completion, not the stop-wait timeout flag.
+                if (!active.WorkerShutdownCompleted.IsCompleted || active.IsPumpRunning)
+                {
+                    RecordSeekTrace(SeekLifecycleStage.Failed, seekId, active, requested: position, outcome: 3);
+                    throw new InvalidOperationException(
+                        "Seek cannot proceed because the decode worker has not exited after StopPump.");
                 }
 
                 active.Ring.Clear();
@@ -1543,7 +1584,9 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 try
                 {
                     if (seekGeneration != Volatile.Read(ref _activeTrackGeneration)
-                        || !ReferenceEquals(Volatile.Read(ref _active), active))
+                        || !ReferenceEquals(Volatile.Read(ref _active), active)
+                        || active.IsDisposePending
+                        || !active.WorkerShutdownCompleted.IsCompleted)
                     {
                         RecordSeekTrace(SeekLifecycleStage.Superseded, seekId, active, requested: position, outcome: 2);
                         throw new InvalidOperationException("Seek was superseded by another session operation.");
@@ -1567,7 +1610,8 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             }
             catch (Exception ex)
             {
-                var superseded = ex is InvalidOperationException;
+                var superseded = ex is InvalidOperationException io
+                    && io.Message.Contains("superseded", StringComparison.Ordinal);
                 if (!superseded)
                 {
                     RecordSeekTrace(SeekLifecycleStage.Failed, seekId, active, requested: position, outcome: 3);
@@ -1739,11 +1783,26 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         AudioSeekResult? seekResult = null;
         try
         {
+            // Authoritative worker exit — never Seek while Read may still be outstanding.
+            if (active.IsDisposePending
+                || !active.WorkerShutdownCompleted.IsCompleted
+                || active.IsPumpRunning)
+            {
+                return;
+            }
+
             if (active.Decoder.CanSeek)
             {
                 _decoderSeekGate.Wait();
                 try
                 {
+                    if (active.IsDisposePending
+                        || !active.WorkerShutdownCompleted.IsCompleted
+                        || active.IsPumpRunning)
+                    {
+                        return;
+                    }
+
                     seekResult = active.Decoder.Seek(TimeSpan.Zero);
                 }
                 finally
@@ -1797,16 +1856,24 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             {
                 attempted.Ring.Clear();
                 sampleSource?.ResetEndOfStream();
+                // Authoritative: worker still owns the decoder — HasOrphanDecodeWorker is diagnostic only.
+                var incompleteShutdown = !attempted.WorkerShutdownCompleted.IsCompleted
+                    || attempted.IsPumpRunning;
                 EnsureActivePumpRunning_NoLock();
                 RebasePositionClock_NoLock(previousHeld);
-                if (wasPlaying && _output is not null)
+                if (wasPaused)
+                {
+                    SetState_NoLock(PlaybackState.Paused);
+                }
+                else if (wasPlaying && incompleteShutdown)
+                {
+                    // Incomplete StopPump — barrier is exited below; do not claim Playing+silence.
+                    SetState_NoLock(PlaybackState.Stopped);
+                }
+                else if (wasPlaying && _output is not null)
                 {
                     _output.Play();
                     SetState_NoLock(PlaybackState.Playing);
-                }
-                else if (wasPaused)
-                {
-                    SetState_NoLock(PlaybackState.Paused);
                 }
                 else
                 {
@@ -2383,7 +2450,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         var toDispose = previous;
         var oldNetwork = previousNetwork;
         var newNetwork = nextNetwork;
-        _ = Task.Run(() =>
+        _ = Task.Run(async () =>
         {
             try
             {
@@ -2406,7 +2473,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                     // ignored
                 }
 
-                toDispose?.Dispose();
+                if (toDispose is not null)
+                {
+                    // Completion-aware dispose — never release decoder while worker may still Read.
+                    await toDispose.DisposeAsync().ConfigureAwait(false);
+                }
             }
             catch
             {
@@ -2452,16 +2523,23 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     private void EnsureActivePumpRunning_NoLock()
     {
         var active = _active;
-        if (active is null)
+        if (active is null || active.IsDisposePending)
         {
             return;
         }
 
         active.OnDecodeWorkerAliveAfterStop = OnDecodeWorkerAliveAfterStop;
-        active.StartPump(
-            _options.Processors,
-            onSamplesWritten: n => Interlocked.Add(ref _samplesDecoded, n),
-            onError: ex => RaiseError(ex));
+        try
+        {
+            active.StartPump(
+                _options.Processors,
+                onSamplesWritten: n => Interlocked.Add(ref _samplesDecoded, n),
+                onError: ex => RaiseError(ex));
+        }
+        catch (InvalidOperationException)
+        {
+            // Prior worker still alive — leave pump alone; caller/diagnostics observe LastStopTimedOut.
+        }
     }
 
     /// <summary>
@@ -2549,7 +2627,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         }
         finally
         {
-            bag.Active?.Dispose();
+            bag.Active?.Dispose(); // may defer decoder/ring until worker exits
             bag.Active = null;
         }
 
@@ -2603,11 +2681,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             if (bag.Active is not null)
             {
                 await bag.Active.StopPumpAsync().ConfigureAwait(false);
+                await bag.Active.DisposeAsync().ConfigureAwait(false);
             }
         }
         finally
         {
-            bag.Active?.Dispose();
             bag.Active = null;
         }
 
@@ -2616,11 +2694,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             if (bag.Next is not null)
             {
                 await bag.Next.StopPumpAsync().ConfigureAwait(false);
+                await bag.Next.DisposeAsync().ConfigureAwait(false);
             }
         }
         finally
         {
-            bag.Next?.Dispose();
             bag.Next = null;
         }
 
@@ -2637,20 +2715,28 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Stops transport under the command gate. When <paramref name="resetToStart"/> is true and the
-    /// decoder can seek, returns the active pipeline so the caller can rewind it <b>off</b> the gate
-    /// via <see cref="ApplyDecoderResetToStart"/>.
+    /// Stops transport under the command gate without joining the decode worker.
+    /// Requests pump cancel only; callers must <see cref="TrackDecodePipeline.StopPump"/> /
+    /// <see cref="ApplyDecoderResetToStart"/> <b>off</b> the gate so StopPump never blocks `_gate`.
     /// </summary>
     private TrackDecodePipeline? StopTransport_NoLock(bool resetToStart, bool raiseCompletion)
     {
         Volatile.Write(ref _acceptEndOfStreamCompletion, 0);
 
         _output?.Stop();
-        _active?.StopPump();
+        // Non-blocking cancel — full StopPump join happens off-gate at the caller.
+        _active?.RequestPumpStop();
 
         if (_active is not null)
         {
-            _active.Ring.Clear();
+            try
+            {
+                _active.Ring.Clear();
+            }
+            catch (ObjectDisposedException)
+            {
+                // ignored
+            }
         }
 
         _sampleSource?.ResetEndOfStream();
@@ -2667,10 +2753,6 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             if (_active.Decoder.CanSeek)
             {
                 decoderReset = _active;
-            }
-            else
-            {
-                EnsureActivePumpRunning_NoLock();
             }
         }
         else
@@ -2733,10 +2815,17 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             }
         }
 
+        // Only join + rewind when terminal EOS requested a decoder reset. Device-loss /
+        // exception stops must not StopPump the still-owned active pipeline (recovery reuses it).
         if (decoderReset is not null)
         {
-            // Must not Decoder.Seek under the gate (may block on Media Foundation).
-            ApplyDecoderResetToStart(decoderReset);
+            var identity = decoderReset.Identity;
+            decoderReset.StopPump();
+            if (ReferenceEquals(Volatile.Read(ref _active), decoderReset)
+                && decoderReset.Identity == identity)
+            {
+                ApplyDecoderResetToStart(decoderReset);
+            }
         }
     }
 
@@ -4142,6 +4231,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
         await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
         AudioSource activeSource;
+        TrackDecodePipeline? oldActiveForDispose = null;
         try
         {
             ThrowIfSwitchSuperseded(switchGeneration, switchToken);
@@ -4156,12 +4246,12 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             _heldPosition = heldPosition;
 
             // Tear down active pipeline but keep session flags for rebuild.
+            // StopPump/Dispose join must not run under _gate.
             UnbindNetworkInfo_NoLock(setIdle: true);
-            _active.StopPump();
+            _active.RequestPumpStop();
             _sampleSource = null;
-            var oldActive = _active;
+            oldActiveForDispose = _active;
             _active = null;
-            oldActive.Dispose();
 
             if (hasNext)
             {
@@ -4177,6 +4267,17 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         finally
         {
             _gate.Release();
+        }
+
+        if (oldActiveForDispose is not null)
+        {
+            var disposeId = oldActiveForDispose.Identity;
+            oldActiveForDispose.StopPump();
+            // Only dispose this identity — never a newly promoted active.
+            if (oldActiveForDispose.Identity == disposeId)
+            {
+                await oldActiveForDispose.DisposeAsync().ConfigureAwait(false);
+            }
         }
 
         // Rebuild active off-gate.

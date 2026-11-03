@@ -10,6 +10,11 @@ namespace Sonora.Audio.Playback;
 /// Master volume is applied on the output pull path (<see cref="PcmVolume"/>), not here, so volume
 /// changes are not delayed by ring buffering.
 /// </summary>
+/// <remarks>
+/// Stop timeout bounds how long a caller waits; it does not mean the worker exited.
+/// <see cref="ShutdownCompleted"/> is the authoritative signal that the worker has finished and
+/// the decoder is no longer accessed by this pump.
+/// </remarks>
 internal sealed class DecodePump : IDisposable
 {
     private readonly IAudioDecoder _decoder;
@@ -22,7 +27,11 @@ internal sealed class DecodePump : IDisposable
     private Task? _task;
     private int _started;
     private int _stopTimedOut;
+    private int _stopRequested;
     private Action? _onStillAliveAfterCancel;
+    private readonly TaskCompletionSource _shutdownTcs =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private Task? _sharedStopTask;
 
     public DecodePump(
         IAudioDecoder decoder,
@@ -42,10 +51,20 @@ internal sealed class DecodePump : IDisposable
         _onStillAliveAfterCancel = onStillAliveAfterCancel;
     }
 
+    /// <summary>True while the worker task has not completed.</summary>
     public bool IsRunning => _task is { IsCompleted: false };
 
-    /// <summary>True when the last <see cref="StopAsync"/> timed out before the worker joined.</summary>
+    /// <summary>True when a caller waited out the stop join timeout while the worker was still alive.</summary>
     public bool StopTimedOut => Volatile.Read(ref _stopTimedOut) != 0;
+
+    /// <summary>True after <see cref="StopAsync"/> has been requested (or Dispose cancelled the CTS).</summary>
+    public bool StopRequested => Volatile.Read(ref _stopRequested) != 0;
+
+    /// <summary>
+    /// Completes when the decode worker has exited (authoritative safety for Seek/Dispose/restart).
+    /// Already completed if the pump never started.
+    /// </summary>
+    public Task ShutdownCompleted => _shutdownTcs.Task;
 
     public void Start()
     {
@@ -54,22 +73,73 @@ internal sealed class DecodePump : IDisposable
             throw new InvalidOperationException("Decode pump already started.");
         }
 
+        if (_shutdownTcs.Task.IsCompleted)
+        {
+            throw new InvalidOperationException("Decode pump has already shut down and cannot be restarted.");
+        }
+
         _cts = new CancellationTokenSource();
         var token = _cts.Token;
         _task = Task.Factory.StartNew(
             () => Run(token),
-            token,
+            CancellationToken.None,
             TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
+
+        // Observe completion off the worker thread so cleanup cannot re-enter the worker.
+        _ = _task.ContinueWith(
+            static (t, state) =>
+            {
+                var self = (DecodePump)state!;
+                if (t.IsFaulted && t.Exception is not null)
+                {
+                    self._shutdownTcs.TrySetException(t.Exception.InnerExceptions);
+                }
+                else
+                {
+                    self._shutdownTcs.TrySetResult();
+                }
+            },
+            this,
+            CancellationToken.None,
+            TaskContinuationOptions.RunContinuationsAsynchronously,
             TaskScheduler.Default);
     }
 
-    public async Task StopAsync(TimeSpan timeout)
+    /// <summary>
+    /// Cancels the worker and clears the ring without waiting. Returns <see cref="ShutdownCompleted"/>.
+    /// Safe to call multiple times; concurrent callers share one stop.
+    /// </summary>
+    public Task RequestStop()
     {
+        var existing = Volatile.Read(ref _sharedStopTask);
+        if (existing is not null)
+        {
+            return existing;
+        }
+
+        var created = BeginStop();
+        var prior = Interlocked.CompareExchange(ref _sharedStopTask, created, null);
+        return prior ?? created;
+    }
+
+    /// <summary>
+    /// Requests stop and waits up to <paramref name="timeout"/> for worker exit.
+    /// Timeout does not mean the worker exited — await <see cref="ShutdownCompleted"/> for that.
+    /// Concurrent callers share the same stop operation.
+    /// </summary>
+    public Task StopAsync(TimeSpan timeout) => WaitSharedStopAsync(RequestStop(), timeout);
+
+    private Task BeginStop()
+    {
+        Volatile.Write(ref _stopRequested, 1);
+
         var cts = _cts;
         var task = _task;
         if (cts is null || task is null)
         {
-            return;
+            _shutdownTcs.TrySetResult();
+            return Task.CompletedTask;
         }
 
         try
@@ -82,12 +152,32 @@ internal sealed class DecodePump : IDisposable
         }
 
         // Unblock a producer waiting on a full ring.
-        _ring.Clear();
-
-        var completed = await Task.WhenAny(task, Task.Delay(timeout)).ConfigureAwait(false);
-        if (completed != task)
+        try
         {
-            // Timeout is NOT proof the worker exited — it may still be inside Decoder.Read.
+            _ring.Clear();
+        }
+        catch (ObjectDisposedException)
+        {
+            // ring may already be tearing down via deferred dispose
+        }
+
+        // Full stop completes when the worker exits — not when a caller timeout elapses.
+        return ShutdownCompleted;
+    }
+
+    private async Task WaitSharedStopAsync(Task sharedStop, TimeSpan timeout)
+    {
+        if (sharedStop.IsCompleted)
+        {
+            await sharedStop.ConfigureAwait(false);
+            Volatile.Write(ref _stopTimedOut, 0);
+            return;
+        }
+
+        var completed = await Task.WhenAny(sharedStop, Task.Delay(timeout)).ConfigureAwait(false);
+        if (completed != sharedStop)
+        {
+            // Caller wait bound elapsed; worker may still be inside Decoder.Read.
             Volatile.Write(ref _stopTimedOut, 1);
             try
             {
@@ -97,17 +187,17 @@ internal sealed class DecodePump : IDisposable
             {
                 // diagnostics must not throw
             }
-        }
-        else
-        {
-            Volatile.Write(ref _stopTimedOut, 0);
+
+            return;
         }
 
-        Interlocked.Exchange(ref _started, 0);
+        Volatile.Write(ref _stopTimedOut, 0);
+        await sharedStop.ConfigureAwait(false);
     }
 
     public void Dispose()
     {
+        Volatile.Write(ref _stopRequested, 1);
         try
         {
             _cts?.Cancel();
@@ -117,8 +207,22 @@ internal sealed class DecodePump : IDisposable
             // ignored
         }
 
+        try
+        {
+            _ring.Clear();
+        }
+        catch (ObjectDisposedException)
+        {
+            // ignored
+        }
+
         _cts?.Dispose();
         _cts = null;
+
+        if (_task is null)
+        {
+            _shutdownTcs.TrySetResult();
+        }
     }
 
     private void Run(CancellationToken cancellationToken)
@@ -127,18 +231,6 @@ internal sealed class DecodePump : IDisposable
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                if (cancellationToken.IsCancellationRequested && Volatile.Read(ref _stopTimedOut) != 0)
-                {
-                    try
-                    {
-                        _onStillAliveAfterCancel?.Invoke();
-                    }
-                    catch
-                    {
-                        // diagnostics must not throw
-                    }
-                }
-
                 int read;
                 try
                 {

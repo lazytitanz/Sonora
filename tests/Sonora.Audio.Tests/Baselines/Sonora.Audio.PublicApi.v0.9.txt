@@ -99,6 +99,7 @@ public sealed class Sonora.Audio.AudioPlayer
   event System.EventHandler Underrun
   System.Void ClearNext()
   System.Threading.Tasks.Task ConfigureOutputAsync(Sonora.Audio.Output.AudioOutputConfiguration configuration, System.Threading.CancellationToken cancellationToken)
+  System.Int32 CopySeekLifecycleTrace(System.Span<Sonora.Audio.Diagnostics.SeekLifecycleEvent> destination, System.Int64& droppedCount, System.Int64& overwrittenCount)
   System.Void Dispose()
   System.Threading.Tasks.ValueTask DisposeAsync()
   Sonora.Audio.Diagnostics.PlaybackDiagnostics GetDiagnostics()
@@ -110,6 +111,7 @@ public sealed class Sonora.Audio.AudioPlayer
   System.Threading.Tasks.Task PreloadNextAsync(System.String filePath, System.Threading.CancellationToken cancellationToken)
   System.Void Seek(System.TimeSpan position)
   Sonora.Audio.Seeking.AudioSeekResult SeekWithResult(System.TimeSpan position)
+  System.Void SetNextSeekCorrelationId(System.Int32 seekId)
   System.Threading.Tasks.Task SetOutputDeviceAsync(System.String deviceId, System.Threading.CancellationToken cancellationToken)
   System.Void Stop()
 
@@ -261,9 +263,83 @@ public enum Sonora.Audio.Devices.OutputRecoveryIntent
 
 public sealed class Sonora.Audio.Diagnostics.PlaybackDiagnostics
   .ctor()
+  System.Boolean AcceptEndOfStreamCompletion { get; set }
+  System.Int32 ActivePipelineId { get; set }
+  System.Int32 ActiveTrackGeneration { get; set }
   System.Int32 BufferCapacitySamples { get; set }
   System.Int32 BufferedSamples { get; set }
+  System.Int64 CallbackCount { get; set }
+  System.Int32 EffectsBarrier { get; set }
+  System.Int64 LastCallbackTimestamp { get; set }
+  System.Int32 LastPromoteTransitionId { get; set }
+  System.Int32 LastSeekId { get; set }
+  System.Int32 LastSeekTerminalId { get; set }
+  Sonora.Audio.Diagnostics.SeekSilenceReason LastSilenceReason { get; set }
+  Sonora.Audio.Network.NetworkTransportStatus NetworkStatus { get; set }
+  Sonora.Audio.Formats.NextTrackState NextTrackState { get; set }
+  System.Boolean OrphanDecodeWorker { get; set }
+  Sonora.Audio.Devices.OutputDeviceStatus OutputDeviceStatus { get; set }
+  System.Boolean PumpRunning { get; set }
+  System.Boolean RingCompleted { get; set }
+  System.Int64 SamplesConsumed { get; set }
+  System.Int64 SamplesDecoded { get; set }
+  System.Int32 SeekInProgress { get; set }
+  System.Int32 SessionGeneration { get; set }
+  System.String SourcePath { get; set }
+  Sonora.Audio.Formats.PlaybackState State { get; set }
+  System.Int64 StopPumpTimeoutCount { get; set }
+  System.Int64 TraceDroppedCount { get; set }
+  System.Int64 TraceOverwrittenCount { get; set }
+  System.Int32 TransitionId { get; set }
   System.Int64 UnderrunCount { get; set }
+
+public struct Sonora.Audio.Diagnostics.SeekLifecycleEvent
+
+public enum Sonora.Audio.Diagnostics.SeekLifecycleStage
+  ArmBarrier = 4
+  CallbackHeartbeat = 18
+  Commit = 12
+  ControllerCoalesced = 2
+  ControllerEnter = 1
+  DecodeWorkerAliveAfterStop = 20
+  DecoderSeekEnter = 9
+  DecoderSeekExit = 10
+  ExitBarrier = 13
+  Failed = 15
+  GaplessRecover = 23
+  Prime = 11
+  Promote = 17
+  ReadSilence = 19
+  RestoreAfterFail = 16
+  SeekBegin = 3
+  SeekOverlapEnter = 21
+  SeekOverlapExit = 22
+  StopPumpEnter = 6
+  StopPumpExit = 7
+  StopPumpTimeout = 8
+  Superseded = 14
+  WaitBarrier = 5
+
+public sealed class Sonora.Audio.Diagnostics.SeekLifecycleTraceRing
+  .ctor(System.Int32 capacity)
+  System.Int32 Capacity { get }
+  System.Int64 DroppedCount { get }
+  System.Int64 OverwrittenCount { get }
+  System.Int64 PublishedCount { get }
+  System.Int32 CopyRecent(System.Span<Sonora.Audio.Diagnostics.SeekLifecycleEvent> destination, System.Int64& droppedSnapshot, System.Int64& overwrittenSnapshot)
+  System.Void Record(Sonora.Audio.Diagnostics.SeekLifecycleEvent evt)
+  System.Void Record(Sonora.Audio.Diagnostics.SeekLifecycleEvent& evt)
+  System.Void Reset()
+
+public enum Sonora.Audio.Diagnostics.SeekSilenceReason
+  Buffering = 7
+  EffectsBarrier = 1
+  EndOfStream = 3
+  None = 0
+  OutputSwitching = 2
+  PendingNext = 5
+  Seeking = 6
+  Underrun = 4
 
 public struct Sonora.Audio.Formats.AudioFormat
   .ctor(System.Int32 SampleRate, System.Int32 ChannelCount, Sonora.Audio.Formats.SampleFormat SampleFormat)
