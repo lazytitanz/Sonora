@@ -107,17 +107,14 @@ public class OutputDeviceManagementTests
     {
         var devices = CreateTwoActiveDevices();
         var createBStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var outputs = new FakeAudioOutputFactory((id, ct) =>
+        var outputs = new FakeAudioOutputFactory(async (id, ct) =>
         {
             if (id == "b")
             {
                 createBStarted.TrySetResult();
-                while (!ct.IsCancellationRequested)
-                {
-                    Thread.Sleep(10);
-                }
-
-                ct.ThrowIfCancellationRequested();
+                // Async wait — a sync Sleep loop starves the pool under parallel CI and prevents
+                // the superseding SetOutputDeviceAsync from ever cancelling this create.
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false);
             }
 
             return new FakeAudioOutput(endpointId: id ?? "default");

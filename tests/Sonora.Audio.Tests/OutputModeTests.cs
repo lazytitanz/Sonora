@@ -600,18 +600,23 @@ public class OutputModeTests
     public async Task DisposeAsync_DuringConfigure_DoesNotHang()
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var outputs = new FakeAudioOutputFactory((req, ct) =>
+        var outputs = new FakeAudioOutputFactory(async (req, ct) =>
         {
             if (req.Mode == AudioOutputMode.Exclusive)
             {
                 started.TrySetResult();
-                // Block until disposal cancels the switch token.
-                if (!ct.WaitHandle.WaitOne(TimeSpan.FromSeconds(5)))
+                // Async wait for DisposeAsync to cancel — sync WaitOne blocks the pool.
+                try
                 {
-                    throw new TimeoutException("Configure was not cancelled by DisposeAsync.");
+                    await Task.Delay(TimeSpan.FromSeconds(30), ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    throw;
                 }
 
-                ct.ThrowIfCancellationRequested();
+                throw new TimeoutException("Configure was not cancelled by DisposeAsync.");
             }
 
             return new FakeAudioOutput(endpointId: req.DeviceId ?? "a");
@@ -619,20 +624,30 @@ public class OutputModeTests
 
         var engine = CreateEngine(outputs: outputs);
         var player = engine.CreatePlayer();
-        await player.LoadAsync("track.wav");
-        player.Play();
-
-        var configure = player.ConfigureOutputAsync(new AudioOutputConfiguration
+        try
         {
-            Mode = AudioOutputMode.Exclusive,
-            ExclusiveFallback = ExclusiveModeFallback.None,
-        });
-        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await player.LoadAsync("track.wav");
+            player.Play();
 
-        await player.DisposeAsync();
-        await engine.DisposeAsync();
+            var configure = player.ConfigureOutputAsync(new AudioOutputConfiguration
+            {
+                Mode = AudioOutputMode.Exclusive,
+                ExclusiveFallback = ExclusiveModeFallback.None,
+            });
+            // Exclusive rebind runs AssistWasapiEndpointRelease + 1s grace before Create; under
+            // parallel CI that can exceed a tight 2s budget before started is signaled.
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(15));
 
-        await Assert.ThrowsAnyAsync<Exception>(async () => await configure);
+            await player.DisposeAsync();
+            await engine.DisposeAsync();
+
+            await Assert.ThrowsAnyAsync<Exception>(async () => await configure.WaitAsync(TimeSpan.FromSeconds(10)));
+        }
+        finally
+        {
+            await player.DisposeAsync();
+            await engine.DisposeAsync();
+        }
     }
 
     [Fact]

@@ -157,7 +157,7 @@ public class OutputSwitchHardeningTests
         HoldableFakeAudioOutput? first = null;
         var createBStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var count = 0;
-        var outputs = new FakeAudioOutputFactory((id, ct) =>
+        var outputs = new FakeAudioOutputFactory(async (id, ct) =>
         {
             count++;
             if (count == 1)
@@ -169,12 +169,7 @@ public class OutputSwitchHardeningTests
             if (id == "b")
             {
                 createBStarted.TrySetResult();
-                while (!ct.IsCancellationRequested)
-                {
-                    Thread.Sleep(10);
-                }
-
-                ct.ThrowIfCancellationRequested();
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false);
             }
 
             return new FakeAudioOutput(endpointId: id ?? "default");
@@ -209,9 +204,9 @@ public class OutputSwitchHardeningTests
 
         var secondSwitch = player.SetOutputDeviceAsync("a");
 
-        var firstError = await Record.ExceptionAsync(() => firstSwitch);
+        var firstError = await Record.ExceptionAsync(() => firstSwitch.WaitAsync(TimeSpan.FromSeconds(10)));
         Assert.IsType<OperationCanceledException>(firstError);
-        await secondSwitch;
+        await secondSwitch.WaitAsync(TimeSpan.FromSeconds(10));
 
         Assert.Equal("a", player.PreferredOutputDeviceId);
         Assert.Equal("a", player.ActiveOutputDeviceId);
@@ -294,17 +289,12 @@ public class OutputSwitchHardeningTests
     {
         var devices = TwoDevices();
         var createBStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var outputs = new FakeAudioOutputFactory((id, ct) =>
+        var outputs = new FakeAudioOutputFactory(async (id, ct) =>
         {
             if (id == "b")
             {
                 createBStarted.TrySetResult();
-                while (!ct.IsCancellationRequested)
-                {
-                    Thread.Sleep(10);
-                }
-
-                ct.ThrowIfCancellationRequested();
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false);
             }
 
             return new FakeAudioOutput(endpointId: id ?? "default");
@@ -318,8 +308,8 @@ public class OutputSwitchHardeningTests
         await createBStarted.Task.WaitAsync(TimeSpan.FromSeconds(3));
         var second = player.SetOutputDeviceAsync("a");
 
-        await second;
-        var firstError = await Record.ExceptionAsync(() => first);
+        await second.WaitAsync(TimeSpan.FromSeconds(10));
+        var firstError = await Record.ExceptionAsync(() => first.WaitAsync(TimeSpan.FromSeconds(10)));
         Assert.IsType<OperationCanceledException>(firstError);
 
         Assert.Equal("a", player.PreferredOutputDeviceId);
