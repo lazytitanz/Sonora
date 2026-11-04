@@ -18,7 +18,7 @@ public sealed class GaplessPromotePcmPhase1Tests
     private static readonly AudioFormat Stereo = AudioFormat.CreateFloat32(44100, 2);
 
     [Fact]
-    public void RackBypass_SkipsEffectProcess_VolumeStillApplies()
+    public void RackBypass_OutputsDryWhileEffectsStayWarm()
     {
         var factory = new FakeAudioEffectFactory();
         var rack = new AudioEffectRack(factory);
@@ -28,14 +28,18 @@ public sealed class GaplessPromotePcmPhase1Tests
         var buffer = new float[64];
         Array.Fill(buffer, 0.2f);
         rack.Bypass = true;
+        rack.ResetProcessingState();
         rack.Process(buffer, Mono);
 
-        Assert.Equal(0, pre.ProcessCount);
+        Assert.True(pre.ProcessCount > 0, "Warm bypass must still process effects.");
         Assert.All(buffer, s => Assert.Equal(0.2f, s));
 
         rack.Bypass = false;
+        rack.ResetProcessingState();
+        Array.Fill(buffer, 0.2f);
+        var countBefore = pre.ProcessCount;
         rack.Process(buffer, Mono);
-        Assert.Equal(1, pre.ProcessCount);
+        Assert.True(pre.ProcessCount > countBefore);
         // +6 dB ≈ ×2
         Assert.All(buffer, s => Assert.True(s > 0.35f && s < 0.45f));
     }

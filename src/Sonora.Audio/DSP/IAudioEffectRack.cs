@@ -6,7 +6,21 @@ namespace Sonora.Audio.DSP;
 /// </summary>
 public interface IAudioEffectRack
 {
-    /// <summary>When true, all effects are skipped.</summary>
+    /// <summary>
+    /// When true, the rack outputs unprocessed (dry) audio. Effects continue to receive PCM so
+    /// filter and dynamics state stay current for immediate reactivation.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Transitions use a short linear crossfade. Dry audio is delayed to match the effective wet-path
+    /// latency (for example limiter look-ahead), so bypass does not jump the output timeline relative
+    /// to the processed path. While bypassed, the rack still incurs the CPU cost of the active chain.
+    /// </para>
+    /// <para>
+    /// Steady-state bypassed output therefore has the same DSP latency as the wet chain. Seek/load/reset
+    /// clear delay-line state under the existing effects barrier.
+    /// </para>
+    /// </remarks>
     bool Bypass { get; set; }
 
     /// <summary>Current effects in processing order.</summary>

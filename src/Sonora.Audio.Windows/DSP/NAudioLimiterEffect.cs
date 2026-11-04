@@ -8,12 +8,14 @@ namespace Sonora.Audio.Windows.DSP;
 internal sealed class NAudioLimiterEffect : ILimiterEffect, IAudioEffectRuntime
 {
     private readonly LimiterEffect _effect = new();
+    private readonly float _lookaheadMs;
     private float _ceilingDb;
     private float _pendingCeilingDb;
     private float _releaseMs;
     private float _pendingReleaseMs;
     private int _enabled = 1;
     private int _pending;
+    private int _maxLatencySamples;
     private bool _configured;
     private bool _disposed;
 
@@ -23,6 +25,7 @@ internal sealed class NAudioLimiterEffect : ILimiterEffect, IAudioEffectRuntime
         _pendingCeilingDb = options.CeilingDb;
         _releaseMs = options.ReleaseMs;
         _pendingReleaseMs = options.ReleaseMs;
+        _lookaheadMs = options.LookaheadMs;
         _effect.CeilingDb = options.CeilingDb;
         _effect.ReleaseMs = options.ReleaseMs;
         _effect.LookaheadMs = options.LookaheadMs;
@@ -67,9 +70,15 @@ internal sealed class NAudioLimiterEffect : ILimiterEffect, IAudioEffectRuntime
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         _effect.Configure(NAudioEffectHelpers.ToIeeeFloatWaveFormat(format));
+        // Match NAudio look-ahead: at least one sample even when LookaheadMs is 0.
+        _maxLatencySamples = Math.Max(1, (int)Math.Round(_lookaheadMs * format.SampleRate / 1000.0));
         _configured = true;
         Interlocked.Exchange(ref _pending, 1);
     }
+
+    public int LatencySamples => Volatile.Read(ref _enabled) == 1 ? _maxLatencySamples : 0;
+
+    public int MaxLatencySamples => _maxLatencySamples;
 
     public void Reset()
     {

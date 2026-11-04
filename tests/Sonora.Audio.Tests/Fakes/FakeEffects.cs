@@ -32,7 +32,7 @@ internal abstract class FakeEffectBase : IAudioEffectRuntime
         set => Volatile.Write(ref _enabled, value ? 1 : 0);
     }
 
-    public void Configure(in AudioFormat format) => ConfigureCount++;
+    public virtual void Configure(in AudioFormat format) => ConfigureCount++;
 
     public void Reset() => ResetCount++;
 
@@ -50,6 +50,10 @@ internal abstract class FakeEffectBase : IAudioEffectRuntime
     }
 
     protected abstract void ProcessCore(Span<float> buffer, in AudioFormat format);
+
+    public virtual int LatencySamples => 0;
+
+    public virtual int MaxLatencySamples => 0;
 
     public void Dispose() => Disposed = true;
 }
@@ -72,15 +76,29 @@ internal sealed class FakePreampEffect : FakeEffectBase, IPreampEffect
 
 internal sealed class FakeLimiterEffect : FakeEffectBase, ILimiterEffect
 {
+    private readonly float _lookaheadMs;
+    private int _maxLatencySamples;
+
     public FakeLimiterEffect(LimiterOptions options)
     {
         CeilingDb = options.CeilingDb;
         ReleaseMs = options.ReleaseMs;
+        _lookaheadMs = options.LookaheadMs;
     }
 
     public override string Name => "FakeLimiter";
     public float CeilingDb { get; set; }
     public float ReleaseMs { get; set; }
+
+    public override int LatencySamples => Enabled ? _maxLatencySamples : 0;
+
+    public override int MaxLatencySamples => _maxLatencySamples;
+
+    public override void Configure(in AudioFormat format)
+    {
+        base.Configure(format);
+        _maxLatencySamples = Math.Max(1, (int)Math.Round(_lookaheadMs * format.SampleRate / 1000.0));
+    }
 
     protected override void ProcessCore(Span<float> buffer, in AudioFormat format)
     {

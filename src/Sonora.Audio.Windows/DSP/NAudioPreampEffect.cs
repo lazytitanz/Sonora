@@ -85,6 +85,10 @@ internal sealed class NAudioPreampEffect : IPreampEffect, IAudioEffectRuntime
         _effect.Process(buffer);
     }
 
+    public int LatencySamples => 0;
+
+    public int MaxLatencySamples => 0;
+
     public void Dispose()
     {
         _disposed = true;

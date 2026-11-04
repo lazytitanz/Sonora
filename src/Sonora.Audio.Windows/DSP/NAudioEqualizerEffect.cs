@@ -157,6 +157,10 @@ internal sealed class NAudioEqualizerEffect : IEqualizerEffect, IAudioEffectRunt
         _equalizer.Process(buffer);
     }
 
+    public int LatencySamples => 0;
+
+    public int MaxLatencySamples => 0;
+
     public void Dispose()
     {
         _disposed = true;

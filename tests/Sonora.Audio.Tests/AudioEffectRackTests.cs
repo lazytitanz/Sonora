@@ -32,15 +32,48 @@ public sealed class AudioEffectRackTests
     }
 
     [Fact]
-    public void Bypass_SkipsProcessing()
+    public void Bypass_OutputsDryWhileEffectsStayWarm()
     {
-        var rack = new AudioEffectRack(new MultiplyFactory());
-        rack.Configure(AudioFormat.CreateFloat32(44100, 1));
-        rack.AddPreamp(2f);
+        var rack = new AudioEffectRack(new FakeAudioEffectFactory());
+        var format = AudioFormat.CreateFloat32(44100, 1);
+        rack.Configure(format);
+        var pre = (FakePreampEffect)rack.AddPreamp(6f); // would double if heard
+        // Settle bypass mix fully dry.
         rack.Bypass = true;
-        var buffer = new float[] { 1f };
-        rack.Process(buffer, AudioFormat.CreateFloat32(44100, 1));
-        Assert.Equal(1f, buffer[0]);
+        rack.ResetProcessingState();
+        var buffer = new float[] { 0.25f };
+        rack.Process(buffer, format);
+        Assert.Equal(0.25f, buffer[0]);
+        Assert.True(pre.ProcessCount > 0, "Warm bypass must still call effect.Process.");
+    }
+
+    [Fact]
+    public void EmptyRack_IsTransparent()
+    {
+        var rack = new AudioEffectRack(new FakeAudioEffectFactory());
+        var format = AudioFormat.CreateFloat32(48000, 2);
+        rack.Configure(format);
+        var buffer = new float[] { 0.1f, -0.2f, 0.3f, -0.4f };
+        var expected = (float[])buffer.Clone();
+        rack.Process(buffer, format);
+        Assert.Equal(expected, buffer);
+    }
+
+    [Fact]
+    public void Process_PreservesFrameCount_AcrossBypassTransition()
+    {
+        var rack = new AudioEffectRack(new FakeAudioEffectFactory());
+        var format = AudioFormat.CreateFloat32(48000, 2);
+        rack.Configure(format);
+        rack.AddPreamp(0f);
+        var buffer = new float[512];
+        Array.Fill(buffer, 0.1f);
+        rack.Bypass = false;
+        rack.Process(buffer, format);
+        Assert.Equal(512, buffer.Length);
+        rack.Bypass = true;
+        rack.Process(buffer, format);
+        Assert.Equal(512, buffer.Length);
     }
 
     [Fact]
