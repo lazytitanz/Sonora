@@ -56,6 +56,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     private bool _disposed;
     private bool _hasSource;
     private bool _completionRaised;
+    /// <summary>
+    /// When true for the current source generation, <see cref="PlaybackCompleted"/> must not fire.
+    /// Set by active-track decode failures so undecodable streams are not reported as success.
+    /// </summary>
+    private bool _errorRaised;
     private long _underrunCount;
     private int _underrunLatched;
     private int _positionFrozen;
@@ -246,7 +251,15 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     /// </summary>
     public event EventHandler<TrackTransitionedEventArgs>? TrackTransitioned;
 
-    /// <summary>Raised when a recoverable or fatal playback error occurs.</summary>
+    /// <summary>
+    /// Raised when a recoverable or fatal playback error occurs.
+    /// Active-track decode failures raise this event, transition the player to
+    /// <see cref="PlaybackState.Stopped"/>, and do <strong>not</strong> raise
+    /// <see cref="PlaybackCompleted"/> for that source generation — consumers (e.g. playlist
+    /// hosts) should advance to the next item on <see cref="ErrorOccurred"/> when state is Stopped.
+    /// Preload failures also raise this event but do not stop the active track.
+    /// Never raised on the real-time audio callback.
+    /// </summary>
     public event EventHandler<Exception>? ErrorOccurred;
 
     /// <summary>Raised once per underrun episode while playing.</summary>
@@ -1385,6 +1398,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             EnsureActivePumpRunning_NoLock();
             _active.Prime(_options.PrimeDuration);
             _completionRaised = false;
+            _errorRaised = false;
             Volatile.Write(ref _acceptEndOfStreamCompletion, 1);
             _outputRecoveryIntent = OutputRecoveryIntent.None;
 
@@ -2250,6 +2264,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         Interlocked.Exchange(ref _samplesDecoded, 0);
         Interlocked.Exchange(ref _samplesConsumed, 0);
         _completionRaised = false;
+        _errorRaised = false;
         Interlocked.Exchange(ref _underrunCount, 0);
         Interlocked.Exchange(ref _underrunLatched, 0);
         Volatile.Write(ref _positionFrozen, 0);
@@ -2721,7 +2736,77 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         pipeline.OnDecodeWorkerAliveAfterStop = OnDecodeWorkerAliveAfterStop;
         pipeline.SetPumpCallbacks(
             onSamplesWritten: n => Interlocked.Add(ref _samplesDecoded, n),
-            onError: ex => RaiseError(ex));
+            onError: OnActiveDecodeError);
+    }
+
+    /// <summary>
+    /// DecodePump worker callback for the active track. Marshals off the worker before taking
+    /// <see cref="_gate"/> so StopTransport cannot deadlock with pump shutdown.
+    /// </summary>
+    private void OnActiveDecodeError(Exception exception)
+    {
+        var generation = Volatile.Read(ref _activeTrackGeneration);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                HandleActiveDecodeError(exception, generation);
+            }
+            catch (ObjectDisposedException)
+            {
+                // ignored
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "Sonora.DecodeError",
+        };
+        thread.Start();
+    }
+
+    private void HandleActiveDecodeError(Exception exception, int generation)
+    {
+        try
+        {
+            _gate.Wait();
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+
+        try
+        {
+            if (_disposed || generation != _activeTrackGeneration)
+            {
+                return;
+            }
+
+            if (_errorRaised)
+            {
+                return;
+            }
+
+            _errorRaised = true;
+            Volatile.Write(ref _acceptEndOfStreamCompletion, 0);
+            RaiseError(exception);
+
+            if (_state is PlaybackState.Playing or PlaybackState.Paused or PlaybackState.Buffering)
+            {
+                StopTransport_NoLock(resetToStart: true, raiseCompletion: false);
+            }
+        }
+        finally
+        {
+            try
+            {
+                _gate.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+                // ignored
+            }
+        }
     }
 
     /// <summary>
@@ -2999,7 +3084,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             active.StartPump(
                 _options.Processors,
                 onSamplesWritten: n => Interlocked.Add(ref _samplesDecoded, n),
-                onError: ex => RaiseError(ex));
+                onError: OnActiveDecodeError);
         }
         catch (InvalidOperationException)
         {
@@ -4187,7 +4272,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
     private void RaiseCompletion()
     {
-        if (_completionRaised)
+        if (_completionRaised || _errorRaised)
         {
             return;
         }

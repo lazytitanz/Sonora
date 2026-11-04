@@ -127,7 +127,8 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
     public static WaveStreamAudioDecoder OpenMediaFoundation(
         Stream stream,
         string? originName = null,
-        string? contentType = null)
+        string? contentType = null,
+        bool ownStream = true)
     {
         ArgumentNullException.ThrowIfNull(stream);
         if (!stream.CanSeek)
@@ -150,7 +151,7 @@ internal sealed class WaveStreamAudioDecoder : IAudioDecoder
             supportsExactByteSeek: false,
             hasKnownDuration: DetermineDurationKnown(reader, isFileOpen: false),
             streamFactory: factory,
-            ownedByteStream: stream);
+            ownedByteStream: ownStream ? stream : null);
     }
 
     /// <summary>

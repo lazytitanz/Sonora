@@ -25,6 +25,8 @@
     <PackageReference Include="NVorbis" />
     <PackageReference Include="Concentus" />
     <PackageReference Include="Concentus.Oggfile" />
+    <PackageReference Include="ManagedCodecs.Containers" />
+    <PackageReference Include="ManagedCodecs.Aac" />
   </ItemGroup>
 
   <ItemGroup>

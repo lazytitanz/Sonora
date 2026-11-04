@@ -251,7 +251,8 @@ Formats are selected by container/header sniffing (not extension alone). Only fo
 | AIFF / AIF | `AiffFileReader` | PCM (NAudio.Core; no extra package) |
 | MP3 | Media Foundation | |
 | ADTS AAC (`.aac`) | Media Foundation | |
-| M4A (AAC) | Media Foundation | MPEG-4 AAC |
+| M4A (AAC) | Media Foundation | Progressive MPEG-4 AAC |
+| M4A / MP4 (fragmented AAC) | ManagedCodecs | fMP4 / DASH-style `moof` containers; MF empty-PCM fallback |
 | M4A (ALAC) | Media Foundation | Apple Lossless in `.m4a` (Win10+) |
 | WMA | Media Foundation | ASF / WMA |
 | FLAC | Media Foundation | Content-verified seeks; accuracy is `Unknown`/`Approximate`, never Exact from MF timestamps |

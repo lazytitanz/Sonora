@@ -11,6 +11,12 @@ internal static class DecoderSelector
 {
     private const int SniffBufferSize = 8192;
 
+    /// <summary>Open-time empty-PCM probe threshold: shorter known durations may be legitimate empty.</summary>
+    private static readonly TimeSpan SubstantialDurationThreshold = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>Interleaved float samples read during the open-time PCM probe.</summary>
+    private const int OpenProbeSamples = 4096;
+
     // ASF header object GUID: 75B22630-668E-11CF-A6D9-00AA0062CE6C
     private static ReadOnlySpan<byte> AsfHeaderGuid =>
     [
@@ -160,9 +166,10 @@ internal static class DecoderSelector
                 isMediaFoundation: false,
                 hasKnownDuration: true),
             AudioContainerKind.OggOpus => OpusOggAudioDecoder.Open(filePath),
+            AudioContainerKind.FragmentedMpeg4 => OpenManagedMpeg4OrThrow(filePath),
+            AudioContainerKind.Mpeg4 => OpenMpeg4WithFallback(filePath),
             AudioContainerKind.Flac
                 or AudioContainerKind.MpegAudio
-                or AudioContainerKind.Mpeg4
                 or AudioContainerKind.AdtsAac
                 or AudioContainerKind.Asf
                 or AudioContainerKind.WebM
@@ -188,9 +195,10 @@ internal static class DecoderSelector
                 hasKnownDuration: null,
                 ownedByteStream: stream),
             AudioContainerKind.OggOpus => OpusOggAudioDecoder.Open(stream, originName, leaveOpen: false),
+            AudioContainerKind.FragmentedMpeg4 => OpenManagedMpeg4OrThrow(stream, originName),
+            AudioContainerKind.Mpeg4 => OpenMpeg4WithFallback(stream, originName, contentTypeHint),
             AudioContainerKind.Flac
                 or AudioContainerKind.MpegAudio
-                or AudioContainerKind.Mpeg4
                 or AudioContainerKind.AdtsAac
                 or AudioContainerKind.Asf
                 or AudioContainerKind.WebM
@@ -198,6 +206,161 @@ internal static class DecoderSelector
             _ => throw new UnsupportedFormatException(
                 $"The audio format of '{originName}' is not supported."),
         };
+
+    private static IAudioDecoder OpenManagedMpeg4OrThrow(string filePath)
+    {
+        var decoder = ManagedAacMp4AudioDecoder.Open(filePath);
+        return EnsureProducesPcmOrThrow(decoder, filePath);
+    }
+
+    private static IAudioDecoder OpenManagedMpeg4OrThrow(Stream stream, string originName)
+    {
+        var decoder = ManagedAacMp4AudioDecoder.Open(stream, originName, leaveOpen: false);
+        return EnsureProducesPcmOrThrow(decoder, originName);
+    }
+
+    private static IAudioDecoder OpenMpeg4WithFallback(string filePath)
+    {
+        IAudioDecoder? mf = null;
+        try
+        {
+            mf = WaveStreamAudioDecoder.OpenMediaFoundation(filePath);
+            var probed = TryProbePcm(mf, out var leftover, out var leftoverLength);
+            if (probed > 0)
+            {
+                return leftoverLength > 0
+                    ? new PrefixedAudioDecoder(mf, leftover!, leftoverLength)
+                    : mf;
+            }
+
+            if (!IsSubstantialKnownDuration(mf))
+            {
+                // Legitimate empty / unknown-length: keep MF (first Read will EOS).
+                return mf;
+            }
+
+            mf.Dispose();
+            mf = null;
+            return OpenManagedMpeg4OrThrow(filePath);
+        }
+        catch (Exception ex) when (mf is not null && ex is not AudioException)
+        {
+            mf.Dispose();
+            throw;
+        }
+        catch
+        {
+            mf?.Dispose();
+            throw;
+        }
+    }
+
+    private static IAudioDecoder OpenMpeg4WithFallback(Stream stream, string originName, string? contentTypeHint)
+    {
+        if (!stream.CanSeek)
+        {
+            throw new NotSupportedException(
+                "MPEG-4 stream decoding requires a seekable byte stream.");
+        }
+
+        IAudioDecoder? mf = null;
+        try
+        {
+            // Probe without taking stream ownership so a managed fallback can reuse it.
+            mf = WaveStreamAudioDecoder.OpenMediaFoundation(
+                stream, originName, contentTypeHint, ownStream: false);
+            var probed = TryProbePcm(mf, out var leftover, out var leftoverLength);
+            if (probed > 0)
+            {
+                IAudioDecoder decorated = leftoverLength > 0
+                    ? new PrefixedAudioDecoder(mf, leftover!, leftoverLength)
+                    : mf;
+                mf = null;
+                return new OwningStreamAudioDecoder(decorated, stream);
+            }
+
+            if (!IsSubstantialKnownDuration(mf))
+            {
+                // Legitimate empty: keep MF and take stream ownership.
+                var empty = mf;
+                mf = null;
+                return new OwningStreamAudioDecoder(empty, stream);
+            }
+
+            mf.Dispose();
+            mf = null;
+            stream.Position = 0;
+            return OpenManagedMpeg4OrThrow(stream, originName);
+        }
+        catch
+        {
+            mf?.Dispose();
+            throw;
+        }
+    }
+
+    private static IAudioDecoder EnsureProducesPcmOrThrow(IAudioDecoder decoder, string originName)
+    {
+        var duration = decoder.Duration;
+        var substantial = IsSubstantialKnownDuration(decoder);
+        int probed;
+        float[]? leftover;
+        int leftoverLength;
+        try
+        {
+            probed = TryProbePcm(decoder, out leftover, out leftoverLength);
+        }
+        catch
+        {
+            decoder.Dispose();
+            throw;
+        }
+
+        if (probed > 0)
+        {
+            return leftoverLength > 0
+                ? new PrefixedAudioDecoder(decoder, leftover!, leftoverLength)
+                : decoder;
+        }
+
+        if (!substantial)
+        {
+            return decoder;
+        }
+
+        decoder.Dispose();
+        throw new DecoderException(
+            $"The audio source '{originName}' opened successfully but produced no PCM "
+            + $"(declared duration {duration}).");
+    }
+
+    private static bool IsSubstantialKnownDuration(IAudioDecoder decoder)
+        => decoder.HasKnownDuration && decoder.Duration >= SubstantialDurationThreshold;
+
+    private static int TryProbePcm(IAudioDecoder decoder, out float[]? leftover, out int leftoverLength)
+    {
+        leftover = new float[OpenProbeSamples];
+        leftoverLength = 0;
+        try
+        {
+            var read = decoder.Read(leftover);
+            if (read <= 0)
+            {
+                leftover = null;
+                leftoverLength = 0;
+                return 0;
+            }
+
+            leftoverLength = read;
+            return read;
+        }
+        catch
+        {
+            leftover = null;
+            leftoverLength = 0;
+            throw;
+        }
+    }
 
     private static AudioContainerKind SniffHeader(ReadOnlySpan<byte> h, Stream? sourceForOgg)
     {
@@ -240,7 +403,7 @@ internal static class DecoderSelector
 
         if (read >= 8 && HasAscii(h, 4, "ftyp"))
         {
-            return AudioContainerKind.Mpeg4;
+            return ClassifyMpeg4(h, sourceForOgg);
         }
 
         if (IsAdtsAac(h))
@@ -254,6 +417,108 @@ internal static class DecoderSelector
         }
 
         return AudioContainerKind.Unknown;
+    }
+
+    private static AudioContainerKind ClassifyMpeg4(ReadOnlySpan<byte> header, Stream? stream)
+    {
+        if (HasFragmentedMpeg4Brand(header))
+        {
+            return AudioContainerKind.FragmentedMpeg4;
+        }
+
+        if (stream is { CanSeek: true })
+        {
+            if (ContainsFragmentedMpeg4Boxes(stream))
+            {
+                return AudioContainerKind.FragmentedMpeg4;
+            }
+        }
+        else if (stream is PeekBufferStream peek
+                 && ContainsAsciiBoxType(peek.PrefetchSpan, "mvex"u8, "moof"u8))
+        {
+            return AudioContainerKind.FragmentedMpeg4;
+        }
+
+        return AudioContainerKind.Mpeg4;
+    }
+
+    private static bool HasFragmentedMpeg4Brand(ReadOnlySpan<byte> header)
+    {
+        // ftyp: size(4) + 'ftyp'(4) + major_brand(4) + minor_version(4) + compatible_brands...
+        if (header.Length < 16 || !HasAscii(header, 4, "ftyp"))
+        {
+            return false;
+        }
+
+        var boxSize = (int)ReadUInt32BigEndian(header);
+        if (boxSize < 16)
+        {
+            boxSize = header.Length;
+        }
+
+        var end = Math.Min(header.Length, boxSize);
+        // Brands start at offset 8 within the box payload → absolute offset 8 from file start of box = 8.
+        // major at 8, compatible from 16.
+        for (var offset = 8; offset + 4 <= end; offset += 4)
+        {
+            if (offset == 12)
+            {
+                // minor_version — skip
+                continue;
+            }
+
+            if (IsFragmentedBrand(header.Slice(offset, 4)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsFragmentedBrand(ReadOnlySpan<byte> brand4)
+        => brand4.SequenceEqual("dash"u8)
+           || brand4.SequenceEqual("iso5"u8)
+           || brand4.SequenceEqual("iso6"u8)
+           || brand4.SequenceEqual("iso9"u8)
+           || brand4.SequenceEqual("msdh"u8)
+           || brand4.SequenceEqual("msix"u8)
+           || brand4.SequenceEqual("cmfc"u8)
+           || brand4.SequenceEqual("cmaf"u8);
+
+    private static bool ContainsFragmentedMpeg4Boxes(Stream stream)
+    {
+        var start = stream.Position;
+        try
+        {
+            // Caller already read a small header; scan from the start of the file/window.
+            // Sniff restored position in Sniff(); here we are called from SniffHeader with the
+            // stream still advanced — walk from current-64 approx. Prefer absolute start scan.
+            var scanFrom = Math.Max(0, start - 64);
+            stream.Position = scanFrom;
+            var remaining = stream.CanSeek ? Math.Max(0, stream.Length - scanFrom) : SniffBufferSize;
+            var toRead = (int)Math.Min(Math.Max(remaining, 64), 65_536);
+            var buffer = new byte[toRead];
+            var n = stream.Read(buffer);
+            return ContainsAsciiBoxType(buffer.AsSpan(0, n), "mvex"u8, "moof"u8);
+        }
+        finally
+        {
+            stream.Position = start;
+        }
+    }
+
+    private static bool ContainsAsciiBoxType(ReadOnlySpan<byte> data, ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
+        => IndexOf(data, a) >= 0 || IndexOf(data, b) >= 0;
+
+    private static uint ReadUInt32BigEndian(ReadOnlySpan<byte> box)
+    {
+        if (box.Length < 4)
+        {
+            return 0;
+        }
+
+        return ((uint)box[0] << 24) | ((uint)box[1] << 16) | ((uint)box[2] << 8) | box[3];
     }
 
     private static AudioContainerKind SniffOgg(Stream? stream, ReadOnlySpan<byte> firstPage)

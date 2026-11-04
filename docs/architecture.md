@@ -74,12 +74,13 @@ Accuracy limits are documented in the README.
 | Selection | Internal magic-byte / container sniff → backend (`DecoderSelector`) |
 | WAV | `WaveFileReader` |
 | AIFF | `AiffFileReader` |
-| MP3 / ADTS AAC / M4A / ALAC / WMA / FLAC / WebM | `MediaFoundationReader` with `RepositionInRead=false`, `RequestFloatOutput=true` |
+| MP3 / ADTS AAC / progressive M4A / ALAC / WMA / FLAC / WebM | `MediaFoundationReader` with `RepositionInRead=false`, `RequestFloatOutput=true` |
+| Fragmented M4A/MP4 (AAC) | ManagedCodecs demux + AAC (`ManagedAacMp4AudioDecoder`); sniff `dash`/`iso6`/`mvex`/`moof`, or MF empty-PCM fallback |
 | Ogg Vorbis | `VorbisWaveReader` (NAudio.Vorbis / NVorbis) |
 | Ogg Opus | Concentus + Concentus.Oggfile (`OpusOggAudioDecoder`) |
 | MF seek | Coarse `CurrentTime` seek + bounded forward discard; recreate after EOF/invalid state; never Exact from MF timestamps alone |
 | WAV/AIFF seek | Frame-aligned byte `Position`; may report `Exact` |
-| Opus seek | Page-granular `SeekTo` + preroll discard; `Unknown` accuracy |
+| Opus / fMP4 seek | Approximate (page/fragment granularity); never Exact from container timestamps alone |
 
 ```text
 LoadAsync(AudioSource)
@@ -87,8 +88,10 @@ LoadAsync(AudioSource)
       File → DecoderSelector (path sniff)
       HTTP → HttpRandomAccessStream (206) or HttpContentByteStream (forward-only)
            → DecoderSelector (stream sniff)
-  → Wave / AIFF / MF / Vorbis / Opus → IAudioDecoder → decode pump
+  → Wave / AIFF / MF / Managed fMP4 AAC / Vorbis / Opus → IAudioDecoder → decode pump
 ```
+
+Active-track decode failures raise `ErrorOccurred`, move the player to `Stopped`, and suppress `PlaybackCompleted` for that source generation so hosts can skip the track. Preload failures set `NextTrackState.Failed` and raise `ErrorOccurred` without stopping the active track.
 
 HTTP resource identity uses strong ETags with `If-Range` when available. Weak or missing validators are documented as less safe; Sonora refuses to stitch bytes across changed lengths/ETags.
 

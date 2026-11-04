@@ -34,6 +34,13 @@ Sonora is MIT-licensed. It depends on the following third-party components (dire
 - **License:** MIT
 - **Projects:** Concentus / Concentus.Oggfile NuGet packages
 
+## ManagedCodecs.Containers / ManagedCodecs.Aac / ManagedCodecs.Core
+
+- **Use:** Fragmented MPEG-4 (fMP4 / DASH-style) AAC demux and decode on Windows when Media Foundation produces no PCM; also used when container sniff detects `moof`/`mvex` or fMP4 brands
+- **License:** MIT (packages ship their own `THIRD-PARTY-NOTICES.md` for transcribed codec constant tables)
+- **Project:** https://github.com/bisforboman/ManagedCodecs
+- ManagedCodecs types are **not** exposed through Sonora’s public API
+
 ---
 
 Sonora itself: see [LICENSE](LICENSE).
