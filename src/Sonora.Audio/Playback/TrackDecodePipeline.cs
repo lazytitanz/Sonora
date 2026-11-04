@@ -21,7 +21,10 @@ internal sealed class TrackDecodePipeline : IDisposable, IAsyncDisposable
     private int _resourcesReleased;
     private int _lastStopTimedOut;
     private long _stopPumpTimeoutCount;
+    private long _samplesWritten;
     private Action? _onDecodeWorkerAliveAfterStop;
+    private Action<int>? _onSamplesWritten;
+    private Action<Exception>? _onError;
     private readonly object _lifecycleSync = new();
     private Task? _sharedStopTask;
     private TaskCompletionSource? _resourcesReleasedTcs;
@@ -138,16 +141,34 @@ internal sealed class TrackDecodePipeline : IDisposable, IAsyncDisposable
         set => _onDecodeWorkerAliveAfterStop = value;
     }
 
+    /// <summary>
+    /// Interleaved float samples written into the ring by the current/last pump session.
+    /// Updated on the decode worker; readable lock-free from other threads.
+    /// </summary>
+    public long SamplesWritten => Interlocked.Read(ref _samplesWritten);
+
+    /// <summary>
+    /// Ring capacity in interleaved float samples for the given format and target buffer duration.
+    /// </summary>
+    public static int ComputeRingCapacitySamples(AudioFormat format, TimeSpan bufferDuration)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(bufferDuration, TimeSpan.Zero);
+        return Math.Max(
+            format.ChannelCount * 256,
+            (int)Math.Ceiling(bufferDuration.TotalSeconds * format.SamplesPerSecond));
+    }
+
     public static TrackDecodePipeline Create(
         AudioSource source,
         IAudioDecoder decoder,
         AudioEngineOptions options,
-        INetworkTransportInfo? networkInfo = null)
+        INetworkTransportInfo? networkInfo = null,
+        TimeSpan? ringBufferDuration = null)
     {
         ArgumentNullException.ThrowIfNull(source);
-        var capacity = Math.Max(
-            decoder.Format.ChannelCount * 256,
-            (int)Math.Ceiling(options.BufferDuration.TotalSeconds * decoder.Format.SamplesPerSecond));
+        var capacity = ComputeRingCapacitySamples(
+            decoder.Format,
+            ringBufferDuration ?? options.BufferDuration);
         var ring = new PcmRingBuffer(capacity);
         return new TrackDecodePipeline(
             source.Identifier,
@@ -163,13 +184,25 @@ internal sealed class TrackDecodePipeline : IDisposable, IAsyncDisposable
         string path,
         IAudioDecoder decoder,
         AudioEngineOptions options,
-        INetworkTransportInfo? networkInfo = null)
+        INetworkTransportInfo? networkInfo = null,
+        TimeSpan? ringBufferDuration = null)
     {
-        var capacity = Math.Max(
-            decoder.Format.ChannelCount * 256,
-            (int)Math.Ceiling(options.BufferDuration.TotalSeconds * decoder.Format.SamplesPerSecond));
+        var capacity = ComputeRingCapacitySamples(
+            decoder.Format,
+            ringBufferDuration ?? options.BufferDuration);
         var ring = new PcmRingBuffer(capacity);
         return new TrackDecodePipeline(path, decoder, ring, decoder.Duration, source: null, networkInfo);
+    }
+
+    /// <summary>
+    /// Installs or replaces pump callbacks without restarting the worker.
+    /// Used after gapless/crossfade promote so the active track reports decode progress and errors.
+    /// </summary>
+    public void SetPumpCallbacks(Action<int> onSamplesWritten, Action<Exception>? onError)
+    {
+        ArgumentNullException.ThrowIfNull(onSamplesWritten);
+        Volatile.Write(ref _onSamplesWritten, onSamplesWritten);
+        Volatile.Write(ref _onError, onError);
     }
 
     public void StartPump(
@@ -178,6 +211,7 @@ internal sealed class TrackDecodePipeline : IDisposable, IAsyncDisposable
         Action<Exception>? onError)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        SetPumpCallbacks(onSamplesWritten, onError);
 
         lock (_lifecycleSync)
         {
@@ -194,12 +228,13 @@ internal sealed class TrackDecodePipeline : IDisposable, IAsyncDisposable
                 }
             }
 
+            Interlocked.Exchange(ref _samplesWritten, 0);
             _pump = new DecodePump(
                 Decoder,
                 Ring,
                 processors,
-                onSamplesWritten,
-                onError,
+                OnPumpSamplesWritten,
+                OnPumpError,
                 onStillAliveAfterCancel: () =>
                 {
                     try
@@ -214,6 +249,35 @@ internal sealed class TrackDecodePipeline : IDisposable, IAsyncDisposable
             Volatile.Write(ref _lastStopTimedOut, 0);
             _sharedStopTask = null;
             _pump.Start();
+        }
+    }
+
+    private void OnPumpSamplesWritten(int n)
+    {
+        if (n > 0)
+        {
+            Interlocked.Add(ref _samplesWritten, n);
+        }
+
+        try
+        {
+            Volatile.Read(ref _onSamplesWritten)?.Invoke(n);
+        }
+        catch
+        {
+            // player callbacks must not tear down the decode worker
+        }
+    }
+
+    private void OnPumpError(Exception ex)
+    {
+        try
+        {
+            Volatile.Read(ref _onError)?.Invoke(ex);
+        }
+        catch
+        {
+            // ignored
         }
     }
 

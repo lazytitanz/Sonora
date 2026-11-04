@@ -2,6 +2,24 @@
 
 All notable changes to Sonora will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- Optional track-to-track crossfade on the existing transition stage: `AudioPlayer.CrossfadeDuration` (default `Zero` = hard-cut gapless) and `CrossfadeCurve` (`Linear` / `EqualPower`, default EqualPower)
+- EOS-anchored scheduling: fade begins only after the outgoing producer completes and the remaining buffered tail fits the configured fade; surplus drains at full level first; rings size to `max(BufferDuration, CrossfadeDuration)` when enabled
+- Deferred fading-out pipeline ownership with barrier-safe release on fade completion, Seek, Stop, Load, and Dispose
+- Transient incoming underrun hold (freeze fade progress, keep outgoing audible) with a 100 ms bound before degrading
+- Test Player: Gapless panel crossfade duration/curve controls; snapshot + diagnostics export include crossfade settings
+
+### Fixed
+
+- Post-promote decode progress: natural promote rebinds active-track pump callbacks so `SamplesDecoded` / `BufferedPosition` advance on the incoming track without restarting the preload worker
+
+### Docs
+
+- README / architecture: crossfade API, limitations (EOS-anchored / buffered-tail), and promote-at-start position semantics; roadmap item removed (shipped)
+
 ## 1.0.0-rc.1 — 2026-11-01
 
 ### Added

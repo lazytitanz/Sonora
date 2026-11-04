@@ -8,8 +8,8 @@ namespace Sonora.Audio.Playback;
 /// <summary>
 /// Pulls from the active ring and, when it drains at EOF with a ready next pipeline,
 /// promotes next and continues filling the same destination (spanning A|B).
-/// Applies master volume then the effect rack on the pull path so live volume and DSP
-/// changes are not delayed by ring buffering. Schedules transition notifications off the
+/// Optional EOS-anchored crossfade overlaps the outgoing and incoming rings before
+/// master volume and the effect rack. Schedules transition notifications off the
 /// calling (audio) thread.
 /// </summary>
 internal sealed class TransitionSampleSource : IPcmSampleSource
@@ -26,6 +26,12 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
     /// </summary>
     private const int EmptyPromoteGraceReads = 256;
 
+    /// <summary>Preallocated scratch for the incoming track during crossfade (interleaved floats).</summary>
+    private const int ScratchSampleCapacity = 8192 * 2;
+
+    /// <summary>Maximum transient B-underrun hold while freezing fade progress (session frames).</summary>
+    private const int MaxCrossfadeUnderrunHoldFramesDefault = 100; // ~2.3 ms @ 44.1k; scaled below by rate
+
     private readonly AudioFormat _format;
     private readonly AudioEffectRack _effects;
     private readonly Func<float> _getVolume;
@@ -34,16 +40,31 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
     private readonly Func<bool> _isPlaying;
     private readonly Func<bool> _isOutputSwitching;
     private readonly Func<TrackDecodePipeline?> _getActive;
+    private readonly Func<TrackDecodePipeline?> _getFadingOut;
     private readonly Func<PromoteResult?> _tryPromoteNext;
+    private readonly Func<CrossfadeCommit?> _tryBeginCrossfade;
+    private readonly Func<TrackDecodePipeline?> _tryTakeFadingOut;
+    private readonly Action<TrackDecodePipeline> _scheduleFadingOutDispose;
     private readonly Func<bool> _hasPendingNext;
+    private readonly Func<TimeSpan> _getCrossfadeDuration;
     private readonly Action<TrackTransitionedEventArgs> _scheduleTransitioned;
     private readonly Action<SeekSilenceReason>? _onSilence;
     private readonly Action? _onCallbackHeartbeat;
+    private readonly float[] _scratch;
+    private readonly int _maxHoldFrames;
+
     private int _endOfStream;
     private int _effectsBarrier;
     private int _callbacksInRead;
     private int _lastReportedSilence;
     private int _emptyPromoteGraceRemaining;
+
+    private int _crossfadeActive;
+    private int _fadeFramesTotal;
+    private int _fadeFramesDone;
+    private int _crossfadeCurve;
+    private int _crossfadeHoldFrames;
+    private int _crossfadeUnderrunLatched;
 
     public TransitionSampleSource(
         AudioFormat format,
@@ -58,7 +79,12 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
         Action<TrackTransitionedEventArgs> scheduleTransitioned,
         Func<bool>? isOutputSwitching = null,
         Action<SeekSilenceReason>? onSilence = null,
-        Action? onCallbackHeartbeat = null)
+        Action? onCallbackHeartbeat = null,
+        Func<TrackDecodePipeline?>? getFadingOut = null,
+        Func<CrossfadeCommit?>? tryBeginCrossfade = null,
+        Func<TrackDecodePipeline?>? tryTakeFadingOut = null,
+        Action<TrackDecodePipeline>? scheduleFadingOutDispose = null,
+        Func<TimeSpan>? getCrossfadeDuration = null)
     {
         _format = format;
         _effects = effects;
@@ -68,11 +94,20 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
         _isPlaying = isPlaying;
         _isOutputSwitching = isOutputSwitching ?? (() => false);
         _getActive = getActive;
+        _getFadingOut = getFadingOut ?? (() => null);
         _tryPromoteNext = tryPromoteNext;
+        _tryBeginCrossfade = tryBeginCrossfade ?? (() => null);
+        _tryTakeFadingOut = tryTakeFadingOut ?? (() => null);
+        _scheduleFadingOutDispose = scheduleFadingOutDispose ?? (_ => { });
         _hasPendingNext = hasPendingNext;
+        _getCrossfadeDuration = getCrossfadeDuration ?? (() => TimeSpan.Zero);
         _scheduleTransitioned = scheduleTransitioned;
         _onSilence = onSilence;
         _onCallbackHeartbeat = onCallbackHeartbeat;
+        _scratch = new float[ScratchSampleCapacity];
+        _maxHoldFrames = Math.Max(
+            MaxCrossfadeUnderrunHoldFramesDefault,
+            (int)Math.Ceiling(0.100 * format.SampleRate)); // 100 ms
     }
 
     public AudioFormat Format => _format;
@@ -85,6 +120,9 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
 
     /// <summary>1 when the effects barrier is armed.</summary>
     public int EffectsBarrier => Volatile.Read(ref _effectsBarrier);
+
+    /// <summary>True while an EOS-anchored crossfade is in progress.</summary>
+    public bool IsCrossfadeActive => Volatile.Read(ref _crossfadeActive) == 1;
 
     public int Read(Span<float> destination)
     {
@@ -125,7 +163,7 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
             // If next is Loading/Ready, clear the latch and continue — active-track EOF ≠ session EOS.
             if (Volatile.Read(ref _endOfStream) == 1)
             {
-                if (_hasPendingNext())
+                if (_hasPendingNext() || Volatile.Read(ref _crossfadeActive) == 1)
                 {
                     Interlocked.Exchange(ref _endOfStream, 0);
                 }
@@ -157,6 +195,16 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
                     break;
                 }
 
+                if (Volatile.Read(ref _crossfadeActive) == 1)
+                {
+                    if (!ReadCrossfade(destination, ref filled))
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
                 var active = _getActive();
                 if (active is null)
                 {
@@ -171,6 +219,50 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
                 }
 
                 var ring = active.Ring;
+
+                // EOS-anchored crossfade: wait until only the fade-sized tail remains, draining any
+                // surplus at full level first so a large ring cannot fade the start of a short track.
+                if (TryArmCrossfade(active))
+                {
+                    emptyPromotes = 0;
+                    continue;
+                }
+
+                var crossfadeDuration = _getCrossfadeDuration();
+                if (crossfadeDuration > TimeSpan.Zero
+                    && ring.IsProducerCompleted
+                    && ring.Count > 0)
+                {
+                    var channels = Math.Max(1, _format.ChannelCount);
+                    var configuredFrames = CrossfadeMixer.DurationToFadeFrames(
+                        crossfadeDuration,
+                        _format.SampleRate);
+                    var framesBuffered = ring.Count / channels;
+                    if (framesBuffered > configuredFrames)
+                    {
+                        var fullLevelSamples = (framesBuffered - configuredFrames) * channels;
+                        var limit = Math.Min(destination.Length - filled, fullLevelSamples);
+                        var limited = ring.TryRead(destination.Slice(filled, limit));
+                        if (limited > 0)
+                        {
+                            filled += limited;
+                            _onSamplesConsumed(limited);
+                            ReportSilence(SeekSilenceReason.None);
+                            emptyPromotes = 0;
+                        }
+
+                        if (filled == destination.Length)
+                        {
+                            break;
+                        }
+
+                        if (TryArmCrossfade(active))
+                        {
+                            continue;
+                        }
+                    }
+                }
+
                 var read = ring.TryRead(destination[filled..]);
                 if (read > 0)
                 {
@@ -178,6 +270,11 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
                     _onSamplesConsumed(read);
                     ReportSilence(SeekSilenceReason.None);
                     emptyPromotes = 0;
+
+                    if (filled < destination.Length && TryArmCrossfade(active))
+                    {
+                        continue;
+                    }
                 }
 
                 if (filled == destination.Length)
@@ -287,6 +384,15 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
     }
 
     /// <summary>
+    /// Clears in-progress crossfade gain state. Does not dispose pipelines — the player must
+    /// take <c>_fadingOut</c> under the pipeline lock after excluding the pull path.
+    /// </summary>
+    public void AbortCrossfade()
+    {
+        ClearCrossfadeState();
+    }
+
+    /// <summary>
     /// Arms the effects barrier so subsequent <see cref="Read"/> calls return silence and do not
     /// drain or promote. Does not wait for an in-flight callback — pair with
     /// <see cref="WaitEffectsBarrier"/> after releasing locks that an audio callback must not hold.
@@ -294,6 +400,7 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
     public void ArmEffectsBarrier()
     {
         Volatile.Write(ref _effectsBarrier, 1);
+        ClearCrossfadeState();
     }
 
     /// <summary>
@@ -329,6 +436,186 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
     public void ExitEffectsBarrier()
     {
         Volatile.Write(ref _effectsBarrier, 0);
+    }
+
+    private bool TryArmCrossfade(TrackDecodePipeline active)
+    {
+        var duration = _getCrossfadeDuration();
+        if (duration <= TimeSpan.Zero)
+        {
+            return false;
+        }
+
+        if (!active.Ring.IsProducerCompleted || active.Ring.Count == 0)
+        {
+            return false;
+        }
+
+        var channels = Math.Max(1, _format.ChannelCount);
+        var framesBuffered = active.Ring.Count / channels;
+        var configuredFrames = CrossfadeMixer.DurationToFadeFrames(duration, _format.SampleRate);
+        // Wait until only the fade-sized (or shorter) tail remains so a large ring cannot
+        // begin fading at the start of a short track that fully fit in the buffer.
+        if (framesBuffered > configuredFrames)
+        {
+            return false;
+        }
+
+        var commit = _tryBeginCrossfade();
+        if (commit is null)
+        {
+            return false;
+        }
+
+        _scheduleTransitioned(commit.EventArgs);
+        _fadeFramesTotal = commit.FadeFrames;
+        _fadeFramesDone = 0;
+        _crossfadeCurve = (int)commit.Curve;
+        _crossfadeHoldFrames = 0;
+        _crossfadeUnderrunLatched = 0;
+        Volatile.Write(ref _crossfadeActive, 1);
+        Volatile.Write(ref _emptyPromoteGraceRemaining, 0);
+        return true;
+    }
+
+    /// <summary>
+    /// Fills from the dual-ring crossfade. Returns false when the caller should break the outer loop
+    /// (underrun keepalive already padded); true to continue.
+    /// </summary>
+    private bool ReadCrossfade(Span<float> destination, ref int filled)
+    {
+        var channels = _format.ChannelCount;
+        if (channels <= 0)
+        {
+            ClearCrossfadeState();
+            return true;
+        }
+
+        var fading = _getFadingOut();
+        var incoming = _getActive();
+        if (fading is null || incoming is null || fading.IsDisposePending || incoming.IsDisposePending)
+        {
+            CompleteCrossfadeRelease();
+            return true;
+        }
+
+        var framesLeft = _fadeFramesTotal - _fadeFramesDone;
+        if (framesLeft <= 0)
+        {
+            CompleteCrossfadeRelease();
+            return true;
+        }
+
+        var samplesAvailable = destination.Length - filled;
+        var maxScratchFrames = Math.Max(1, _scratch.Length / channels);
+        var framesWanted = Math.Min(framesLeft, samplesAvailable / channels);
+        framesWanted = Math.Min(framesWanted, maxScratchFrames);
+        if (framesWanted <= 0)
+        {
+            // Destination has a partial frame left — pad silence and stop.
+            destination[filled..].Clear();
+            filled = destination.Length;
+            return false;
+        }
+
+        var samplesWanted = framesWanted * channels;
+        var destSlice = destination.Slice(filled, samplesWanted);
+
+        var aRead = fading.Ring.TryRead(destSlice);
+        if (aRead < samplesWanted)
+        {
+            destSlice[aRead..].Clear();
+        }
+
+        var scratchSlice = _scratch.AsSpan(0, samplesWanted);
+        var bRead = incoming.Ring.TryRead(scratchSlice);
+        if (bRead < samplesWanted)
+        {
+            scratchSlice[bRead..].Clear();
+        }
+
+        var bTransient = bRead == 0
+            && !incoming.Ring.IsProducerCompleted
+            && !incoming.IsDisposePending;
+
+        var curve = (CrossfadeCurve)_crossfadeCurve;
+        if (bTransient && _crossfadeHoldFrames < _maxHoldFrames)
+        {
+            _crossfadeHoldFrames += framesWanted;
+            if (_isPlaying() && Interlocked.Exchange(ref _crossfadeUnderrunLatched, 1) == 0)
+            {
+                _onUnderrun();
+            }
+
+            ReportSilence(SeekSilenceReason.Underrun);
+
+            // Hold t: emit A at current gain only; do not invent B; do not advance fade progress.
+            var tHold = _fadeFramesTotal <= 0 ? 1f : _fadeFramesDone / (float)_fadeFramesTotal;
+            CrossfadeMixer.Gains(curve, tHold, out var gAHold, out _);
+            CrossfadeMixer.ScaleInPlace(destSlice, gAHold);
+            filled += samplesWanted;
+            // Position freeze: no B PCM consumed.
+            return filled < destination.Length;
+        }
+
+        _crossfadeHoldFrames = 0;
+        Interlocked.Exchange(ref _crossfadeUnderrunLatched, 0);
+
+        // Per-frame gains for continuous envelopes across callback boundaries.
+        for (var frame = 0; frame < framesWanted; frame++)
+        {
+            var t = _fadeFramesTotal <= 0
+                ? 1f
+                : (_fadeFramesDone + frame) / (float)_fadeFramesTotal;
+            CrossfadeMixer.Gains(curve, t, out var gA, out var gB);
+            var offset = frame * channels;
+            for (var c = 0; c < channels; c++)
+            {
+                var i = offset + c;
+                destSlice[i] = (gA * destSlice[i]) + (gB * scratchSlice[i]);
+            }
+        }
+
+        _fadeFramesDone += framesWanted;
+        if (bRead > 0)
+        {
+            _onSamplesConsumed(bRead);
+            ReportSilence(SeekSilenceReason.None);
+        }
+        else if (_isPlaying())
+        {
+            // Permanent B shortfall (EOS/failure) or degraded hold — still advancing t.
+            _onUnderrun();
+            ReportSilence(SeekSilenceReason.Underrun);
+        }
+
+        filled += samplesWanted;
+
+        if (_fadeFramesDone >= _fadeFramesTotal)
+        {
+            CompleteCrossfadeRelease();
+        }
+
+        return true;
+    }
+
+    private void CompleteCrossfadeRelease()
+    {
+        ClearCrossfadeState();
+        var releasing = _tryTakeFadingOut();
+        if (releasing is not null)
+        {
+            _scheduleFadingOutDispose(releasing);
+        }
+    }
+
+    private void ClearCrossfadeState()
+    {
+        Volatile.Write(ref _crossfadeActive, 0);
+        _fadeFramesTotal = 0;
+        _fadeFramesDone = 0;
+        _crossfadeHoldFrames = 0;
+        Interlocked.Exchange(ref _crossfadeUnderrunLatched, 0);
     }
 
     private void LatchTerminalEndOfStream()
@@ -378,5 +665,20 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
         }
 
         public TrackTransitionedEventArgs EventArgs { get; }
+    }
+
+    /// <summary>Result of committing an EOS-anchored crossfade promote.</summary>
+    internal sealed class CrossfadeCommit
+    {
+        public CrossfadeCommit(TrackTransitionedEventArgs eventArgs, int fadeFrames, CrossfadeCurve curve)
+        {
+            EventArgs = eventArgs;
+            FadeFrames = fadeFrames;
+            Curve = curve;
+        }
+
+        public TrackTransitionedEventArgs EventArgs { get; }
+        public int FadeFrames { get; }
+        public CrossfadeCurve Curve { get; }
     }
 }

@@ -170,6 +170,8 @@ public sealed class AppBridge : IDisposable
         _bridge.Register<int>("diagnostics.seekTrace", max => _playback.CaptureSeekTrace(max <= 0 ? 256 : max));
         _bridge.Register<float>("playback.setVolume", volume => _playback.SetVolume(volume));
         _bridge.Register<bool>("playback.setGapless", enabled => Run(() => _playback.SetGaplessEnabled(enabled)));
+        _bridge.Register<double>("playback.setCrossfadeDurationMs", ms => _playback.SetCrossfadeDurationMs(ms));
+        _bridge.Register<string>("playback.setCrossfadeCurve", curve => _playback.SetCrossfadeCurve(curve));
         _bridge.RegisterAsync("playback.preloadNext", ct => Done(_playback.PreloadNextAsync(ct)));
         _bridge.Register("playback.clearNext", () => Run(_playback.ClearNext));
         _bridge.RegisterAsync<string>("playback.getArtwork", (id, ct) => Box(_playback.GetArtworkDataUrlAsync(id, ct)));

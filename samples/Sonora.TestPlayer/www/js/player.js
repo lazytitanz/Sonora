@@ -33,6 +33,8 @@
   let artworkResolved = false;
   let dragId = null;
   let gaplessBusy = false;
+  /** True while the user is editing crossfade controls so snapshots do not clobber in-progress input. */
+  let crossfadeBusy = false;
   const seekHistory = [];
 
   // ---------------------------------------------------------------------------------------------
@@ -49,6 +51,7 @@
       'np-art-img', 'np-art-ph', 'np-title', 'np-artist', 'np-album', 'np-format', 'np-source', 'np-queue-pos', 'np-generation',
       'gapless-switch', 'gapless-next-state', 'gapless-next-path', 'gapless-transitions', 'gapless-completions',
       'gapless-advances', 'btn-preload-next', 'btn-clear-next',
+      'crossfade-duration', 'crossfade-curve',
       'seek-input', 'btn-seek', 'btn-seek-result', 'seek-result', 'seek-history', 'player-checklist',
     ];
     for (const id of ids) dom[id] = document.getElementById(id);
@@ -308,6 +311,22 @@
     setText(dom['gapless-transitions'], ready ? String(snap.transitionsObserved) : '—');
     setText(dom['gapless-completions'], ready ? String(snap.completionsObserved) : '—');
     setText(dom['gapless-advances'], ready ? String(snap.completionAdvances) : '—');
+
+    if (!crossfadeBusy) {
+      const durationSec = ready && typeof snap.crossfadeDurationMs === 'number'
+        ? snap.crossfadeDurationMs / 1000
+        : 0;
+      const durationStr = Number.isFinite(durationSec) ? String(Math.round(durationSec * 10) / 10) : '0';
+      if (dom['crossfade-duration'].value !== durationStr) {
+        dom['crossfade-duration'].value = durationStr;
+      }
+      const curve = ready && snap.crossfadeCurve === 'linear' ? 'linear' : 'equalPower';
+      if (dom['crossfade-curve'].value !== curve) {
+        dom['crossfade-curve'].value = curve;
+      }
+    }
+    dom['crossfade-duration'].disabled = !ready;
+    dom['crossfade-curve'].disabled = !ready;
   }
 
   function renderAll() {
@@ -652,6 +671,40 @@
     dom['btn-clear-next'].addEventListener('click', async () => {
       await run('playback.clearNext', [], { label: 'Clear next' });
       await refreshSnapshot();
+    });
+
+    const applyCrossfadeDuration = latestWins(async () => {
+      crossfadeBusy = true;
+      const seconds = Number(dom['crossfade-duration'].value);
+      const ms = Number.isFinite(seconds) ? Math.max(0, Math.min(30, seconds)) * 1000 : 0;
+      const result = await run('playback.setCrossfadeDurationMs', [ms], { label: 'Crossfade duration', toast: false });
+      if (result.ok && typeof result.value === 'number') {
+        TP.core.mergeIntoSnapshot({ crossfadeDurationMs: result.value });
+        const appliedSec = Math.round((result.value / 1000) * 10) / 10;
+        dom['crossfade-duration'].value = String(appliedSec);
+      }
+      crossfadeBusy = false;
+      if (!result.ok) await refreshSnapshot();
+    });
+
+    dom['crossfade-duration'].addEventListener('change', () => { applyCrossfadeDuration(); });
+    dom['crossfade-duration'].addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        applyCrossfadeDuration();
+      }
+    });
+
+    dom['crossfade-curve'].addEventListener('change', async () => {
+      crossfadeBusy = true;
+      const curve = dom['crossfade-curve'].value === 'linear' ? 'linear' : 'equalPower';
+      const result = await run('playback.setCrossfadeCurve', [curve], { label: 'Crossfade curve' });
+      if (result.ok && typeof result.value === 'string') {
+        TP.core.mergeIntoSnapshot({ crossfadeCurve: result.value });
+        dom['crossfade-curve'].value = result.value === 'linear' ? 'linear' : 'equalPower';
+      }
+      crossfadeBusy = false;
+      if (!result.ok) await refreshSnapshot();
     });
   }
 

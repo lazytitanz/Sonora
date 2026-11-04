@@ -32,13 +32,13 @@ It is built for apps like [EMP](https://github.com/lazytitanz/EMP) but stays com
 | **Predictable playback** | Deterministic state, resource disposal, and completion semantics |
 | **Real-time safe** | Decoding and file I/O stay off the WASAPI callback |
 | **Extensible DSP** | Equalizer, preamp, and limiter on a per-player effect rack |
-| **Gapless joins** | Preload one next track; continuous WASAPI without device restart |
+| **Gapless joins** | Preload one next track; continuous WASAPI without device restart; optional crossfade |
 
 ### At a glance
 
 - **.NET 10** — `Sonora.Audio` (`net10.0`) and `Sonora.Audio.Windows` (`net10.0-windows10.0.19041.0`)
 - **Wide format coverage** — WAV, AIFF, MP3, AAC, M4A, FLAC, WMA, ALAC, Ogg Vorbis, Ogg Opus, WebM Opus
-- **Gapless playback** — `PreloadNextAsync` + seamless hard-cut transition on one WASAPI session
+- **Gapless playback** — `PreloadNextAsync` + hard-cut transition by default; optional EOS-anchored crossfade (`CrossfadeDuration` / `CrossfadeCurve`) on one WASAPI session
 - **Dual position tracking** — `Position` (audible estimate) and `BufferedPosition` (decode frontier)
 - **Live volume and DSP** — `Volume`, EQ, and preamp apply on the output path without waiting for the PCM buffer to drain
 - **Metadata** — read tags and optional embedded artwork without creating a player or opening WASAPI
@@ -211,11 +211,12 @@ player.TrackTransitioned += (_, e) =>
 | Ready / Failed | Inspect `NextTrackState` and `NextTrackPath` |
 | Replace | Another `PreloadNextAsync` cancels/disposes the previous pending track |
 | Clear | `ClearNext()`, `Stop()`, `LoadAsync()`, and `Dispose()` clear the slot; **Seek preserves** a safe next track |
-| Transition | When the current track drains and next is `Ready`, Sonora hard-cuts into B without stopping WASAPI |
+| Transition | When the current track drains and next is `Ready`, Sonora hard-cuts into B without stopping WASAPI (`CrossfadeDuration == Zero`, default) |
+| Crossfade | Set `CrossfadeDuration` above zero for an EOS-anchored overlap (outgoing fades out, incoming fades in) before shared volume/DSP; `CrossfadeCurve` selects Linear or EqualPower (default). Promote / `TrackTransitioned` / track identity commit at fade start |
 | Not ready | Natural `PlaybackCompleted` as before (exactly once) |
 | DSP | Same effect rack and settings continue across the join (filter state is not reset at the boundary) |
 
-Mismatched sample rates/channels are converted on the decode pump (NAudio WDL on Windows). Continuous output without a device restart is guaranteed for prepared joins; **encoder-delay/padding-corrected** gapless for MP3/AAC/Opus is **not** claimed unless metadata is verified.
+Mismatched sample rates/channels are converted on the decode pump (NAudio WDL on Windows). Continuous output without a device restart is guaranteed for prepared joins; **encoder-delay/padding-corrected** gapless for MP3/AAC/Opus is **not** claimed unless metadata is verified. Crossfade start is based on real decode EOF and the buffered tail (not metadata duration), so short/incorrect Duration tags do not truncate the outgoing track.
 
 ### Position accuracy
 
@@ -402,7 +403,8 @@ dotnet add package Sonora.Audio.Windows
 - Applications accepting arbitrary URLs should apply SSRF / egress controls ([SECURITY.md](SECURITY.md))
 - Metadata does not invent titles from file names; ATL `UseFileNameWhenNoTitle` is disabled once on first Sonora metadata use
 - ATL may report ALAC as lossy; WebM Opus may omit sample rate / channels; artwork write/edit is out of scope
-- Gapless joins are continuous PCM hard-cuts; encoder delay/padding trimming for lossy codecs is not applied
+- Gapless joins default to continuous PCM hard-cuts (`CrossfadeDuration == Zero`). Optional crossfade is EOS-anchored and limited by the buffered outgoing tail (rings size to at least the fade duration when enabled); it does not use metadata duration to start early. Encoder delay/padding trimming for lossy codecs is not applied
+- Crossfade promote / `TrackTransitioned` / track identity update at fade start, so `Position`/`SourcePath` can lead the still-audible outgoing tail by device buffering (same class of skew as hard-cut handoffs, longer window)
 - Audible track-change timing is not sample-accurate under shared-mode WASAPI
 - FLAC / Media Foundation seeking is reliable for playback; sample-accurate (`Exact`) seeking is not claimed for MF-backed formats
 - Bare Ogg Opus uses managed Concentus (not MF); WebM Opus depends on host Media Foundation codecs (WebM Vorbis is not claimed)
@@ -415,7 +417,6 @@ dotnet add package Sonora.Audio.Windows
 
 - Stronger WebM portability across Windows SKUs
 - Additional DSP effects (compressor, reverb, …) on the existing rack
-- Crossfade on the existing transition stage
 - Encoder-delay/padding aware gapless where metadata is available
 - Additional platform backends
 

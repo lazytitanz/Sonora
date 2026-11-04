@@ -144,13 +144,26 @@
                   <i class="bi bi-x-circle" aria-hidden="true"></i> Clear next
                 </button>
               </div>
-              <div class="form-check form-switch unsupported">
-                <input id="crossfade-switch" class="form-check-input" type="checkbox" role="switch" disabled aria-describedby="crossfade-note">
-                <label class="form-check-label" for="crossfade-switch">
-                  Crossfade <span class="badge text-bg-secondary ms-1">Not supported</span>
-                </label>
+              <div class="border-top pt-3">
+                <h3 class="h6 mb-2">Crossfade</h3>
+                <div class="row g-2 align-items-end mb-2">
+                  <div class="col-6">
+                    <label class="form-label form-label-sm" for="crossfade-duration">Duration (seconds)</label>
+                    <input id="crossfade-duration" type="number" class="form-control form-control-sm"
+                           min="0" max="30" step="0.1" value="0" inputmode="decimal"
+                           aria-describedby="crossfade-note">
+                  </div>
+                  <div class="col-6">
+                    <label class="form-label form-label-sm" for="crossfade-curve">Curve</label>
+                    <select id="crossfade-curve" class="form-select form-select-sm" aria-describedby="crossfade-note">
+                      <option value="equalPower" selected>Equal power</option>
+                      <option value="linear">Linear</option>
+                    </select>
+                  </div>
+                </div>
                 <div id="crossfade-note" class="form-text">
-                  Sonora does not implement crossfade. Track changes are either gapless (preloaded) or sequential. This control is intentionally disabled.
+                  Zero keeps the hard-cut gapless join. Values above zero overlap the outgoing and incoming
+                  tracks at EOF (requires gapless preload so next is Ready). Applies to the next transition.
                 </div>
               </div>
             </div>

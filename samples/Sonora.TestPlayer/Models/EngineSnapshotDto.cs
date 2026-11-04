@@ -56,6 +56,12 @@ public sealed record EngineSnapshotDto
     /// <summary>Whether the controller preloads the next queue item for gapless playback.</summary>
     public bool GaplessEnabled { get; init; }
 
+    /// <summary>Configured crossfade overlap in milliseconds (<c>0</c> = hard-cut gapless).</summary>
+    public double CrossfadeDurationMs { get; init; }
+
+    /// <summary>Crossfade gain curve (<c>linear</c> or <c>equalPower</c>).</summary>
+    public string CrossfadeCurve { get; init; } = "equalPower";
+
     /// <summary>Path of the preloaded next track, or <see langword="null"/>.</summary>
     public string? NextTrackPath { get; init; }
 

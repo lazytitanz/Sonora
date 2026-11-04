@@ -136,20 +136,19 @@ Next Decoder (+ convert) → Pump → Ring B ───┘
 | API | `PreloadNextAsync` / `ClearNext` / `NextTrackState` / `TrackTransitioned` |
 | Output | One WASAPI session for the continuous play-through; format locked at `LoadAsync` |
 | Conversion | Decode-pump only; Windows uses NAudio WDL (`WindowsAudioFormatConverter`) |
-| Transition | Hard cut; single output `Read` may span A\|B; no silence/dup/drop at the join |
+| Transition | Hard cut by default (`CrossfadeDuration == Zero`); single output `Read` may span A\|B |
+| Crossfade | Optional EOS-anchored overlap in `TransitionSampleSource` before volume/rack; promote at fade start; outgoing pipeline retained until fade completes or Seek/Stop/Load/Dispose takes it under the effects barrier |
 | Events | `TrackTransitioned` deferred off the audio callback; `PlaybackCompleted` only when no ready next |
-| Seek | Preserves a safe next track; does not promote or notify |
-| DSP | Same rack across joins; no `ResetProcessingState` on gapless handoff |
-
-Known deferred defect (diagnostics/error routing only): post-promote pump callbacks — see [gapless-callback-ownership.md](gapless-callback-ownership.md).
+| Seek | Preserves a safe next track; does not promote or notify; aborts an in-flight crossfade |
+| DSP | Same rack across joins; no `ResetProcessingState` on gapless/crossfade handoff |
 
 Native submission boundary (pre-engine lease vs MixFormat): see [gapless-native-submission-boundary.md](gapless-native-submission-boundary.md).
 
 ## DSP (0.3.0+)
 
 ```text
-Decoder → [optional IAudioProcessor] → Volume → PcmRingBuffer (dry)
-  → output pull → player EffectRack (preamp / EQ / limiter) → WASAPI
+Decoder → [optional IAudioProcessor] → PcmRingBuffer (dry)
+  → output pull → [optional crossfade mix] → Volume → EffectRack → WASAPI
 ```
 
 | Concern | Behavior |

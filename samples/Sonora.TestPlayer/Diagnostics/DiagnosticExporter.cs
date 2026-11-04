@@ -204,7 +204,7 @@ public static partial class DiagnosticExporter
             sb.AppendLine("Engine");
             sb.AppendLine(ci, $"  State: {e.State}; source: {e.SourcePath ?? "(none)"}");
             sb.AppendLine(ci, $"  Position: {e.PositionMs:F0} ms / {(e.HasKnownDuration ? e.DurationMs.ToString("F0", ci) : "unknown")} ms; volume {e.Volume:F2}");
-            sb.AppendLine(ci, $"  Queue: {e.QueueLength} item(s), index {e.QueueIndex}; gapless {(e.GaplessEnabled ? "on" : "off")}; next {e.NextTrackState} {e.NextTrackPath}");
+            sb.AppendLine(ci, $"  Queue: {e.QueueLength} item(s), index {e.QueueIndex}; gapless {(e.GaplessEnabled ? "on" : "off")}; crossfade {(e.CrossfadeDurationMs <= 0 ? "off" : $"{e.CrossfadeDurationMs:0.#}ms {e.CrossfadeCurve}")}; next {e.NextTrackState} {e.NextTrackPath}");
             sb.AppendLine(ci, $"  Network: {e.NetworkStatus}, {e.NetworkBytesBuffered} bytes buffered");
             sb.AppendLine(ci, $"  Counters: transitions {e.TransitionsObserved}, completions {e.CompletionsObserved} (advances {e.CompletionAdvances}), errors {e.ErrorsObserved}, underrun events {e.UnderrunEventsObserved}, engine underruns {e.UnderrunCount}");
             if (e.Output is { } o)

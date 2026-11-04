@@ -31,8 +31,31 @@ public sealed class PcmRingBufferTests
         ring.Write(new float[] { 1, 2 }, CancellationToken.None);
         ring.MarkCompleted();
         Assert.False(ring.IsCompleted);
+        Assert.True(ring.IsProducerCompleted);
         ring.TryRead(new float[2]);
         Assert.True(ring.IsCompleted);
+        Assert.True(ring.IsProducerCompleted);
+    }
+
+    [Fact]
+    public void IsProducerCompleted_BeforeMark_IsFalse()
+    {
+        var ring = new PcmRingBuffer(4);
+        ring.Write(new float[] { 1, 2 }, CancellationToken.None);
+        Assert.False(ring.IsProducerCompleted);
+        Assert.False(ring.IsCompleted);
+    }
+
+    [Fact]
+    public void Clear_ResetsProducerCompleted()
+    {
+        var ring = new PcmRingBuffer(4);
+        ring.Write(new float[] { 1 }, CancellationToken.None);
+        ring.MarkCompleted();
+        Assert.True(ring.IsProducerCompleted);
+        ring.Clear();
+        Assert.False(ring.IsProducerCompleted);
+        Assert.Equal(0, ring.Count);
     }
 
     /// <summary>

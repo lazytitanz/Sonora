@@ -46,7 +46,7 @@ Startup failures (missing WebView2, missing `www`, Vetra init errors) show a **n
 
 | Section | Purpose |
 | --- | --- |
-| Player | File queue (add-folder defaults to the Windows Music library, recursive, still changeable), transport, seek/`SeekWithResult` (async off the UI bridge so MF seeks cannot AppHang the host), gapless preload/transition, listening checklists |
+| Player | File queue (add-folder defaults to the Windows Music library, recursive, still changeable), transport, seek/`SeekWithResult` (async off the UI bridge so MF seeks cannot AppHang the host), gapless preload/transition, optional crossfade duration/curve, listening checklists |
 | Audio Output | Device enumeration/selection, shared vs exclusive, fallback, latency request vs effective mode |
 | DSP & Effects | Preamp → six-band EQ → limiter (Sonora rack order) |
 | Streaming | `HttpAudioSource` only (not file `LoadAsync`), network status, restricted URL mode |
@@ -59,7 +59,7 @@ Startup failures (missing WebView2, missing `www`, Vetra init errors) show a **n
 - When a track ends **without** a gapless transition and more queue items remain, **`PlaybackCompleted`** loads the next item.
 - A coordinator dedupes stale generations and transition/completion races so the queue cannot double-advance.
 
-Gapless joins are Sonora’s PCM hard-cut. Encoder-delay/padding correction and crossfade are **not** claimed.
+Gapless joins default to Sonora’s PCM hard-cut. Optional EOS-anchored crossfade is available in the Gapless panel (`CrossfadeDuration` / `CrossfadeCurve`); encoder-delay/padding correction is **not** claimed.
 
 ## HTTP URL safety (important limitation)
 

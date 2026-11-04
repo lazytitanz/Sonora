@@ -608,6 +608,56 @@ public sealed class PlaybackController : IAsyncDisposable
         return player.Volume;
     }
 
+    /// <summary>
+    /// Sets crossfade overlap duration in milliseconds. <c>0</c> preserves hard-cut gapless joins.
+    /// Returns the authoritative engine value in milliseconds.
+    /// </summary>
+    public double SetCrossfadeDurationMs(double durationMs)
+    {
+        ThrowIfDisposed();
+        if (!double.IsFinite(durationMs) || durationMs < 0 || durationMs > 30_000)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(durationMs),
+                durationMs,
+                "Crossfade duration must be between 0 and 30000 milliseconds.");
+        }
+
+        var player = RequirePlayer();
+        player.CrossfadeDuration = TimeSpan.FromMilliseconds(durationMs);
+        return player.CrossfadeDuration.TotalMilliseconds;
+    }
+
+    /// <summary>
+    /// Sets the crossfade gain curve. Accepts <c>linear</c> or <c>equalPower</c> (case-insensitive).
+    /// Returns the canonical camelCase name stored on the player.
+    /// </summary>
+    public string SetCrossfadeCurve(string curve)
+    {
+        ThrowIfDisposed();
+        ArgumentException.ThrowIfNullOrWhiteSpace(curve);
+
+        var player = RequirePlayer();
+        player.CrossfadeCurve = curve.Trim().ToLowerInvariant() switch
+        {
+            "linear" => CrossfadeCurve.Linear,
+            "equalpower" => CrossfadeCurve.EqualPower,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(curve),
+                curve,
+                "Crossfade curve must be 'linear' or 'equalPower'."),
+        };
+
+        return FormatCrossfadeCurve(player.CrossfadeCurve);
+    }
+
+    private static string FormatCrossfadeCurve(CrossfadeCurve curve) =>
+        curve switch
+        {
+            CrossfadeCurve.Linear => "linear",
+            _ => "equalPower",
+        };
+
     // ---------------------------------------------------------------------------------------------
     // Gapless / preload
     // ---------------------------------------------------------------------------------------------
@@ -807,6 +857,8 @@ public sealed class PlaybackController : IAsyncDisposable
                 DurationMs = p.Duration.TotalMilliseconds,
                 HasKnownDuration = p.HasKnownDuration,
                 Volume = p.Volume,
+                CrossfadeDurationMs = p.CrossfadeDuration.TotalMilliseconds,
+                CrossfadeCurve = FormatCrossfadeCurve(p.CrossfadeCurve),
                 NextTrackPath = p.NextTrackPath,
                 NextTrackState = p.NextTrackState,
                 NetworkStatus = p.NetworkTransportStatus,

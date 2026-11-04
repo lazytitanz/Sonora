@@ -46,6 +46,8 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
     private PlaybackState _state = PlaybackState.Stopped;
     private float _volume = 1f;
+    private long _crossfadeDurationTicks; // TimeSpan.Zero by default
+    private int _crossfadeCurve = (int)CrossfadeCurve.EqualPower;
     private int _generation;
     private int _activeTrackGeneration;
     private int _transitionId;
@@ -95,6 +97,11 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     private const int ExclusiveOpenMaxAttempts = 3;
 
     private TrackDecodePipeline? _active;
+    /// <summary>
+    /// Outgoing pipeline retained during an active crossfade. Taken under <see cref="_pipelineSync"/>
+    /// for release; never disposed while the pull callback can still read it.
+    /// </summary>
+    private TrackDecodePipeline? _fadingOut;
     private IAudioOutput? _output;
     private TransitionSampleSource? _sampleSource;
     private CancellationTokenSource? _sessionCts;
@@ -387,6 +394,49 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             }
 
             Volatile.Write(ref _volume, value);
+        }
+    }
+
+    /// <summary>
+    /// Overlap duration for track-to-track crossfades. <see cref="TimeSpan.Zero"/> (default) preserves
+    /// hard-cut gapless joins. Changes apply to the next transition; an in-flight fade keeps its snapshot.
+    /// When greater than zero, decode rings are sized to at least this duration so EOS-anchored fades
+    /// can use a buffered tail without metadata-based early start.
+    /// </summary>
+    public TimeSpan CrossfadeDuration
+    {
+        get => TimeSpan.FromTicks(Interlocked.Read(ref _crossfadeDurationTicks));
+        set
+        {
+            if (value < TimeSpan.Zero)
+            {
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Crossfade duration must be non-negative.");
+            }
+
+            if (value > TimeSpan.FromSeconds(30))
+            {
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Crossfade duration must be at most 30 seconds.");
+            }
+
+            Interlocked.Exchange(ref _crossfadeDurationTicks, value.Ticks);
+        }
+    }
+
+    /// <summary>
+    /// Gain curve used when <see cref="CrossfadeDuration"/> is greater than zero.
+    /// Default is <see cref="CrossfadeCurve.EqualPower"/>.
+    /// </summary>
+    public CrossfadeCurve CrossfadeCurve
+    {
+        get => (CrossfadeCurve)Volatile.Read(ref _crossfadeCurve);
+        set
+        {
+            if (value is not (CrossfadeCurve.Linear or CrossfadeCurve.EqualPower))
+            {
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Unknown crossfade curve.");
+            }
+
+            Volatile.Write(ref _crossfadeCurve, (int)value);
         }
     }
 
@@ -1198,7 +1248,12 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             var networkInfo = opened as INetworkTransportInfo;
             var converted = _formatConverter.Convert(opened, sessionFormat);
             opened = null; // ownership transferred to converted (or same instance)
-            pipeline = TrackDecodePipeline.Create(source, converted, _options, networkInfo);
+            pipeline = TrackDecodePipeline.Create(
+                source,
+                converted,
+                _options,
+                networkInfo,
+                GetEffectiveRingBufferDuration());
             pipeline.StartPump(
                 _options.Processors,
                 onSamplesWritten: _ => { },
@@ -1481,7 +1536,8 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
                 active = _active;
                 sampleSource = _sampleSource;
-                // Arm before releasing locks so Read cannot promote between capture and silence.
+                // Arm before releasing locks so Read cannot promote/crossfade between capture and silence.
+                // Clears crossfade gain state; fading-out is taken after WaitEffectsBarrier below.
                 sampleSource?.ArmEffectsBarrier();
             }
 
@@ -1524,6 +1580,18 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         // (concurrent Pause/Stop tests and UI must not sit behind a multi-second spin).
         sampleSource?.WaitEffectsBarrier(TimeSpan.FromMilliseconds(100));
         RecordSeekTrace(SeekLifecycleStage.WaitBarrier, seekId, active, requested: position);
+
+        // After the pull path is excluded, take fading-out so dispose cannot race an active Read.
+        TrackDecodePipeline? abortFadingOut;
+        lock (_pipelineSync)
+        {
+            abortFadingOut = TakeFadingOut_NoLock();
+        }
+
+        if (abortFadingOut is not null)
+        {
+            SchedulePipelineDispose(abortFadingOut);
+        }
 
         AudioSeekResult result;
             try
@@ -2053,7 +2121,12 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         networkInfo ??= decoder as INetworkTransportInfo;
         BindNetworkInfo_NoLock(networkInfo);
 
-        _active = TrackDecodePipeline.Create(source, decoder, _options, networkInfo);
+        _active = TrackDecodePipeline.Create(
+            source,
+            decoder,
+            _options,
+            networkInfo,
+            GetEffectiveRingBufferDuration());
 
         _effects.Configure(decoder.Format);
         _effects.ResetProcessingState();
@@ -2439,7 +2512,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
             transitionId = Interlocked.Increment(ref _transitionId);
             Volatile.Write(ref _lastPromoteTransitionId, transitionId);
-            nextPipeline.OnDecodeWorkerAliveAfterStop = OnDecodeWorkerAliveAfterStop;
+            BindActivePumpCallbacks_NoLock(nextPipeline);
 
             // Promote replaces the drained active track; clear any sticky session EOS latch so a
             // deferred device-Stopped from pre-promote EOF cannot see IsEndOfStream and complete.
@@ -2498,6 +2571,247 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         return new TransitionSampleSource.PromoteResult(args);
     }
 
+    /// <summary>
+    /// Installs active-track decode progress/error callbacks. Safe while a preload pump is already
+    /// running — <see cref="TrackDecodePipeline.SetPumpCallbacks"/> does not restart the worker.
+    /// </summary>
+    private void BindActivePumpCallbacks_NoLock(TrackDecodePipeline pipeline)
+    {
+        pipeline.OnDecodeWorkerAliveAfterStop = OnDecodeWorkerAliveAfterStop;
+        pipeline.SetPumpCallbacks(
+            onSamplesWritten: n => Interlocked.Add(ref _samplesDecoded, n),
+            onError: ex => RaiseError(ex));
+    }
+
+    /// <summary>
+    /// Takes the fading-out pipeline under <see cref="_pipelineSync"/>. Caller must already hold the lock.
+    /// Only the taker may schedule dispose.
+    /// </summary>
+    private TrackDecodePipeline? TakeFadingOut_NoLock()
+    {
+        var fading = _fadingOut;
+        _fadingOut = null;
+        return fading;
+    }
+
+    /// <summary>
+    /// Callback-safe attempt to take fading-out for release after crossfade completion.
+    /// Returns null when contended or empty.
+    /// </summary>
+    private TrackDecodePipeline? TryTakeFadingOutFromCallback()
+    {
+        if (!Monitor.TryEnter(_pipelineSync))
+        {
+            return null;
+        }
+
+        try
+        {
+            return TakeFadingOut_NoLock();
+        }
+        finally
+        {
+            Monitor.Exit(_pipelineSync);
+        }
+    }
+
+    /// <summary>
+    /// EOS-anchored crossfade commit: promotes Ready next to active, retains outgoing as fading-out,
+    /// snapshots fade length from the buffered A tail. Never blocks; returns null when unavailable.
+    /// </summary>
+    private TransitionSampleSource.CrossfadeCommit? TryBeginCrossfadeFromCallback()
+    {
+        if (!Monitor.TryEnter(_pipelineSync))
+        {
+            return null;
+        }
+
+        TrackDecodePipeline? previous = null;
+        string? previousPath = null;
+        var previousDuration = TimeSpan.Zero;
+        string? nextPath = null;
+        TrackDecodePipeline? nextPipeline = null;
+        INetworkTransportInfo? previousNetwork = null;
+        INetworkTransportInfo? nextNetwork = null;
+        var transitionId = 0;
+        var fadeFrames = 0;
+        var curve = CrossfadeCurve.EqualPower;
+        try
+        {
+            var duration = CrossfadeDuration;
+            if (duration <= TimeSpan.Zero || _fadingOut is not null || _active is null)
+            {
+                return null;
+            }
+
+            if (!_active.Ring.IsProducerCompleted || _active.Ring.Count == 0)
+            {
+                return null;
+            }
+
+            var ready = _next.ReadyPipeline;
+            if (ready is null)
+            {
+                return null;
+            }
+
+            var channels = Math.Max(1, _sessionFormat.ChannelCount);
+            var configuredFrames = CrossfadeMixer.DurationToFadeFrames(duration, _sessionFormat.SampleRate);
+            var aFrames = _active.Ring.Count / channels;
+            // Tail gate: only commit once remaining A fits in the configured fade window.
+            if (aFrames > configuredFrames)
+            {
+                return null;
+            }
+
+            var minPrimeSamples = Math.Max(
+                channels,
+                _sessionFormat.TimeToSamples(
+                    _options.PrimeDuration > TimeSpan.Zero
+                        ? _options.PrimeDuration
+                        : TimeSpan.FromMilliseconds(20)));
+            if (ready.Ring.Count < minPrimeSamples && !ready.Ring.IsProducerCompleted)
+            {
+                return null;
+            }
+
+            fadeFrames = Math.Min(configuredFrames, aFrames);
+            if (fadeFrames <= 0)
+            {
+                return null;
+            }
+
+            if (!_next.TryTakeReady(out nextPipeline, out nextPath))
+            {
+                return null;
+            }
+
+            previous = _active;
+            previousPath = previous.Path;
+            previousDuration = previous.Duration;
+            _fadingOut = previous;
+            _active = nextPipeline;
+            _currentSource = nextPipeline.Source;
+            Volatile.Write(ref _sourcePath, nextPath);
+            _duration = nextPipeline.Duration;
+            _hasKnownDuration = nextPipeline.Decoder.HasKnownDuration;
+            _timelineOriginSamples = 0;
+            Interlocked.Exchange(ref _samplesDecoded, 0);
+            Interlocked.Exchange(ref _samplesConsumed, 0);
+            Interlocked.Exchange(ref _underrunLatched, 0);
+            Volatile.Write(ref _positionFrozen, 0);
+
+            _logicalPositionAtAnchor = TimeSpan.Zero;
+            _deviceClockAnchor = _output?.TryGetRenderedPosition() ?? TimeSpan.Zero;
+            _heldPosition = TimeSpan.Zero;
+
+            previousNetwork = _networkInfo;
+            nextNetwork = nextPipeline.NetworkInfo ?? nextPipeline.Decoder as INetworkTransportInfo;
+            _networkInfo = nextNetwork;
+            if (nextNetwork is not null)
+            {
+                _networkStatus = nextNetwork.TransportStatus;
+                Volatile.Write(ref _networkBytesBuffered, nextNetwork.NetworkBytesBuffered);
+            }
+            else
+            {
+                _networkStatus = NetworkTransportStatus.Idle;
+                Volatile.Write(ref _networkBytesBuffered, 0);
+            }
+
+            transitionId = Interlocked.Increment(ref _transitionId);
+            Volatile.Write(ref _lastPromoteTransitionId, transitionId);
+            BindActivePumpCallbacks_NoLock(nextPipeline);
+            curve = CrossfadeCurve;
+            _sampleSource?.ResetEndOfStream();
+        }
+        finally
+        {
+            Monitor.Exit(_pipelineSync);
+        }
+
+        if (nextPipeline is null || previous is null || fadeFrames <= 0)
+        {
+            return null;
+        }
+
+        RecordSeekTrace(
+            SeekLifecycleStage.Promote,
+            seekId: Volatile.Read(ref _lastSeekId),
+            pipeline: nextPipeline,
+            extraFlags: transitionId);
+
+        // Rebind network off the callback; do not dispose previous (held as fading-out).
+        var oldNetwork = previousNetwork;
+        var newNetwork = nextNetwork;
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                if (oldNetwork is not null)
+                {
+                    oldNetwork.TransportChanged -= OnNetworkTransportChanged;
+                }
+
+                if (newNetwork is not null)
+                {
+                    newNetwork.TransportChanged += OnNetworkTransportChanged;
+                }
+
+                try
+                {
+                    NetworkStatusChanged?.Invoke(this, EventArgs.Empty);
+                }
+                catch
+                {
+                    // ignored
+                }
+            }
+            catch
+            {
+                // ignored
+            }
+        });
+
+        var args = new TrackTransitionedEventArgs(previousPath, nextPath, previousDuration, transitionId);
+        return new TransitionSampleSource.CrossfadeCommit(args, fadeFrames, curve);
+    }
+
+    /// <summary>
+    /// Schedules completion-aware dispose of a pipeline that is no longer readable from the pull path.
+    /// </summary>
+    private static void SchedulePipelineDispose(TrackDecodePipeline? pipeline)
+    {
+        if (pipeline is null)
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await pipeline.DisposeAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                // ignored
+            }
+        });
+    }
+
+    /// <summary>
+    /// Effective PCM ring target duration: at least <see cref="AudioEngineOptions.BufferDuration"/>,
+    /// raised to <see cref="CrossfadeDuration"/> when crossfade is enabled so EOS-anchored fades
+    /// can retain a sufficient buffered tail.
+    /// </summary>
+    private TimeSpan GetEffectiveRingBufferDuration()
+    {
+        var buffer = _options.BufferDuration;
+        var crossfade = CrossfadeDuration;
+        return crossfade > buffer ? crossfade : buffer;
+    }
+
     private void ScheduleTrackTransitioned(TrackTransitionedEventArgs args)
     {
         // Never invoke user handlers on the audio callback thread.
@@ -2538,7 +2852,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             return;
         }
 
-        active.OnDecodeWorkerAliveAfterStop = OnDecodeWorkerAliveAfterStop;
+        BindActivePumpCallbacks_NoLock(active);
         try
         {
             active.StartPump(
@@ -2549,6 +2863,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         catch (InvalidOperationException)
         {
             // Prior worker still alive — leave pump alone; caller/diagnostics observe LastStopTimedOut.
+            // Callbacks were still rebound above so a promoted preload pump reports progress.
         }
     }
 
@@ -2570,10 +2885,17 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             // ignored
         }
 
+        TrackDecodePipeline? fadingOut;
+        lock (_pipelineSync)
+        {
+            fadingOut = TakeFadingOut_NoLock();
+        }
+
         var bag = new SessionTeardownBag
         {
             Output = DetachOutput_NoLock(),
             Active = _active,
+            FadingOut = fadingOut,
             SessionCts = _sessionCts,
             Next = takeNext ? _next.TakeAndClear() : null,
         };
@@ -2643,6 +2965,16 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
         try
         {
+            bag.FadingOut?.StopPump();
+        }
+        finally
+        {
+            bag.FadingOut?.Dispose();
+            bag.FadingOut = null;
+        }
+
+        try
+        {
             bag.Next?.StopPump();
         }
         finally
@@ -2701,6 +3033,19 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
         try
         {
+            if (bag.FadingOut is not null)
+            {
+                await bag.FadingOut.StopPumpAsync().ConfigureAwait(false);
+                await bag.FadingOut.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            bag.FadingOut = null;
+        }
+
+        try
+        {
             if (bag.Next is not null)
             {
                 await bag.Next.StopPumpAsync().ConfigureAwait(false);
@@ -2720,6 +3065,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     {
         public IAudioOutput? Output;
         public TrackDecodePipeline? Active;
+        public TrackDecodePipeline? FadingOut;
         public TrackDecodePipeline? Next;
         public CancellationTokenSource? SessionCts;
     }
@@ -2734,6 +3080,20 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         Volatile.Write(ref _acceptEndOfStreamCompletion, 0);
 
         _output?.Stop();
+        // Pull path is stopped — abort crossfade state and take fading-out for deferred dispose.
+        _sampleSource?.AbortCrossfade();
+        TrackDecodePipeline? fadingOut;
+        lock (_pipelineSync)
+        {
+            fadingOut = TakeFadingOut_NoLock();
+        }
+
+        if (fadingOut is not null)
+        {
+            fadingOut.RequestPumpStop();
+            SchedulePipelineDispose(fadingOut);
+        }
+
         // Non-blocking cancel — full StopPump join happens off-gate at the caller.
         _active?.RequestPumpStop();
 
@@ -3583,7 +3943,27 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             scheduleTransitioned: ScheduleTrackTransitioned,
             isOutputSwitching: () => _outputDeviceStatus == OutputDeviceStatus.Switching,
             onSilence: OnPullSilence,
-            onCallbackHeartbeat: OnOutputCallbackHeartbeat);
+            onCallbackHeartbeat: OnOutputCallbackHeartbeat,
+            getFadingOut: () =>
+            {
+                if (Monitor.TryEnter(_pipelineSync))
+                {
+                    try
+                    {
+                        return _fadingOut;
+                    }
+                    finally
+                    {
+                        Monitor.Exit(_pipelineSync);
+                    }
+                }
+
+                return Volatile.Read(ref _fadingOut);
+            },
+            tryBeginCrossfade: TryBeginCrossfadeFromCallback,
+            tryTakeFadingOut: TryTakeFadingOutFromCallback,
+            scheduleFadingOutDispose: SchedulePipelineDispose,
+            getCrossfadeDuration: () => CrossfadeDuration);
 
     private void BindNetworkInfo_NoLock(INetworkTransportInfo? info)
     {
@@ -4358,7 +4738,12 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             var networkInfo = opened as INetworkTransportInfo;
             var converted = _formatConverter.Convert(opened, requiredFormat);
             opened = null;
-            pipeline = TrackDecodePipeline.Create(activeSource, converted, _options, networkInfo);
+            pipeline = TrackDecodePipeline.Create(
+                activeSource,
+                converted,
+                _options,
+                networkInfo,
+                GetEffectiveRingBufferDuration());
 
             if (activeSource is HttpAudioSource
                 && !pipeline.Decoder.CanSeek
@@ -4431,7 +4816,12 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 var nextNetwork = nextOpened as INetworkTransportInfo;
                 var nextConverted = _formatConverter.Convert(nextOpened, requiredFormat);
                 nextOpened = null;
-                nextPipeline = TrackDecodePipeline.Create(rebuildSource, nextConverted, _options, nextNetwork);
+                nextPipeline = TrackDecodePipeline.Create(
+                    rebuildSource,
+                    nextConverted,
+                    _options,
+                    networkInfo: nextNetwork,
+                    ringBufferDuration: GetEffectiveRingBufferDuration());
                 nextPipeline.StartPump(
                     _options.Processors,
                     onSamplesWritten: _ => { },

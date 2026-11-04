@@ -63,6 +63,18 @@
     { label: 'Queue position', source: 'derived', get: (c) => (ready(c) ? (c.snap.queueIndex >= 0 ? `${c.snap.queueIndex + 1} of ${c.snap.queueLength}` : `none of ${c.snap.queueLength}`) : null) },
     { label: 'Session generation', source: 'derived', get: (c) => (ready(c) ? String(c.snap.generation) : null) },
     { label: 'Gapless preload setting', source: 'derived', get: (c) => (ready(c) ? (c.snap.gaplessEnabled ? 'Enabled' : 'Disabled') : null) },
+    {
+      label: 'Crossfade',
+      source: 'sonora',
+      get: (c) => {
+        if (!ready(c)) return null;
+        const ms = Number(c.snap.crossfadeDurationMs) || 0;
+        if (ms <= 0) return 'Off (hard-cut)';
+        const sec = Math.round((ms / 1000) * 10) / 10;
+        const curve = c.snap.crossfadeCurve === 'linear' ? 'linear' : 'equalPower';
+        return `${sec}s ${curve}`;
+      },
+    },
     { label: 'Track transitions accepted', source: 'derived', get: (c) => (ready(c) ? String(c.snap.transitionsObserved) : null) },
     { label: 'Completion events observed', source: 'derived', get: (c) => (ready(c) ? String(c.snap.completionsObserved) : null) },
     { label: 'Queue advances via completion', source: 'derived', get: (c) => (ready(c) ? String(c.snap.completionAdvances) : null) },

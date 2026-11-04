@@ -56,6 +56,21 @@ internal sealed class PcmRingBuffer
     }
 
     /// <summary>
+    /// True after the producer has called <see cref="MarkCompleted"/>, even if samples remain.
+    /// Distinct from <see cref="IsCompleted"/>, which also requires the ring to be empty.
+    /// </summary>
+    public bool IsProducerCompleted
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _completed;
+            }
+        }
+    }
+
+    /// <summary>
     /// Marks the producer side as finished (decoder EOF). Remaining samples may still be consumed.
     /// </summary>
     public void MarkCompleted()
