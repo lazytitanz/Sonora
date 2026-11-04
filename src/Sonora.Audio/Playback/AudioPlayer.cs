@@ -3866,18 +3866,20 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             {
                 if (intent == OutputRecoveryIntent.ResumePlaying)
                 {
+                    // Clear intent before Play so observers never see Playing+Available with a
+                    // stale ResumePlaying flag (Play may start a pull thread before returning).
+                    _outputRecoveryIntent = OutputRecoveryIntent.None;
                     EnsureActivePumpRunning_NoLock();
                     _active?.Prime(_options.PrimeDuration);
                     _completionRaised = false;
                     Volatile.Write(ref _acceptEndOfStreamCompletion, 1);
                     SetState_NoLock(PlaybackState.Playing);
-                    _output!.Play();
-                    _outputRecoveryIntent = OutputRecoveryIntent.None;
+                    PlayOutput_NoLock();
                 }
                 else if (intent == OutputRecoveryIntent.RemainPaused)
                 {
-                    SetState_NoLock(PlaybackState.Paused);
                     _outputRecoveryIntent = OutputRecoveryIntent.None;
+                    SetState_NoLock(PlaybackState.Paused);
                 }
 
                 RaiseOutputDeviceChanged(reason == OutputDeviceChangeReason.DeviceLostFallback
@@ -4708,6 +4710,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
         if (honorPlay)
         {
+            _outputRecoveryIntent = OutputRecoveryIntent.None;
             EnsureActivePumpRunning_NoLock();
             _active?.Prime(_options.PrimeDuration);
             _completionRaised = false;
@@ -4721,15 +4724,13 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             }
             else
             {
-                _output!.Play();
+                PlayOutput_NoLock();
             }
-
-            _outputRecoveryIntent = OutputRecoveryIntent.None;
         }
         else if (honorPause)
         {
-            SetState_NoLock(PlaybackState.Paused);
             _outputRecoveryIntent = OutputRecoveryIntent.None;
+            SetState_NoLock(PlaybackState.Paused);
         }
         else
         {

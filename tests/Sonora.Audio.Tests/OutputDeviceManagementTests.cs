@@ -176,17 +176,14 @@ public class OutputDeviceManagementTests
         var lost = current!;
         lost.InjectFailure(new AudioOutputException("device lost"));
 
+        // Recovery can finish before a poll observes Switching/ResumePlaying. Wait for the
+        // durable end state: playing on a replacement output with intent cleared.
         await WaitForAsync(
-            () => player.OutputRecoveryIntent == OutputRecoveryIntent.ResumePlaying
-                  || player.OutputDeviceStatus != OutputDeviceStatus.Available,
+            () => player.State == PlaybackState.Playing
+                  && player.OutputDeviceStatus == OutputDeviceStatus.Available
+                  && player.OutputRecoveryIntent == OutputRecoveryIntent.None
+                  && !ReferenceEquals(current, lost),
             TimeSpan.FromSeconds(3));
-
-        // Preferred still null (follow default); ensure recovery can resume when devices remain.
-        await WaitForAsync(
-            () => player.State == PlaybackState.Playing && player.OutputDeviceStatus == OutputDeviceStatus.Available,
-            TimeSpan.FromSeconds(3));
-
-        Assert.Equal(OutputRecoveryIntent.None, player.OutputRecoveryIntent);
     }
 
     [Fact]
