@@ -163,6 +163,8 @@ public sealed class StickyEosGaplessTests
                 BufferDuration = TimeSpan.FromMilliseconds(40),
             });
         using var player = engine.CreatePlayer();
+        // Force the Linux CI race: deferred EOS Stopped runs after next Ready/promote.
+        player.OutputStoppedHandlerDelay = TimeSpan.FromMilliseconds(250);
         var transitions = 0;
         player.TrackTransitioned += (_, _) => Interlocked.Increment(ref transitions);
 
@@ -180,7 +182,11 @@ public sealed class StickyEosGaplessTests
                   || output is { IsPullLoopIdle: true },
             TimeSpan.FromSeconds(5));
 
-        // Next becomes Ready after the output may have stopped pulling.
+        Assert.NotNull(output);
+        // Synthetic device EOS while next is still Loading — handler is intentionally delayed.
+        player.OnOutputStopped(output, new AudioOutputStoppedEventArgs(reachedEndOfStream: true));
+
+        // Next becomes Ready (and may promote) before the delayed Stopped handler runs.
         releaseNext.TrySetResult();
         await preload.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.True(
@@ -188,8 +194,10 @@ public sealed class StickyEosGaplessTests
             $"Unexpected next state {player.NextTrackState}");
 
         await WaitForAsync(() => Volatile.Read(ref transitions) >= 1, TimeSpan.FromSeconds(8));
+
+        // Allow the delayed Stopped handler to finish; it must not flip Playing → Stopped.
+        await Task.Delay(400);
         Assert.Equal(PlaybackState.Playing, player.State);
-        Assert.NotNull(output);
         await WaitForAsync(() => !output!.IsPullLoopIdle, TimeSpan.FromSeconds(5));
 
         var consumed0 = player.GetDiagnostics().SamplesConsumed;

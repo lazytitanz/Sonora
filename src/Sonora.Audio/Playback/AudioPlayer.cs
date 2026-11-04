@@ -66,6 +66,13 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     private int _acceptEndOfStreamCompletion;
 
     /// <summary>
+    /// Incremented each time output pull is (re)started. Deferred <see cref="IAudioOutput.Stopped"/>
+    /// handlers capture the epoch at raise time and ignore themselves after a newer Play/Recover
+    /// so a pre-promote EOS cannot falsely complete the session after gapless handoff.
+    /// </summary>
+    private int _outputPlaybackEpoch;
+
+    /// <summary>
     /// Pause after disposing a live WASAPI output before opening exclusive mode on the
     /// same endpoint. Values under ~750ms still allow intermittent native
     /// <c>IAudioRenderClient.GetBuffer</c> AVs (<c>0xC0000005</c>) on some AMD/HDMI drivers when
@@ -161,6 +168,12 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     /// Optional test hook invoked at seek phases (never on the audio callback). Null in production.
     /// </summary>
     internal Action<SeekLifecycleStage, int>? SeekTestHook { get; set; }
+
+    /// <summary>
+    /// Test-only delay applied on the dedicated output-Stopped thread before taking <c>_gate</c>.
+    /// Used to force the pre-promote EOS vs gapless Ready/promote race.
+    /// </summary>
+    internal TimeSpan OutputStoppedHandlerDelay { get; set; }
 
     /// <summary>Creates a player. Prefer <see cref="AudioEngine.CreatePlayer"/>.</summary>
     public AudioPlayer(
@@ -1205,16 +1218,16 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
             pipeline = null;
 
-            // Next became Ready after active-track EOS may already have stopped the output.
-            // Kick recovery under the gate so Playing is not left with a stopped pull loop.
+            // Next became Ready after active-track EOS may already have stopped the output
+            // (or a deferred Stopped may have falsely completed the session). Kick recovery
+            // under the gate — including undoing Stopped+_completionRaised when next is Ready.
             await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
             try
             {
                 if (!_disposed
                     && _hasSource
                     && _next.IsCurrentGeneration(preloadGeneration)
-                    && _next.State == NextTrackState.Ready
-                    && _state is PlaybackState.Playing or PlaybackState.Buffering)
+                    && _next.State == NextTrackState.Ready)
                 {
                     RecoverPlaybackAfterNonTerminalEos_NoLock();
                 }
@@ -1302,7 +1315,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             Volatile.Write(ref _acceptEndOfStreamCompletion, 1);
             _outputRecoveryIntent = OutputRecoveryIntent.None;
             SetState_NoLock(PlaybackState.Playing);
-            _output.Play();
+            PlayOutput_NoLock();
         }
         finally
         {
@@ -1717,14 +1730,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                             SetState_NoLock(PlaybackState.Playing);
                         }
 
-                        try
-                        {
-                            _output.Play();
-                        }
-                        catch (ObjectDisposedException)
-                        {
-                            // Replacement output may attach concurrently; next command path recovers.
-                        }
+                        PlayOutput_NoLock();
                     }
 
                     RecordSeekTrace(
@@ -1872,7 +1878,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 }
                 else if (wasPlaying && _output is not null)
                 {
-                    _output.Play();
+                    PlayOutput_NoLock();
                     SetState_NoLock(PlaybackState.Playing);
                 }
                 else
@@ -2434,6 +2440,10 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             transitionId = Interlocked.Increment(ref _transitionId);
             Volatile.Write(ref _lastPromoteTransitionId, transitionId);
             nextPipeline.OnDecodeWorkerAliveAfterStop = OnDecodeWorkerAliveAfterStop;
+
+            // Promote replaces the drained active track; clear any sticky session EOS latch so a
+            // deferred device-Stopped from pre-promote EOF cannot see IsEndOfStream and complete.
+            _sampleSource?.ResetEndOfStream();
         }
         finally
         {
@@ -2782,15 +2792,24 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     /// </remarks>
     internal void OnOutputStopped(object? sender, AudioOutputStoppedEventArgs e)
     {
-        // Capture sender so a deferred handler cannot apply a stale Stopped to a replacement output.
+        // Capture sender + playback epoch so a deferred handler cannot apply a stale Stopped after
+        // GaplessRecover / Play already restarted the pull loop (Linux CI: EOS-while-Loading then
+        // Ready/promote left the player Stopped despite TrackTransitioned).
         // Never take _gate or call output.Stop/Join on the raising (pull) thread — that deadlocks
         // with QueueOutputShutdown. Use a dedicated thread rather than Task.Run so parallel tests
         // that block the thread pool (ownership StopPump joins) cannot starve device-loss recovery.
+        var epoch = Volatile.Read(ref _outputPlaybackEpoch);
         var thread = new Thread(() =>
         {
             try
             {
-                HandleOutputStopped(sender, e);
+                var delay = OutputStoppedHandlerDelay;
+                if (delay > TimeSpan.Zero)
+                {
+                    Thread.Sleep(delay);
+                }
+
+                HandleOutputStopped(sender, e, epoch);
             }
             catch (ObjectDisposedException)
             {
@@ -2804,7 +2823,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         thread.Start();
     }
 
-    private void HandleOutputStopped(object? sender, AudioOutputStoppedEventArgs e)
+    private void HandleOutputStopped(object? sender, AudioOutputStoppedEventArgs e, int playbackEpoch)
     {
         try
         {
@@ -2818,7 +2837,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         TrackDecodePipeline? decoderReset = null;
         try
         {
-            decoderReset = HandleOutputStopped_NoLock(sender, e);
+            decoderReset = HandleOutputStopped_NoLock(sender, e, playbackEpoch);
         }
         finally
         {
@@ -2850,7 +2869,10 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     /// Classifies output Stopped under the command gate. Returns a pipeline that needs an off-gate
     /// decoder rewind after terminal EOS, or <see langword="null"/>.
     /// </summary>
-    private TrackDecodePipeline? HandleOutputStopped_NoLock(object? sender, AudioOutputStoppedEventArgs e)
+    private TrackDecodePipeline? HandleOutputStopped_NoLock(
+        object? sender,
+        AudioOutputStoppedEventArgs e,
+        int playbackEpoch)
     {
         if (_disposed || !_hasSource)
         {
@@ -2859,6 +2881,12 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
         // Ignore Stopped from an output that is no longer current (stale deferred callback).
         if (!ReferenceEquals(sender, _output))
+        {
+            return null;
+        }
+
+        // Play / GaplessRecover already restarted pull after this Stopped was raised.
+        if (playbackEpoch != Volatile.Read(ref _outputPlaybackEpoch))
         {
             return null;
         }
@@ -2883,6 +2911,14 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             // after next was promoted (slot empty) but before the session has truly ended.
             if (_sampleSource is { IsEndOfStream: false })
             {
+                return null;
+            }
+
+            // Deferred pre-promote EOS: next slot is already empty after handoff, but B is still
+            // playable. Do not raise session completion.
+            if (_active is { Ring.IsCompleted: false })
+            {
+                RecoverPlaybackAfterNonTerminalEos_NoLock();
                 return null;
             }
 
@@ -2991,6 +3027,21 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             seekId: Volatile.Read(ref _lastSeekId),
             silence: SeekSilenceReason.PendingNext);
 
+        PlayOutput_NoLock();
+    }
+
+    /// <summary>
+    /// Bumps <see cref="_outputPlaybackEpoch"/> then starts the output pull loop.
+    /// Invalidates deferred EOS <see cref="IAudioOutput.Stopped"/> handlers from a prior pull.
+    /// </summary>
+    private void PlayOutput_NoLock()
+    {
+        if (_output is null)
+        {
+            return;
+        }
+
+        Interlocked.Increment(ref _outputPlaybackEpoch);
         try
         {
             _output.Play();
@@ -3001,7 +3052,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         }
         catch (InvalidOperationException)
         {
-            // Shutdown mid-recover — ignore.
+            // Shutdown mid-recover / mid-seek — ignore.
         }
     }
 
@@ -4180,7 +4231,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 return;
             }
 
-            _output.Play();
+            PlayOutput_NoLock();
         }
         finally
         {
