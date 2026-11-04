@@ -76,6 +76,7 @@ Accuracy limits are documented in the README.
 | AIFF | `AiffFileReader` |
 | MP3 / ADTS AAC / progressive M4A / ALAC / WMA / FLAC / WebM | `MediaFoundationReader` with `RepositionInRead=false`, `RequestFloatOutput=true` |
 | Fragmented M4A/MP4 (AAC) | ManagedCodecs demux + AAC (`ManagedAacMp4AudioDecoder`); sniff `dash`/`iso6`/`mvex`/`moof`, or MF empty-PCM fallback |
+| WebM (Opus) | Media Foundation first; on MF open/empty failure, ManagedCodecs Matroska demux + Concentus (`ManagedWebmOpusAudioDecoder`) |
 | Ogg Vorbis | `VorbisWaveReader` (NAudio.Vorbis / NVorbis) |
 | Ogg Opus | Concentus + Concentus.Oggfile (`OpusOggAudioDecoder`) |
 | MF seek | Coarse `CurrentTime` seek + bounded forward discard; recreate after EOF/invalid state; never Exact from MF timestamps alone |

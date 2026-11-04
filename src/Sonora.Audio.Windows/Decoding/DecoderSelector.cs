@@ -168,11 +168,11 @@ internal static class DecoderSelector
             AudioContainerKind.OggOpus => OpusOggAudioDecoder.Open(filePath),
             AudioContainerKind.FragmentedMpeg4 => OpenManagedMpeg4OrThrow(filePath),
             AudioContainerKind.Mpeg4 => OpenMpeg4WithFallback(filePath),
+            AudioContainerKind.WebM => OpenWebMWithFallback(filePath),
             AudioContainerKind.Flac
                 or AudioContainerKind.MpegAudio
                 or AudioContainerKind.AdtsAac
                 or AudioContainerKind.Asf
-                or AudioContainerKind.WebM
                 => WaveStreamAudioDecoder.OpenMediaFoundation(filePath),
             _ => throw new UnsupportedFormatException(
                 $"The audio format of '{filePath}' is not supported."),
@@ -197,11 +197,11 @@ internal static class DecoderSelector
             AudioContainerKind.OggOpus => OpusOggAudioDecoder.Open(stream, originName, leaveOpen: false),
             AudioContainerKind.FragmentedMpeg4 => OpenManagedMpeg4OrThrow(stream, originName),
             AudioContainerKind.Mpeg4 => OpenMpeg4WithFallback(stream, originName, contentTypeHint),
+            AudioContainerKind.WebM => OpenWebMWithFallback(stream, originName, contentTypeHint),
             AudioContainerKind.Flac
                 or AudioContainerKind.MpegAudio
                 or AudioContainerKind.AdtsAac
                 or AudioContainerKind.Asf
-                or AudioContainerKind.WebM
                 => WaveStreamAudioDecoder.OpenMediaFoundation(stream, originName, contentTypeHint),
             _ => throw new UnsupportedFormatException(
                 $"The audio format of '{originName}' is not supported."),
@@ -217,6 +217,121 @@ internal static class DecoderSelector
     {
         var decoder = ManagedAacMp4AudioDecoder.Open(stream, originName, leaveOpen: false);
         return EnsureProducesPcmOrThrow(decoder, originName);
+    }
+
+    private static IAudioDecoder OpenManagedWebmOpusOrThrow(string filePath)
+    {
+        var decoder = ManagedWebmOpusAudioDecoder.Open(filePath);
+        return EnsureProducesPcmOrThrow(decoder, filePath);
+    }
+
+    private static IAudioDecoder OpenManagedWebmOpusOrThrow(Stream stream, string originName)
+    {
+        var decoder = ManagedWebmOpusAudioDecoder.Open(stream, originName, leaveOpen: false);
+        return EnsureProducesPcmOrThrow(decoder, originName);
+    }
+
+    private static IAudioDecoder OpenWebMWithFallback(string filePath)
+    {
+        IAudioDecoder? mf = null;
+        try
+        {
+            mf = WaveStreamAudioDecoder.OpenMediaFoundation(filePath);
+            var probed = TryProbePcm(mf, out var leftover, out var leftoverLength);
+            if (probed > 0)
+            {
+                return leftoverLength > 0
+                    ? new PrefixedAudioDecoder(mf, leftover!, leftoverLength)
+                    : mf;
+            }
+
+            if (!IsSubstantialKnownDuration(mf))
+            {
+                return mf;
+            }
+
+            mf.Dispose();
+            mf = null;
+            return OpenManagedWebmOpusOrThrow(filePath);
+        }
+        catch (Exception ex) when (mf is null && IsMediaFoundationOpenFailure(ex))
+        {
+            // MF often rejects real-world WebM Opus (MF_E_INVALID_FORMAT) that Concentus can decode.
+            return OpenManagedWebmOpusOrThrow(filePath);
+        }
+        catch
+        {
+            mf?.Dispose();
+            throw;
+        }
+    }
+
+    private static IAudioDecoder OpenWebMWithFallback(Stream stream, string originName, string? contentTypeHint)
+    {
+        if (!stream.CanSeek)
+        {
+            throw new NotSupportedException(
+                "WebM stream decoding requires a seekable byte stream.");
+        }
+
+        IAudioDecoder? mf = null;
+        try
+        {
+            mf = WaveStreamAudioDecoder.OpenMediaFoundation(
+                stream, originName, contentTypeHint, ownStream: false);
+            var probed = TryProbePcm(mf, out var leftover, out var leftoverLength);
+            if (probed > 0)
+            {
+                IAudioDecoder decorated = leftoverLength > 0
+                    ? new PrefixedAudioDecoder(mf, leftover!, leftoverLength)
+                    : mf;
+                mf = null;
+                return new OwningStreamAudioDecoder(decorated, stream);
+            }
+
+            if (!IsSubstantialKnownDuration(mf))
+            {
+                var empty = mf;
+                mf = null;
+                return new OwningStreamAudioDecoder(empty, stream);
+            }
+
+            mf.Dispose();
+            mf = null;
+            stream.Position = 0;
+            return OpenManagedWebmOpusOrThrow(stream, originName);
+        }
+        catch (Exception ex) when (mf is null && IsMediaFoundationOpenFailure(ex))
+        {
+            stream.Position = 0;
+            return OpenManagedWebmOpusOrThrow(stream, originName);
+        }
+        catch
+        {
+            mf?.Dispose();
+            throw;
+        }
+    }
+
+    private static bool IsMediaFoundationOpenFailure(Exception ex)
+    {
+        for (var current = ex; current is not null; current = current.InnerException)
+        {
+            var name = current.GetType().FullName ?? current.GetType().Name;
+            if (name.Contains("MediaFoundation", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            var message = current.Message ?? string.Empty;
+            if (message.Contains("Media Foundation", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("0xC00D", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static IAudioDecoder OpenMpeg4WithFallback(string filePath)

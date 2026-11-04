@@ -258,7 +258,7 @@ Formats are selected by container/header sniffing (not extension alone). Only fo
 | FLAC | Media Foundation | Content-verified seeks; accuracy is `Unknown`/`Approximate`, never Exact from MF timestamps |
 | Ogg Vorbis | NVorbis + NAudio.Vorbis | Managed MIT |
 | Ogg Opus (`.opus`) | Concentus + Concentus.Oggfile | Managed MIT; MF does not open bare `.opus` reliably |
-| WebM (Opus) | Media Foundation | Fixture-verified; WebM Vorbis is not claimed (MF codecs vary by Windows SKU) |
+| WebM (Opus) | Media Foundation, Concentus fallback | MF first; ManagedCodecs demux + Concentus when MF rejects (common on real-world WebM). WebM Vorbis is not claimed |
 
 ### Metadata coverage (0.8.0)
 

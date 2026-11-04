@@ -7,6 +7,7 @@ All notable changes to Sonora will be documented in this file.
 ### Added
 
 - Fragmented MPEG-4 AAC compatibility: `ManagedCodecs.Containers` + `ManagedCodecs.Aac` demux/decode for fMP4/`moof` M4A (and MF empty-PCM fallback for mis-sniffed progressive opens)
+- WebM Opus Media Foundation fallback: ManagedCodecs Matroska demux + Concentus when MF returns `MF_E_INVALID_FORMAT` / empty PCM
 - Committed redistributable fMP4 fixture `tone-fmp4-1s.m4a` (regenerate via `scripts/generate-fmp4-fixture`)
 - Active-track decode failures raise `ErrorOccurred`, transition to `Stopped`, and suppress `PlaybackCompleted` so playlist hosts can skip undecodable tracks
 - Optional track-to-track crossfade on the existing transition stage: `AudioPlayer.CrossfadeDuration` (default `Zero` = hard-cut gapless) and `CrossfadeCurve` (`Linear` / `EqualPower`, default EqualPower)

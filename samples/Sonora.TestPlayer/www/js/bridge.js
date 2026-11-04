@@ -143,7 +143,7 @@
   }
 
   const AUDIO_FILTERS = [
-    { name: 'Audio files', extensions: ['mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'wma', 'aiff', 'opus'] },
+    { name: 'Audio files', extensions: ['mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'wma', 'aiff', 'opus', 'webm'] },
     { name: 'All files', extensions: ['*'] },
   ];
 

@@ -96,6 +96,45 @@ public sealed class FragmentedMp4DecoderTests
         Assert.True(decoder.Read(buffer) > 0);
     }
 
+    [Fact]
+    public void CommittedWebmOpus_Decodes()
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, "CommittedFixtures", "tone-1s-opus.webm");
+        Assert.True(File.Exists(path), path);
+        Assert.Equal(AudioContainerKind.WebM, DecoderSelector.Sniff(path));
+        using var decoder = WindowsAudioDecoder.Open(path);
+        var buffer = new float[4096];
+        Assert.True(decoder.Read(buffer) > 0);
+    }
+
+    [Fact]
+    public void LocalWebmOpus_ThatMfRejects_DecodesViaManagedFallback()
+    {
+        var path = Environment.GetEnvironmentVariable("SONORA_WEBM_REGRESSION_FILE");
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            path = @"C:\Users\evanl\Music\Johnny Cash\American IV_ The Man Comes Around\02 Hurt.webm";
+        }
+
+        if (!File.Exists(path))
+        {
+            return;
+        }
+
+        Assert.Equal(AudioContainerKind.WebM, DecoderSelector.Sniff(path));
+        using var decoder = WindowsAudioDecoder.Open(path);
+        // May be PrefixedAudioDecoder wrapping ManagedWebmOpus after open-time PCM probe.
+        Assert.True(
+            decoder.GetType().Name.Contains("ManagedWebmOpus", StringComparison.Ordinal)
+            || decoder.GetType().Name.Contains("PrefixedAudioDecoder", StringComparison.Ordinal),
+            $"Unexpected decoder type {decoder.GetType().FullName}");
+        var buffer = new float[8192];
+        Assert.True(decoder.Read(buffer) > 0);
+        Assert.True(decoder.Duration > TimeSpan.FromMinutes(1));
+        decoder.Seek(TimeSpan.FromSeconds(30));
+        Assert.True(decoder.Read(buffer) > 0);
+    }
+
     private static string CommittedFmp4Path()
     {
         var path = Path.Combine(AppContext.BaseDirectory, "CommittedFixtures", "tone-fmp4-1s.m4a");

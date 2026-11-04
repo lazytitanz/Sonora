@@ -17,6 +17,7 @@ internal static class AudioFileEnumerator
         ".aiff",
         ".aif",
         ".opus",
+        ".webm",
     };
 
     /// <summary>
