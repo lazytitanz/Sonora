@@ -145,17 +145,58 @@ public sealed class ConcurrentLifecycleTests
                 "Seek did not reach Decoder.Seek within the hold window.");
 
             // Pause must return without waiting for Decoder.Seek.
-            var paused = Task.Run(player.Pause);
-            await paused.WaitAsync(TimeSpan.FromSeconds(2));
+            Exception? pauseError = null;
+            var pauseThread = new Thread(() =>
+            {
+                try
+                {
+                    player.Pause();
+                }
+                catch (Exception ex)
+                {
+                    pauseError = ex;
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "Sonora.Test.PauseDuringSeek",
+            };
+            pauseThread.Start();
+            Assert.True(pauseThread.Join(TimeSpan.FromSeconds(2)), "Pause did not return while Decoder.Seek was held.");
+            Assert.Null(pauseError);
             Assert.Equal(PlaybackState.Paused, player.State);
 
-            // Stop's gate section must finish; decoder rewind may still be waiting on HoldSeek.
-            var stopTask = Task.Run(player.Stop);
-            await Task.Delay(100);
+            // Stop's gate section must finish promptly; decoder rewind may still wait on HoldSeek.
+            // Dedicated thread: under CI pool pressure Task.Run can delay past a short poll window.
+            Exception? stopError = null;
+            var stopThread = new Thread(() =>
+            {
+                try
+                {
+                    player.Stop();
+                }
+                catch (Exception ex)
+                {
+                    stopError = ex;
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "Sonora.Test.StopDuringSeek",
+            };
+            stopThread.Start();
+
+            var stopDeadline = Environment.TickCount64 + 2000;
+            while (player.State != PlaybackState.Stopped && Environment.TickCount64 < stopDeadline)
+            {
+                Thread.Sleep(5);
+            }
+
             Assert.Equal(PlaybackState.Stopped, player.State);
 
             hold.ReleaseSeek();
-            await stopTask.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(stopThread.Join(TimeSpan.FromSeconds(5)), "Stop thread did not finish after ReleaseSeek.");
+            Assert.Null(stopError);
             Assert.True(seekThread.Join(TimeSpan.FromSeconds(5)), "Seek thread did not finish after ReleaseSeek.");
             // Seek may succeed or fault (superseded); it must not hang.
             _ = seekError;

@@ -1449,6 +1449,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             // Timeout or redirected target; commit path Snaps if this pause is still current.
         }
 
+        IAudioOutput? outputToPause = null;
         _gate.Wait();
         try
         {
@@ -1465,12 +1466,28 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             sampleSource?.Transport.Snap(0f);
             _heldPosition = EstimateAudiblePosition();
             RebasePositionClock_NoLock(_heldPosition);
-            _output?.Pause();
+            // Publish Paused before joining the output pull loop so Stop/Dispose can take the
+            // gate and supersede without waiting on Pause's device quiescence.
             SetState_NoLock(PlaybackState.Paused);
+            outputToPause = _output;
         }
         finally
         {
             _gate.Release();
+        }
+
+        // Join/cancel off-gate — Fake/WASAPI Pause may wait for the pull thread.
+        try
+        {
+            outputToPause?.Pause();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Replacement/teardown won the race.
+        }
+        catch (InvalidOperationException)
+        {
+            // Already shut down / superseded.
         }
     }
 
@@ -3203,6 +3220,10 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     {
         Volatile.Write(ref _acceptEndOfStreamCompletion, 0);
 
+        // Publish Stopped before joining the output pull loop so concurrent observers (and Pause
+        // fade commits that lost the epoch race) cannot keep reporting Paused/Playing.
+        SetState_NoLock(PlaybackState.Stopped);
+
         _output?.Stop();
         // Pull path is stopped — snap transport mute so a later Play fades in from silence.
         _sampleSource?.Transport.Snap(0f);
@@ -3255,8 +3276,6 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         {
             RebasePositionClock_NoLock(EstimateAudiblePosition());
         }
-
-        SetState_NoLock(PlaybackState.Stopped);
 
         if (raiseCompletion)
         {
