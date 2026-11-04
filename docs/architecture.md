@@ -54,9 +54,12 @@ Ordered teardown: stop output → request pump cancel under `_gate` → join pum
 
 Seek path (command gate released around long work):
 
-1. Under `_gate`: pause output, enter effects barrier, bump seek generation.
-2. Off `_gate`: stop pump and **wait for worker exit** → clear ring → `IAudioDecoder.Seek` (may block on Media Foundation) → optional ring prime. If the worker has not exited after the caller wait bound, seek fails, the effects barrier is released, and playback lands in `Stopped` (not Playing+silence).
-3. Under `_gate`: reset DSP, rebase timeline, exit barrier; resume only if still playing (Pause mid-seek is honored; Stop supersedes via generation).
+1. Under `_gate`: bump seek generation; if playing, request transport fade-out (output keeps pulling).
+2. Off `_gate`: bounded wait for fade-out; re-enter `_gate` and arm the effects barrier (snaps transport mute; does not pause WASAPI).
+3. Off `_gate`: stop pump and **wait for worker exit** → clear ring → `IAudioDecoder.Seek` (may block on Media Foundation) → optional ring prime. If the worker has not exited after the caller wait bound, seek fails, the effects barrier is released, and playback lands in `Stopped` (not Playing+silence).
+4. Under `_gate`: reset DSP, rebase timeline, exit barrier; if still playing, request transport fade-in (Pause mid-seek is honored; Stop supersedes via generation).
+
+Pause fades transport gain to silence on the live pull path before `IAudioOutput.Pause` (shared stops the client; exclusive keeps the client running and feeds adapter silence). Resume snaps mute then fades in. The envelope is applied after volume/DSP in `TransitionSampleSource` (~8 ms, channel-coherent).
 
 `Stop` / natural EOS rewind the decoder to zero the same way (off `_gate`, only after worker join + pipeline identity check). Does not `Shutdown` WASAPI per seek.
 

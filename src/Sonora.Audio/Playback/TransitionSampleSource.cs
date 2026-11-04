@@ -52,6 +52,7 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
     private readonly Action? _onCallbackHeartbeat;
     private readonly float[] _scratch;
     private readonly int _maxHoldFrames;
+    private readonly TransportGainEnvelope _transport;
 
     private int _endOfStream;
     private int _effectsBarrier;
@@ -108,9 +109,13 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
         _maxHoldFrames = Math.Max(
             MaxCrossfadeUnderrunHoldFramesDefault,
             (int)Math.Ceiling(0.100 * format.SampleRate)); // 100 ms
+        _transport = new TransportGainEnvelope(format);
     }
 
     public AudioFormat Format => _format;
+
+    /// <summary>Post-DSP transport gain envelope for pause/resume/seek smoothing.</summary>
+    public TransportGainEnvelope Transport => _transport;
 
     /// <summary>
     /// True when terminal session EOS is latched. Active-track EOF with a pending/ready next
@@ -355,11 +360,11 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
                     return destination.Length;
                 }
 
-                // Volume then DSP: preserves prior ordering (volume was pre-effects) while applying
-                // after the ring so changes take effect on the next output callback.
+                // Volume then DSP, then transport envelope (pause/resume/seek smoothing).
                 var wet = destination[..filled];
                 PcmVolume.Apply(wet, _getVolume());
                 _effects.Process(wet, _format);
+                _transport.Apply(wet);
             }
 
             if (filled < destination.Length && Volatile.Read(ref _endOfStream) == 1)
@@ -401,6 +406,9 @@ internal sealed class TransitionSampleSource : IPcmSampleSource
     {
         Volatile.Write(ref _effectsBarrier, 1);
         ClearCrossfadeState();
+        // Barrier commits silence — snap transport mute so stale pre-seek PCM cannot leak
+        // after the barrier lifts before a fade-in is requested.
+        _transport.Snap(0f);
     }
 
     /// <summary>

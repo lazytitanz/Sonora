@@ -111,10 +111,10 @@ Metadata uses managed [ATL.NET](https://github.com/Zeugma440/atldotnet) (`z440.a
 | API | Behavior |
 | --- | --- |
 | `LoadAsync` | Opens a file or `AudioSource` (file / HTTP); releases the previous source |
-| `Play` | Starts or resumes |
-| `Pause` | Preserves position |
+| `Play` | Starts or resumes (resume from pause fades in from silence) |
+| `Pause` | Soft-mutes (~8 ms) on the live pull path, then pauses the device; preserves position |
 | `Stop` | Stops and resets to the beginning (does not raise completion) |
-| `Seek` | Seeks when the decoder supports it (preserves a safe next track). Long decoder work runs off the command gate so Pause/Stop/Dispose stay responsive |
+| `Seek` | Seeks when the decoder supports it (preserves a safe next track). Playing seeks fade out before the effects barrier and fade in after; long decoder work runs off the command gate so Pause/Stop/Dispose stay responsive |
 | `SeekWithResult` | Same as `Seek`, returns `AudioSeekResult` (requested / actual / accuracy) |
 | `Volume` | Linear gain in `[0, 1]` (applied post-ring on the output path; immediate) |
 

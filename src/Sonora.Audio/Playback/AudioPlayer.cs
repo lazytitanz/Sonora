@@ -172,6 +172,18 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     private int _seekBodiesInFlight;
 
     /// <summary>
+    /// Bumped by Play/Stop/Dispose (and similar) so an in-flight Pause fade-wait cannot commit
+    /// after a newer transport command has taken over.
+    /// </summary>
+    private int _transportCommandEpoch;
+
+    /// <summary>
+    /// Bound for waiting until a transport fade-out reaches the pull path. Must stay short —
+    /// never block on a callback that may no longer be running.
+    /// </summary>
+    private static readonly TimeSpan TransportFadeWait = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>
     /// Optional test hook invoked at seek phases (never on the audio callback). Null in production.
     /// </summary>
     internal Action<SeekLifecycleStage, int>? SeekTestHook { get; set; }
@@ -1336,6 +1348,8 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     public void Play()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        // Invalidate any Pause fade that has not yet committed the device pause.
+        Interlocked.Increment(ref _transportCommandEpoch);
         _gate.Wait();
         try
         {
@@ -1354,12 +1368,16 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
             if (_state == PlaybackState.Playing)
             {
+                // Mid pause-fade: reverse toward unity from the current gain.
+                _sampleSource?.Transport.RequestFadeIn();
                 return;
             }
 
+            var resumingFromPause = _state == PlaybackState.Paused;
+
             // Exclusive WASAPI Pause stops the device client; on resume the device clock restarts
             // near zero. Re-anchor to the held logical position before starting the output again.
-            if (_state == PlaybackState.Paused)
+            if (resumingFromPause)
             {
                 RebasePositionClock_NoLock(_heldPosition);
             }
@@ -1369,8 +1387,25 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             _completionRaised = false;
             Volatile.Write(ref _acceptEndOfStreamCompletion, 1);
             _outputRecoveryIntent = OutputRecoveryIntent.None;
+
+            if (resumingFromPause)
+            {
+                // Resume from device silence: fade in so the onset is not a hard step.
+                _sampleSource?.Transport.Snap(0f);
+            }
+            else
+            {
+                // Stopped → Playing (including after Stop/Load): full gain so gapless/crossfade
+                // seams and bit-exact starts remain unchanged. Stop snaps mute; restore unity here.
+                _sampleSource?.Transport.Snap(1f);
+            }
+
             SetState_NoLock(PlaybackState.Playing);
             PlayOutput_NoLock();
+            if (resumingFromPause)
+            {
+                _sampleSource?.Transport.RequestFadeIn();
+            }
         }
         finally
         {
@@ -1379,9 +1414,15 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     }
 
     /// <summary>Pauses playback and preserves position.</summary>
+    /// <remarks>
+    /// Fades transport gain to silence on the live pull path before pausing the output device,
+    /// so WASAPI Stop/Pause is not applied while audible PCM is still being rendered.
+    /// </remarks>
     public void Pause()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        TransitionSampleSource? sampleSource;
+        int pauseEpoch;
         _gate.Wait();
         try
         {
@@ -1391,6 +1432,37 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 return;
             }
 
+            pauseEpoch = Volatile.Read(ref _transportCommandEpoch);
+            sampleSource = _sampleSource;
+            // Keep Playing so the output continues to pull while the envelope reaches silence.
+            sampleSource?.Transport.RequestFadeOut();
+        }
+        finally
+        {
+            _gate.Release();
+        }
+
+        // Bounded wait off-gate — must not hold _gate and must not assume the callback is alive.
+        if (sampleSource is not null
+            && !sampleSource.Transport.TryWaitUntilFadeOutComplete(TransportFadeWait))
+        {
+            // Timeout or redirected target; commit path Snaps if this pause is still current.
+        }
+
+        _gate.Wait();
+        try
+        {
+            if (_disposed || pauseEpoch != Volatile.Read(ref _transportCommandEpoch))
+            {
+                return;
+            }
+
+            if (_state is not PlaybackState.Playing)
+            {
+                return;
+            }
+
+            sampleSource?.Transport.Snap(0f);
             _heldPosition = EstimateAudiblePosition();
             RebasePositionClock_NoLock(_heldPosition);
             _output?.Pause();
@@ -1417,6 +1489,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             ObjectDisposedException.ThrowIf(_disposed, this);
             CancelOutputSwitch_NoLock();
             _outputRecoveryIntent = OutputRecoveryIntent.None;
+            Interlocked.Increment(ref _transportCommandEpoch);
             _next.Clear();
             if (!_hasSource)
             {
@@ -1522,30 +1595,22 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
 
         try
         {
+        // Phase 1: capture session + start transport fade-out while the device still pulls.
         _gate.Wait();
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
-            lock (_pipelineSync)
+            if (_active is null)
             {
-                if (_active is null)
-                {
-                    throw new InvalidOperationException("No audio source is loaded.");
-                }
-
-                active = _active;
-                sampleSource = _sampleSource;
-                // Arm before releasing locks so Read cannot promote/crossfade between capture and silence.
-                // Clears crossfade gain state; fading-out is taken after WaitEffectsBarrier below.
-                sampleSource?.ArmEffectsBarrier();
+                throw new InvalidOperationException("No audio source is loaded.");
             }
 
-            RecordSeekTrace(SeekLifecycleStage.ArmBarrier, seekId, active, requested: position);
+            active = _active;
+            sampleSource = _sampleSource;
 
             if (!active.Decoder.CanSeek)
             {
-                sampleSource?.ExitEffectsBarrier();
                 RecordSeekTrace(SeekLifecycleStage.Failed, seekId, active, requested: position, outcome: 3);
                 throw new NotSupportedException("The current audio source does not support seeking.");
             }
@@ -1568,6 +1633,53 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
             _heldPosition = previousHeld;
             Interlocked.Increment(ref _seekInProgress);
             seekFreezeHeld = true;
+
+            if (wasPlaying)
+            {
+                sampleSource?.Transport.RequestFadeOut();
+            }
+        }
+        finally
+        {
+            _gate.Release();
+        }
+
+        // Fade to silence on the live pull path before the barrier snaps mute (playing seeks only).
+        if (wasPlaying && sampleSource is not null)
+        {
+            sampleSource.Transport.TryWaitUntilFadeOutComplete(TransportFadeWait);
+        }
+
+        // Phase 2: arm the effects barrier under locks so promote cannot slip between capture and silence.
+        _gate.Wait();
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            if (seekGeneration != _activeTrackGeneration
+                || !ReferenceEquals(_active, active))
+            {
+                RecordSeekTrace(SeekLifecycleStage.Superseded, seekId, active, requested: position, outcome: 2);
+                throw new InvalidOperationException("Seek was superseded by another session operation.");
+            }
+
+            lock (_pipelineSync)
+            {
+                sampleSource = _sampleSource;
+                // Arm before releasing locks so Read cannot promote/crossfade between capture and silence.
+                // Clears crossfade gain state; Snap(0) excludes stale pre-seek PCM; fading-out is
+                // taken after WaitEffectsBarrier below.
+                sampleSource?.ArmEffectsBarrier();
+            }
+
+            RecordSeekTrace(SeekLifecycleStage.ArmBarrier, seekId, active, requested: position);
+
+            // Pause may have landed during the fade wait — keep wasPaused authoritative for commit.
+            if (_state == PlaybackState.Paused)
+            {
+                wasPaused = true;
+                wasPlaying = false;
+            }
         }
         finally
         {
@@ -1766,6 +1878,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                     throw new InvalidOperationException("Seek was superseded by another session operation.");
                 }
 
+                var resumeAudible = false;
                 try
                 {
                     _effects.ResetProcessingState();
@@ -1788,6 +1901,8 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                     // Output was not Pause'd for seek; keep transport running when still Playing.
                     if (wasPaused || _state == PlaybackState.Paused)
                     {
+                        // Remain muted until an explicit Play fades in.
+                        sampleSource?.Transport.Snap(0f);
                         SetState_NoLock(PlaybackState.Paused);
                     }
                     else if (wasPlaying && _output is not null && _state != PlaybackState.Stopped)
@@ -1799,6 +1914,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                         }
 
                         PlayOutput_NoLock();
+                        resumeAudible = true;
                     }
 
                     RecordSeekTrace(
@@ -1813,6 +1929,12 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 finally
                 {
                     sampleSource?.ExitEffectsBarrier();
+                    // Fade in only after the barrier lifts and post-seek PCM is eligible.
+                    if (resumeAudible)
+                    {
+                        sampleSource?.Transport.RequestFadeIn();
+                    }
+
                     RecordSeekTrace(SeekLifecycleStage.ExitBarrier, seekId, active, requested: position);
                 }
 
@@ -1948,6 +2070,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
                 {
                     PlayOutput_NoLock();
                     SetState_NoLock(PlaybackState.Playing);
+                    sampleSource?.Transport.RequestFadeIn();
                 }
                 else
                 {
@@ -2073,6 +2196,7 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     {
         _disposed = true;
         _generation++;
+        Interlocked.Increment(ref _transportCommandEpoch);
         CancelOutputSwitch_NoLock();
         _outputRecoveryIntent = OutputRecoveryIntent.None;
         _outputDevices.DevicesChanged -= OnDevicesChanged;
@@ -3080,7 +3204,9 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
         Volatile.Write(ref _acceptEndOfStreamCompletion, 0);
 
         _output?.Stop();
-        // Pull path is stopped — abort crossfade state and take fading-out for deferred dispose.
+        // Pull path is stopped — snap transport mute so a later Play fades in from silence.
+        _sampleSource?.Transport.Snap(0f);
+        // Abort crossfade state and take fading-out for deferred dispose.
         _sampleSource?.AbortCrossfade();
         TrackDecodePipeline? fadingOut;
         lock (_pipelineSync)

@@ -68,6 +68,8 @@ public sealed class Sonora.Audio.AudioPlayer
   .ctor(Sonora.Audio.Abstractions.IAudioDecoderFactory decoderFactory, Sonora.Audio.Abstractions.IAudioOutputFactory outputFactory, Sonora.Audio.Playback.AudioEngineOptions options, Sonora.Audio.Devices.IAudioOutputDevices outputDevices)
   System.String ActiveOutputDeviceId { get }
   System.TimeSpan BufferedPosition { get }
+  Sonora.Audio.Playback.CrossfadeCurve CrossfadeCurve { get; set }
+  System.TimeSpan CrossfadeDuration { get; set }
   Sonora.Audio.Sources.AudioSource CurrentSource { get }
   System.TimeSpan Duration { get }
   System.Nullable<Sonora.Audio.Output.AudioOutputMode> EffectiveOutputMode { get }
@@ -579,6 +581,10 @@ public sealed class Sonora.Audio.Playback.AudioEngineOptions
   Sonora.Audio.Network.HttpStreamingOptions HttpStreaming { get; set }
   System.TimeSpan PrimeDuration { get; set }
   System.Collections.Generic.IReadOnlyList<Sonora.Audio.DSP.IAudioProcessor> Processors { get; set }
+
+public enum Sonora.Audio.Playback.CrossfadeCurve
+  EqualPower = 1
+  Linear = 0
 
 public interface Sonora.Audio.Playback.IAudioFormatConverter
   Sonora.Audio.Abstractions.IAudioDecoder Convert(Sonora.Audio.Abstractions.IAudioDecoder source, Sonora.Audio.Formats.AudioFormat targetFormat)
