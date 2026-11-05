@@ -217,7 +217,16 @@ internal sealed class DecodePump : IDisposable
                 {
                     read = _decoder.Read(_scratch);
                 }
-                catch (Exception ex) when (ex is not OperationCanceledException)
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Decoder/stream torn down during stop/seek/promote — not a user-facing failure.
+                    break;
+                }
+                catch (Exception ex)
                 {
                     _onError?.Invoke(ex);
                     break;

@@ -2745,6 +2745,13 @@ public sealed class AudioPlayer : IDisposable, IAsyncDisposable
     /// </summary>
     private void OnActiveDecodeError(Exception exception)
     {
+        // Teardown races (promote/stop/dispose) can surface disposed/canceled reads; those are not
+        // playlist-skip failures and must not Stop a live gapless session.
+        if (exception is ObjectDisposedException or OperationCanceledException)
+        {
+            return;
+        }
+
         var generation = Volatile.Read(ref _activeTrackGeneration);
         var thread = new Thread(() =>
         {

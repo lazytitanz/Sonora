@@ -18,6 +18,7 @@ All notable changes to Sonora will be documented in this file.
 
 ### Fixed
 
+- Decode-pump `ObjectDisposedException` during stop/seek/promote is no longer treated as a fatal active-track error (avoids false `Stopped` / missing gapless `TrackTransitioned` under CI races)
 - Transport click smoothing: short (~8 ms) sample-frame gain envelope after volume/DSP softens Pause, resume-from-pause, and Seek boundaries on both shared and exclusive WASAPI paths without a new public API (Stopped→Play stays full-gain so gapless/crossfade seams stay bit-exact)
 - Post-promote decode progress: natural promote rebinds active-track pump callbacks so `SamplesDecoded` / `BufferedPosition` advance on the incoming track without restarting the preload worker
 
